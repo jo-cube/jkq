@@ -337,9 +337,16 @@ fn create_consumer(config: &RuntimeConfig) -> Result<BaseConsumer, String> {
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("enable.partition.eof", "true");
-    client
-        .create()
-        .map_err(|error| format!("cannot create Kafka consumer: {error}"))
+    client.create().map_err(client_creation_error)
+}
+
+fn client_creation_error(error: KafkaError) -> String {
+    match error {
+        KafkaError::ClientConfig(_, description, key, _) => {
+            format!("cannot create Kafka consumer: client configuration {key:?}: {description}")
+        }
+        error => format!("cannot create Kafka consumer: {error}"),
+    }
 }
 
 fn fetch_watermarks(
@@ -443,5 +450,19 @@ mod tests {
             timestamp_offset(Offset::Offset(3), 7, "t", 0, 10).unwrap(),
             3
         );
+    }
+
+    #[test]
+    fn client_configuration_errors_do_not_expose_values() {
+        let error = match ClientConfig::new()
+            .set("secret.password", "do-not-print")
+            .create::<BaseConsumer>()
+        {
+            Ok(_) => panic!("invalid property unexpectedly created a consumer"),
+            Err(error) => error,
+        };
+        let message = client_creation_error(error);
+        assert!(message.contains("secret.password"));
+        assert!(!message.contains("do-not-print"));
     }
 }
