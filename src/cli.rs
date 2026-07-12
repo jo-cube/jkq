@@ -245,6 +245,15 @@ impl RawCli {
             let (key, value) = parse_property(property)?;
             kafka_properties.insert(key.to_owned(), value.to_owned());
         }
+        for key in [
+            "enable.auto.commit",
+            "enable.auto.offset.store",
+            "enable.partition.eof",
+        ] {
+            if kafka_properties.contains_key(key) {
+                return Err(format!("Kafka property {key:?} is managed by jkq"));
+            }
+        }
         if let Some(brokers) = &self.brokers {
             kafka_properties.insert("bootstrap.servers".to_owned(), brokers.clone());
         }
@@ -506,6 +515,19 @@ mod tests {
         .unwrap();
         assert_eq!(config.brokers, ["new"]);
         assert_eq!(config.kafka_properties["a"], "2");
+    }
+
+    #[test]
+    fn runtime_owned_kafka_properties_are_rejected() {
+        for property in [
+            "enable.auto.commit=true",
+            "enable.auto.offset.store=true",
+            "enable.partition.eof=false",
+        ] {
+            let error =
+                resolve(&["jkq", "-b", "x", "-t", "t", "-p", "0", "-X", property]).unwrap_err();
+            assert!(error.contains("managed by jkq"), "{property}: {error}");
+        }
     }
 
     #[test]
