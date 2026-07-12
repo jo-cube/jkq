@@ -55,6 +55,8 @@ Rules:
 - a negative integer is relative to the current high watermark.
 - `s@...` resolves the first offset at or after the timestamp.
 - `e@...` resolves an exclusive end boundary.
+- a relative start that precedes the low watermark is clamped to the low watermark.
+- a timestamp with no matching record resolves to the current high watermark.
 - one start form is allowed;
 - one end form is allowed;
 - repeated partition-specific offsets are not supported initially;
@@ -314,6 +316,8 @@ Malformed lines report their line number.
 Set a librdkafka property. Repeatable.
 
 Later repeated values for the same key override earlier ones.
+
+The runtime always sets `enable.auto.commit=false`, `enable.auto.offset.store=false`, and `enable.partition.eof=true`. These properties are owned by the direct-assignment and termination model and cannot be overridden through `-F` or `-X`. When `group.id` is absent, the runtime supplies `jkq`; a configured group identifier is accepted but no group subscription or offset commit occurs.
 
 ### Default config discovery
 

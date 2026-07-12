@@ -200,3 +200,9 @@ The following are deliberately deferred until implementation or benchmark eviden
 - whether metadata or offset-query commands belong in a later product scope.
 
 Deferred questions must be resolved in the relevant specification before a stable release makes the behavior contractual.
+
+## D30. Initial librdkafka linkage
+
+**Decision:** Use `rdkafka` without its default Tokio feature, compile the pinned librdkafka source, and vendor OpenSSL support.
+
+**Reason:** The runtime uses the synchronous base consumer and must not introduce an async runtime. Static librdkafka plus vendored TLS avoids requiring a preinstalled librdkafka or OpenSSL development package on supported build hosts. Zlib support remains enabled for compressed Kafka records.

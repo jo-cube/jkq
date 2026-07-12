@@ -60,6 +60,8 @@ docs/
 
 This is a target shape, not a requirement to create every file immediately. Start cohesive and split only when a module has a clear responsibility.
 
+The Stage 2 implementation keeps Kafka assignment, offset resolution, snapshot state, and owned-record conversion together in `src/kafka.rs`; splitting that cohesive module before the bounded poller exists would only add wrappers. `src/app.rs` runs the synchronous Kafka-to-transform-to-output path. Runtime admission, worker, completion, and signal modules remain deferred until they contain real concurrent behavior.
+
 ## 2. Application Assembly
 
 `main.rs` should remain small:
@@ -97,6 +99,10 @@ struct RuntimeConfig {
 Dedicated CLI options override equivalent arbitrary Kafka properties only when explicitly documented. Conflicting duplicated ownership should be rejected rather than silently ambiguous.
 
 ## 4. Kafka Types
+
+The initial consumer uses `rdkafka::consumer::BaseConsumer` and calls `assign`; it never calls `subscribe`. Client construction forces automatic commit and automatic offset storage off and partition EOF events on. The default `group.id` exists only because librdkafka requires one for the consumer type.
+
+Offset resolution uses broker watermarks and `offsets_for_times` before assignment. Missing timestamp matches resolve to the current high watermark. Relative-to-end starts clamp at the low watermark. Snapshot mode performs a fresh high-watermark query after start resolution and stores that value as the immutable exclusive boundary.
 
 ### 4.1 Partition request
 

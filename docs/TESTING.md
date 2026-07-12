@@ -104,6 +104,8 @@ Run against a disposable Kafka environment for:
 
 Keep Kafka setup reusable and isolated under `tests/support`.
 
+Fast repository tests may use librdkafka's disposable mock cluster for protocol-backed assignment, watermark, polling, EOF, tombstone, key, and header behavior. The mock cluster does not provide reliable timestamp-index semantics, so positive timestamp-range integration cases still belong in the disposable real-Kafka suite; unit tests cover mapping no-match results to the high watermark.
+
 ### 2.6 Differential compatibility tests
 
 Where behavior overlaps, run the same fixture through kcat and compare:
