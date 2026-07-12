@@ -1,6 +1,7 @@
-use std::fmt;
-
-use crate::transform::json::write_string;
+use std::{
+    fmt,
+    io::{self, Write},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FormatToken {
@@ -157,57 +158,81 @@ impl CompiledFormat {
         Ok(Self(tokens))
     }
 
+    #[cfg(test)]
     pub fn render(&self, record: &OutputRecord<'_>) -> Result<Vec<u8>, FormatError> {
         let mut output = Vec::new();
+        self.write_to(record, &mut output)
+            .map_err(|error| FormatError(error.to_string()))?;
+        Ok(output)
+    }
+
+    pub fn write_to(
+        &self,
+        record: &OutputRecord<'_>,
+        output: &mut impl Write,
+    ) -> io::Result<usize> {
+        if let Payload::Bytes(bytes) = record.payload
+            && bytes.len() > i32::MAX as usize
+            && self
+                .0
+                .iter()
+                .any(|token| matches!(token, FormatToken::PayloadLengthBinary))
+        {
+            return Err(io::Error::other(FormatError(format!(
+                "payload length {} exceeds %R signed 32-bit limit",
+                bytes.len()
+            ))));
+        }
+        let mut written = 0;
         for token in &self.0 {
             match token {
-                FormatToken::Literal(bytes) => output.extend_from_slice(bytes),
-                FormatToken::Offset => decimal(record.offset, &mut output),
-                FormatToken::Key => output.extend_from_slice(record.key.unwrap_or_default()),
-                FormatToken::KeyLength => optional_length(record.key, &mut output),
+                FormatToken::Literal(bytes) => write_bytes(output, bytes, &mut written)?,
+                FormatToken::Offset => write_decimal(output, record.offset, &mut written)?,
+                FormatToken::Key => {
+                    write_bytes(output, record.key.unwrap_or_default(), &mut written)?
+                }
+                FormatToken::KeyLength => write_optional_length(output, record.key, &mut written)?,
                 FormatToken::Payload => {
                     if let Payload::Bytes(bytes) = record.payload {
-                        output.extend_from_slice(bytes);
+                        write_bytes(output, bytes, &mut written)?;
                     }
                 }
                 FormatToken::PayloadLength => match record.payload {
-                    Payload::Tombstone => decimal(-1, &mut output),
-                    Payload::Bytes(bytes) => decimal(bytes.len(), &mut output),
+                    Payload::Tombstone => write_decimal(output, -1, &mut written)?,
+                    Payload::Bytes(bytes) => write_decimal(output, bytes.len(), &mut written)?,
                 },
                 FormatToken::PayloadLengthBinary => {
                     let length = match record.payload {
                         Payload::Tombstone => -1,
-                        Payload::Bytes(bytes) => i32::try_from(bytes.len()).map_err(|_| {
-                            FormatError(format!(
-                                "payload length {} exceeds %R signed 32-bit limit",
-                                bytes.len()
-                            ))
-                        })?,
+                        Payload::Bytes(bytes) => {
+                            i32::try_from(bytes.len()).expect("%R payload length was prevalidated")
+                        }
                     };
-                    output.extend_from_slice(&length.to_be_bytes());
+                    write_bytes(output, &length.to_be_bytes(), &mut written)?;
                 }
-                FormatToken::Topic => output.extend_from_slice(record.topic.as_bytes()),
-                FormatToken::Partition => decimal(record.partition, &mut output),
-                FormatToken::Timestamp => decimal(
+                FormatToken::Topic => write_bytes(output, record.topic.as_bytes(), &mut written)?,
+                FormatToken::Partition => write_decimal(output, record.partition, &mut written)?,
+                FormatToken::Timestamp => write_decimal(
+                    output,
                     record.timestamp.map_or(-1, |value| value.milliseconds),
-                    &mut output,
-                ),
+                    &mut written,
+                )?,
                 FormatToken::Headers => {
                     for (index, header) in record.headers.iter().enumerate() {
                         if index != 0 {
-                            output.push(b',');
+                            write_bytes(output, b",", &mut written)?;
                         }
-                        output.extend_from_slice(header.name.as_bytes());
-                        output.push(b'=');
+                        write_bytes(output, header.name.as_bytes(), &mut written)?;
+                        write_bytes(output, b"=", &mut written)?;
                         match header.value {
-                            None => output.extend_from_slice(b"NULL"),
-                            Some(value) => output.extend_from_slice(value),
+                            None => write_bytes(output, b"NULL", &mut written)?,
+                            Some(value) => write_bytes(output, value, &mut written)?,
                         }
                     }
                 }
             }
         }
-        Ok(output)
+        Ok(written)
     }
 
     pub fn requirements(&self) -> OutputRequirements {
@@ -234,136 +259,217 @@ fn flush_literal(tokens: &mut Vec<FormatToken>, literal: &mut Vec<u8>) {
     }
 }
 
-fn decimal(value: impl ToString, output: &mut Vec<u8>) {
-    output.extend_from_slice(value.to_string().as_bytes());
+fn write_bytes(output: &mut impl Write, bytes: &[u8], written: &mut usize) -> io::Result<()> {
+    *written = written
+        .checked_add(bytes.len())
+        .ok_or_else(|| io::Error::other("formatted record length overflowed usize"))?;
+    output.write_all(bytes)
 }
 
-fn optional_length(value: Option<&[u8]>, output: &mut Vec<u8>) {
+fn write_decimal(
+    output: &mut impl Write,
+    value: impl ToString,
+    written: &mut usize,
+) -> io::Result<()> {
+    write_bytes(output, value.to_string().as_bytes(), written)
+}
+
+fn write_optional_length(
+    output: &mut impl Write,
+    value: Option<&[u8]>,
+    written: &mut usize,
+) -> io::Result<()> {
     match value {
-        None => decimal(-1, output),
-        Some(value) => decimal(value.len(), output),
+        None => write_decimal(output, -1, written),
+        Some(value) => write_decimal(output, value.len(), written),
     }
 }
 
+#[cfg(test)]
 pub fn render_envelope(record: &OutputRecord<'_>) -> Vec<u8> {
     let mut output = Vec::new();
-    output.push(b'{');
-    field_string("topic", record.topic, &mut output);
-    field_number("partition", record.partition, &mut output);
-    field_number("offset", record.offset, &mut output);
-    output.extend_from_slice(b",\"timestamp\":");
+    write_envelope(record, &mut output).expect("writing to a vector cannot fail");
+    output
+}
+
+pub fn write_envelope(record: &OutputRecord<'_>, output: &mut impl Write) -> io::Result<usize> {
+    let mut written = 0;
+    write_bytes(output, b"{\"topic\":", &mut written)?;
+    write_json_string(output, record.topic, &mut written)?;
+    write_bytes(output, b",\"partition\":", &mut written)?;
+    write_decimal(output, record.partition, &mut written)?;
+    write_bytes(output, b",\"offset\":", &mut written)?;
+    write_decimal(output, record.offset, &mut written)?;
+    write_bytes(output, b",\"timestamp\":", &mut written)?;
     match record.timestamp {
-        Some(timestamp) => decimal(timestamp.milliseconds, &mut output),
-        None => output.extend_from_slice(b"null"),
+        Some(timestamp) => write_decimal(output, timestamp.milliseconds, &mut written)?,
+        None => write_bytes(output, b"null", &mut written)?,
     }
-    output.extend_from_slice(b",\"timestampType\":");
+    write_bytes(output, b",\"timestampType\":", &mut written)?;
     match record.timestamp.map(|value| value.kind) {
-        Some(TimestampType::CreateTime) => write_string("createTime", &mut output),
-        Some(TimestampType::LogAppendTime) => write_string("logAppendTime", &mut output),
-        None => output.extend_from_slice(b"null"),
+        Some(TimestampType::CreateTime) => write_json_string(output, "createTime", &mut written)?,
+        Some(TimestampType::LogAppendTime) => {
+            write_json_string(output, "logAppendTime", &mut written)?
+        }
+        None => write_bytes(output, b"null", &mut written)?,
     }
-    bytes_fields("key", record.key, &mut output);
-    output.extend_from_slice(b",\"headers\":[");
+    write_bytes_fields(output, "key", record.key, &mut written)?;
+    write_bytes(output, b",\"headers\":[", &mut written)?;
     for (index, header) in record.headers.iter().enumerate() {
         if index != 0 {
-            output.push(b',');
+            write_bytes(output, b",", &mut written)?;
         }
-        output.push(b'{');
-        write_string("name", &mut output);
-        output.push(b':');
-        write_string(header.name, &mut output);
-        bytes_fields("value", header.value, &mut output);
-        output.push(b'}');
+        write_bytes(output, b"{\"name\":", &mut written)?;
+        write_json_string(output, header.name, &mut written)?;
+        write_bytes_fields(output, "value", header.value, &mut written)?;
+        write_bytes(output, b"}", &mut written)?;
     }
-    output.push(b']');
-    field_string(
-        "action",
+    write_bytes(output, b"],\"action\":", &mut written)?;
+    write_json_string(
+        output,
         match record.action {
             EmittedAction::Tombstone => "tombstone",
             EmittedAction::PassThrough => "pass",
             EmittedAction::Project => "project",
         },
-        &mut output,
-    );
+        &mut written,
+    )?;
     match record.payload {
-        Payload::Tombstone => bytes_fields("payload", None, &mut output),
-        Payload::Bytes(bytes) => bytes_fields("payload", Some(bytes), &mut output),
+        Payload::Tombstone => write_bytes_fields(output, "payload", None, &mut written)?,
+        Payload::Bytes(bytes) => write_bytes_fields(output, "payload", Some(bytes), &mut written)?,
     }
-    output.extend_from_slice(b"}\n");
-    output
+    write_bytes(output, b"}\n", &mut written)?;
+    Ok(written)
 }
 
-fn field_string(name: &str, value: &str, output: &mut Vec<u8>) {
-    if output.last() != Some(&b'{') {
-        output.push(b',');
-    }
-    write_string(name, output);
-    output.push(b':');
-    write_string(value, output);
-}
-
-fn field_number(name: &str, value: impl ToString, output: &mut Vec<u8>) {
-    output.push(b',');
-    write_string(name, output);
-    output.push(b':');
-    decimal(value, output);
-}
-
-fn bytes_fields(name: &str, value: Option<&[u8]>, output: &mut Vec<u8>) {
-    output.push(b',');
-    write_string(name, output);
-    output.push(b':');
+fn write_bytes_fields(
+    output: &mut impl Write,
+    name: &str,
+    value: Option<&[u8]>,
+    written: &mut usize,
+) -> io::Result<()> {
+    write_bytes(output, b",\"", written)?;
+    write_bytes(output, name.as_bytes(), written)?;
+    write_bytes(output, b"\":", written)?;
     let encoding = match value {
         None => {
-            output.extend_from_slice(b"null");
+            write_bytes(output, b"null", written)?;
             None
         }
         Some(bytes) => {
-            let (value, encoding) = match std::str::from_utf8(bytes) {
-                Ok(value) => (value.to_owned(), "utf8"),
-                Err(_) => (base64(bytes), "base64"),
+            write_bytes(output, b"\"", written)?;
+            let encoding = match std::str::from_utf8(bytes) {
+                Ok(value) => {
+                    write_json_string_contents(output, value, written)?;
+                    "utf8"
+                }
+                Err(_) => {
+                    write_base64(output, bytes, written)?;
+                    "base64"
+                }
             };
-            write_string(&value, output);
+            write_bytes(output, b"\"", written)?;
             Some(encoding)
         }
     };
-    output.push(b',');
-    write_string(&format!("{name}Encoding"), output);
-    output.push(b':');
+    write_bytes(output, b",\"", written)?;
+    write_bytes(output, name.as_bytes(), written)?;
+    write_bytes(output, b"Encoding\":", written)?;
     match encoding {
-        Some(encoding) => write_string(encoding, output),
-        None => output.extend_from_slice(b"null"),
+        Some(encoding) => write_json_string(output, encoding, written)?,
+        None => write_bytes(output, b"null", written)?,
     }
-    output.push(b',');
-    write_string(&format!("{name}Length"), output);
-    output.push(b':');
+    write_bytes(output, b",\"", written)?;
+    write_bytes(output, name.as_bytes(), written)?;
+    write_bytes(output, b"Length\":", written)?;
     match value {
-        Some(bytes) => decimal(bytes.len(), output),
-        None => decimal(-1, output),
+        Some(bytes) => write_decimal(output, bytes.len(), written),
+        None => write_decimal(output, -1, written),
     }
 }
 
-fn base64(input: &[u8]) -> String {
+fn write_json_string(output: &mut impl Write, value: &str, written: &mut usize) -> io::Result<()> {
+    write_bytes(output, b"\"", written)?;
+    write_json_string_contents(output, value, written)?;
+    write_bytes(output, b"\"", written)
+}
+
+fn write_json_string_contents(
+    output: &mut impl Write,
+    value: &str,
+    written: &mut usize,
+) -> io::Result<()> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let escaped = match byte {
+            b'"' => Some(b"\\\"".as_slice()),
+            b'\\' => Some(b"\\\\".as_slice()),
+            b'\x08' => Some(b"\\b".as_slice()),
+            b'\x0c' => Some(b"\\f".as_slice()),
+            b'\n' => Some(b"\\n".as_slice()),
+            b'\r' => Some(b"\\r".as_slice()),
+            b'\t' => Some(b"\\t".as_slice()),
+            0..=0x1f => {
+                if start != index {
+                    write_bytes(output, &bytes[start..index], written)?;
+                }
+                write_bytes(
+                    output,
+                    &[
+                        b'\\',
+                        b'u',
+                        b'0',
+                        b'0',
+                        HEX[(byte >> 4) as usize],
+                        HEX[(byte & 15) as usize],
+                    ],
+                    written,
+                )?;
+                start = index + 1;
+                None
+            }
+            _ => None,
+        };
+        if let Some(escaped) = escaped {
+            if start != index {
+                write_bytes(output, &bytes[start..index], written)?;
+            }
+            write_bytes(output, escaped, written)?;
+            start = index + 1;
+        }
+    }
+    write_bytes(output, &bytes[start..], written)
+}
+
+fn write_base64(output: &mut impl Write, input: &[u8], written: &mut usize) -> io::Result<()> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut encoded = [0; 4096];
+    let mut length = 0;
     for chunk in input.chunks(3) {
+        if length + 4 > encoded.len() {
+            write_bytes(output, &encoded[..length], written)?;
+            length = 0;
+        }
         let bits = (u32::from(chunk[0]) << 16)
             | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
             | u32::from(*chunk.get(2).unwrap_or(&0));
-        output.push(TABLE[((bits >> 18) & 63) as usize] as char);
-        output.push(TABLE[((bits >> 12) & 63) as usize] as char);
-        output.push(if chunk.len() > 1 {
-            TABLE[((bits >> 6) & 63) as usize] as char
+        encoded[length] = TABLE[((bits >> 18) & 63) as usize];
+        encoded[length + 1] = TABLE[((bits >> 12) & 63) as usize];
+        encoded[length + 2] = if chunk.len() > 1 {
+            TABLE[((bits >> 6) & 63) as usize]
         } else {
-            '='
-        });
-        output.push(if chunk.len() > 2 {
-            TABLE[(bits & 63) as usize] as char
+            b'='
+        };
+        encoded[length + 3] = if chunk.len() > 2 {
+            TABLE[(bits & 63) as usize]
         } else {
-            '='
-        });
+            b'='
+        };
+        length += 4;
     }
-    output
+    write_bytes(output, &encoded[..length], written)
 }
 
 #[cfg(test)]
@@ -410,10 +516,13 @@ mod tests {
         };
         let format =
             CompiledFormat::compile("%t\\t%p\\t%o\\t%T\\t%K%k\\t%S%s\\t%h%%\\x0a").unwrap();
+        let mut output = Vec::new();
+        let written = format.write_to(&record, &mut output).unwrap();
         assert_eq!(
-            format.render(&record).unwrap(),
+            output,
             b"events\t3\t42\t7\t1k\t1v\tnull=NULL,empty=,raw=x%\n"
         );
+        assert_eq!(written, output.len());
     }
 
     #[test]
@@ -457,5 +566,20 @@ mod tests {
             br#"{"topic":"events","partition":3,"offset":42,"timestamp":null,"timestampType":null,"key":"/w==","keyEncoding":"base64","keyLength":1,"headers":[{"name":"trace","value":"/w==","valueEncoding":"base64","valueLength":1}],"action":"tombstone","payload":null,"payloadEncoding":null,"payloadLength":-1}
 "#
         );
+    }
+
+    #[test]
+    fn streaming_envelope_primitives_escape_and_base64_encode_exactly() {
+        let mut output = Vec::new();
+        let mut written = 0;
+        write_json_string(&mut output, "\"\\\n\u{1}", &mut written).unwrap();
+        assert_eq!(output, b"\"\\\"\\\\\\n\\u0001\"");
+        assert_eq!(written, output.len());
+
+        output.clear();
+        written = 0;
+        write_base64(&mut output, &[0xff, 0xee], &mut written).unwrap();
+        assert_eq!(output, b"/+4=");
+        assert_eq!(written, output.len());
     }
 }

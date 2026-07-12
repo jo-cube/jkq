@@ -299,7 +299,7 @@ fn poll_loop(
     let mut error = None;
     let mut signal = None;
     let mut admitted = 0_u64;
-    let mut next_stats = config.stats_interval.map(|interval| started + interval);
+    let mut next_stats = config.stats_interval;
 
     loop {
         loop {
@@ -425,15 +425,17 @@ fn report_periodic(
     config: &RuntimeConfig,
     stats: &Stats,
     started: Instant,
-    next: &mut Option<Instant>,
+    next: &mut Option<Duration>,
 ) {
     let Some(deadline) = *next else {
         return;
     };
-    let now = Instant::now();
-    if now >= deadline {
-        eprintln!("jkq: stats {}", stats.report(started.elapsed()));
-        *next = config.stats_interval.map(|interval| now + interval);
+    let elapsed = started.elapsed();
+    if elapsed >= deadline {
+        eprintln!("jkq: stats {}", stats.report(elapsed));
+        *next = config
+            .stats_interval
+            .and_then(|interval| elapsed.checked_add(interval));
     }
 }
 
@@ -615,16 +617,15 @@ fn write_action(
         payload,
         action: emitted_action,
     };
-    let bytes = match &config.output {
-        OutputPlan::Format(format) => format.render(&output_record).map_err(io::Error::other)?,
-        OutputPlan::Envelope => output::render_envelope(&output_record),
+    let output_bytes = match &config.output {
+        OutputPlan::Format(format) => format.write_to(&output_record, writer)?,
+        OutputPlan::Envelope => output::write_envelope(&output_record, writer)?,
     };
-    writer.write_all(&bytes)?;
     if config.unbuffered {
         writer.flush()?;
     }
     stats.output_records.fetch_add(1, Ordering::Relaxed);
-    add(&stats.output_bytes, bytes.len());
+    add(&stats.output_bytes, output_bytes);
     Ok(())
 }
 
@@ -722,5 +723,13 @@ mod tests {
 
         assert_eq!(output, b"1\n0\n");
         assert_eq!(release_rx.iter().count(), 2);
+    }
+
+    #[test]
+    fn periodic_statistics_accept_the_largest_cli_duration() {
+        let config = config(&["--stats-interval", "18446744073709551615ms"]);
+        let mut next = config.stats_interval;
+        report_periodic(&config, &Stats::default(), Instant::now(), &mut next);
+        assert_eq!(next, config.stats_interval);
     }
 }
