@@ -206,3 +206,11 @@ Deferred questions must be resolved in the relevant specification before a stabl
 **Decision:** Use `rdkafka` without its default Tokio feature, compile the pinned librdkafka source, and vendor OpenSSL support.
 
 **Reason:** The runtime uses the synchronous base consumer and must not introduce an async runtime. Static librdkafka plus vendored TLS avoids requiring a preinstalled librdkafka or OpenSSL development package on supported build hosts. Zlib support remains enabled for compressed Kafka records.
+
+## D31. Initial bounded runtime
+
+**Decision:** One poll/admission thread distributes records over bounded crossbeam channels to a fixed worker pool. The calling thread is the sole completion restorer and output writer. Retained charges are released only after ordered drain; unordered mode releases after immediate write or drop.
+
+**Backpressure:** Global record and byte pressure pauses every selected partition. Per-partition record pressure pauses only that partition. Resume occurs below 75% of each triggering limit. One already-polled candidate may wait outside admitted accounting, and one oversized record may be admitted only when no other admitted bytes remain.
+
+**Shutdown:** The first `SIGINT` or `SIGTERM` stops admission and drains. A second termination signal uses signal-hook's conditional process exit so blocked output cannot prevent forced shutdown.

@@ -2,7 +2,7 @@
 
 `jkq` is a Rust command-line consumer for explicitly selected Kafka partitions whose record values are JSON. It applies a restricted predicate and projection language, then emits dropped, tombstoned, exact pass-through, or compact projected records with kcat-style formatting.
 
-The current implementation directly assigns Kafka partitions, resolves documented start and end positions, captures fixed snapshots, copies borrowed messages into owned records, applies the compiled transform, and writes formatted output. This path is deliberately single-threaded. Bounded parallel workers, backpressure, signal handling, and graceful draining are the next runtime slice.
+The current implementation directly assigns Kafka partitions, resolves documented start and end positions, captures fixed snapshots, and runs owned records through a bounded compute pool. It restores source order within each partition before one writer emits output, pauses Kafka partitions under record or byte pressure, and drains admitted work on termination.
 
 ## Examples
 
@@ -40,6 +40,6 @@ jkq -b localhost:9092 -t events -p 0 \
 
 Run the normal repository checks with `make check`.
 
-## Current runtime limits
+## Runtime limits
 
-The Stage 2 runtime admits and completes one record at a time, so partition order is preserved without a reorder buffer. Worker-count, unordered-mode, in-flight-limit, and statistics options are validated and retained in resolved configuration but do not change execution until the bounded worker runtime is implemented.
+`--max-inflight-records`, `--max-inflight-bytes`, and `--max-inflight-per-partition` bound admitted work. A record larger than the byte budget runs alone. Kafka polling continues while assigned partitions are paused, and partitions resume below the documented low-water thresholds.

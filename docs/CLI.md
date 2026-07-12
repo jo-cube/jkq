@@ -205,6 +205,8 @@ This reduces throughput and should be used only for interactive or latency-sensi
 
 Write final statistics to stderr.
 
+The report contains admitted input records, input tombstones and payload bytes, action counts, invalid-JSON and evaluation failures, output records and bytes, and elapsed milliseconds. Statistics never change stdout.
+
 ### `--stats-interval <duration>`
 
 Write periodic statistics to stderr. A final report is still written.
@@ -428,7 +430,7 @@ name=value,name=NULL,name=
 | interrupted before completion | 130 |
 | terminated before completion | 143 |
 
-Exact signal behavior should be frozen by process integration tests.
+The first `SIGINT` or `SIGTERM` stops admission, drains admitted records, flushes stdout, and returns the corresponding signal code. A second termination signal forces immediate exit with the second signal's code.
 
 ## 15. Compatibility Testing
 

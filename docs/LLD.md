@@ -60,7 +60,7 @@ docs/
 
 This is a target shape, not a requirement to create every file immediately. Start cohesive and split only when a module has a clear responsibility.
 
-The Stage 2 implementation keeps Kafka assignment, offset resolution, snapshot state, and owned-record conversion together in `src/kafka.rs`; splitting that cohesive module before the bounded poller exists would only add wrappers. `src/app.rs` runs the synchronous Kafka-to-transform-to-output path. Runtime admission, worker, completion, and signal modules remain deferred until they contain real concurrent behavior.
+Kafka assignment, offset resolution, snapshot state, owned-record conversion, and pause/resume remain cohesive in `src/kafka.rs`. Stage 3 adds thread orchestration in `src/runtime.rs` and keeps admission plus completion-frontier state in `src/runtime/state.rs`. Further splitting would create wrappers until one of the remaining runtime responsibilities grows independently.
 
 ## 2. Application Assembly
 
@@ -71,7 +71,7 @@ The Stage 2 implementation keeps Kafka assignment, offset resolution, snapshot s
 3. map the result to an exit code;
 4. suppress normal broken-pipe diagnostics.
 
-`app.rs` owns startup sequencing and runtime assembly. It should not contain parsing, Kafka polling, or evaluator logic.
+`app.rs` owns startup sequencing, signal installation, final statistics, and runtime assembly. It does not contain parsing, Kafka polling, evaluator, or ordering logic.
 
 ## 3. Resolved Configuration
 
@@ -192,6 +192,8 @@ struct Header {
 ```
 
 Only allocate headers when required.
+
+The retained charge includes copied payload bytes plus required key bytes and required header names and values. Topic and fixed-size source coordinates are not charged. A message whose charge cannot yet be admitted is the sole pending poll candidate while all partitions are paused; its owned copy is bounded by librdkafka's configured message limit but is not added to the admitted-byte counter until capacity is available.
 
 ## 6. Action and Completion Types
 
@@ -553,16 +555,17 @@ struct PartitionAdmission {
 
 ### 13.2 Reservation
 
-Before copying and enqueueing a payload:
+After polling a payload:
 
-1. calculate required retained bytes from payload, key, and headers;
+1. copy only required fields and calculate their retained-byte charge;
 2. check global and partition limits;
-3. if unavailable, pause and poll for control/completion events;
-4. reserve counters;
-5. copy the record;
-6. enqueue work.
+3. if unavailable, keep this as the sole pending candidate, pause all partitions, and poll control events;
+4. reserve counters when capacity becomes available;
+5. enqueue work.
 
 If enqueue fails due to shutdown, roll back the reservation.
+
+One record larger than the byte budget is admitted only when no other admitted bytes remain. The implementation holds at most one already-polled, not-yet-admitted candidate. Kafka reveals the next record size only after polling, so this copy is outside the admitted-byte counter until it can reserve capacity. No second candidate is accepted while byte pressure is active.
 
 ### 13.3 Release
 
@@ -767,6 +770,8 @@ Second signal:
 - stop waiting for drain;
 - best-effort flush;
 - exit with signal-related status.
+
+The implementation uses signal-hook's conditional shutdown handler: the first `SIGINT` or `SIGTERM` arms forced termination and starts the normal drain; another termination signal exits immediately even when a worker or stdout is blocked.
 
 A fatal error follows the draining path where safe but retains a failure exit code.
 
