@@ -42,4 +42,4 @@ Run the normal repository checks with `make check`.
 
 ## Runtime limits
 
-`--max-inflight-records`, `--max-inflight-bytes`, and `--max-inflight-per-partition` bound admitted work. A record larger than the byte budget runs alone. Kafka polling continues while assigned partitions are paused, and partitions resume below the documented low-water thresholds.
+`--max-inflight-records`, `--max-inflight-bytes`, and `--max-inflight-per-partition` bound admitted work. The byte charge conservatively covers parsing copies and projected output, so duplicative projections may reduce concurrency. A record larger than the byte budget runs alone. Kafka polling continues while assigned partitions are paused, and partitions resume below the documented low-water thresholds.

@@ -39,7 +39,7 @@ Performance should come primarily from:
 - identifying referenced paths before consumption;
 - avoiding full owned DOM construction where possible;
 - skipping parsing for input tombstones and identity transforms;
-- reusing buffers;
+- bounding scratch allocations and reusing buffers only when measured;
 - bounding queues and retained bytes;
 - parallelizing CPU work while restoring partition order.
 
@@ -76,7 +76,7 @@ The language must cover common field filtering, existence checks, comparisons, b
 
 ### G4. High throughput with bounded memory
 
-Use a bounded worker pool, worker-local scratch buffers, per-partition completion ordering, byte-aware admission control, and Kafka partition pause/resume.
+Use a bounded worker pool, bounded transform scratch space, per-partition completion ordering, byte-aware admission control, and Kafka partition pause/resume.
 
 ### G5. Familiar output formatting
 

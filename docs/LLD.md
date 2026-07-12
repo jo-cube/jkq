@@ -193,7 +193,14 @@ struct Header {
 
 Only allocate headers when required.
 
-The retained charge includes copied payload bytes plus required key bytes and required header names and values. Topic and fixed-size source coordinates are not charged. A message whose charge cannot yet be admitted is the sole pending poll candidate while all partitions are paused; its owned copy is bounded by librdkafka's configured message limit but is not added to the admitted-byte counter until capacity is available.
+The retained charge includes required key bytes, required header names and values,
+and a conservative payload peak compiled from the transform plan. The payload
+peak covers the owned input, an original-preserving parse copy when required, and
+the maximum serialized projection size. Topic and fixed-size source coordinates
+are not charged. A message whose charge cannot yet be admitted is the sole pending
+poll candidate while all partitions are paused; its owned copy is bounded by
+librdkafka's configured message limit but is not added to the admitted-byte
+counter until capacity is available.
 
 ## 6. Action and Completion Types
 
@@ -319,6 +326,7 @@ struct TransformPlan {
     tombstones: Vec<CompiledExpr>,
     projection: Option<CompiledExpr>,
     capabilities: PlanCapabilities,
+    payload_budget: PayloadBudget,
 }
 ```
 
@@ -475,7 +483,7 @@ Required when pass-through or invalid-JSON pass policy is possible.
 
 ```text
 original Vec<u8>
-→ copy into worker parse buffer
+→ clone into an owned parse buffer
 → parse mutable buffer
 → retain original unchanged
 ```
@@ -500,20 +508,22 @@ Choose the path through a compile-time capability flag, not per-record guesswork
 
 The first implementation may use a borrowed or tape representation and resolve only compiled paths. It should avoid creating an owned `Value` tree.
 
-The path plan should deduplicate shared prefixes:
+The initial compiler deduplicates identical complete paths. A later path trie may
+also deduplicate shared prefixes such as:
 
 ```text
 .customer.id
 .customer.status
 ```
 
-becomes one traversal into `.customer`.
+so they become one traversal into `.customer`.
 
-If the selected `simd-json` API cannot efficiently exploit the trie, keep the trie in the compiler contract for a later backend and benchmark the initial traversal honestly.
+Add that trie only when the selected backend can exploit it and benchmarks show
+the independent traversals matter.
 
 ### 12.3 Projection serialization
 
-Serialize into a worker-local `Vec<u8>`.
+Serialize into a record-owned `Vec<u8>`.
 
 Requirements:
 
@@ -523,13 +533,8 @@ Requirements:
 - no trailing newline;
 - distinguish projected `null` from tombstone.
 
-Move the completed vector to the output record and replace it with a pooled or fresh vector. Avoid retaining arbitrarily large capacities in every worker.
-
-Suggested retention policy:
-
-- reuse buffers up to a configurable or internal cap;
-- shrink by replacement when capacity exceeds the cap;
-- never call `shrink_to_fit` per record.
+Move the completed vector to the output record. A future worker-local pool must cap
+retained capacity and requires benchmark evidence.
 
 ## 13. Admission Controller
 
@@ -708,8 +713,8 @@ The initial schema is compact, newline-terminated, and emitted in the following 
     {
       "name": "trace-id",
       "value": "abc",
-      "encoding": "utf8",
-      "length": 3
+      "valueEncoding": "utf8",
+      "valueLength": 3
     }
   ],
   "action": "project",
@@ -723,7 +728,7 @@ For keys, header values, and payloads, valid UTF-8 is represented directly with 
 
 Payloads are strings rather than embedded JSON. This preserves exact pass-through bytes, supports invalid-JSON pass policy, and avoids changing JSON whitespace, numeric spelling, or object order. Tombstones use `payload: null`, `payloadEncoding: null`, `payloadLength: -1`, and action `"tombstone"`. JSON text `null` is the UTF-8 string `"null"` with length `4`.
 
-An absent timestamp uses null for both `timestamp` and `timestampType`. Available types are `"createTime"` and `"logAppendTime"`. Golden tests freeze binary encoding, null representation, field order, and the trailing newline.
+An absent timestamp uses null for both `timestamp` and `timestampType`. Available types are `"createTime"` and `"logAppendTime"`. Golden tests freeze binary encoding, null representation, field order, and the trailing newline. The envelope is streamed directly to the writer.
 
 ## 18. Error Policies
 

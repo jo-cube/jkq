@@ -117,13 +117,9 @@ The interface must not expose `simd-json` value types outside the backend module
 
 ### 3.6 Compute workers
 
-Each long-lived worker owns:
-
-- a reusable parse buffer;
-- a reusable projection buffer;
-- backend execution state;
-- temporary extraction slots;
-- local counters periodically merged into global statistics.
+Each long-lived worker keeps backend execution state local. The initial backend uses
+record-owned parse and projection buffers; reusable worker-local buffers remain a
+benchmark-driven optimization rather than part of the current runtime contract.
 
 Workers:
 
@@ -363,6 +359,12 @@ At minimum:
 - completion queue capacity.
 
 Global retained bytes include records waiting for compute, being processed, waiting for order, and waiting for write.
+
+Admission uses a conservative bound compiled from the transform plan. The charge
+includes the owned input, any original-preserving parse copy, and the maximum
+serialized projection size. This may admit fewer records than their eventual
+actions require, but transformed completions cannot escape the configured byte
+budget. Format and envelope encoding stream through the single writer.
 
 ### 8.2 Pause strategy
 

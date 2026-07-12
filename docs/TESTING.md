@@ -106,7 +106,7 @@ Keep Kafka setup reusable and isolated under `tests/support`.
 
 Fast repository tests may use librdkafka's disposable mock cluster for protocol-backed assignment, watermark, polling, EOF, tombstone, key, and header behavior. The mock cluster does not provide reliable timestamp-index semantics, so positive timestamp-range integration cases still belong in the disposable real-Kafka suite; unit tests cover mapping no-match results to the high watermark.
 
-The Stage 3 suite uses deterministic admission and completion-frontier unit tests, a mock-cluster oversized-record pause/resume case, and process tests for broken pipes plus graceful and forced signals. The ordering tests inject completions directly rather than relying on thread timing.
+The Stage 3 suite uses deterministic admission and completion-frontier unit tests, a mock-cluster oversized-record pause/resume case, and process tests for broken pipes plus graceful and forced signals. The ordering tests inject completions directly rather than relying on thread timing. The forced-signal process test observes writer output and poller progress before sending the second signal instead of sleeping for an assumed pipe state.
 
 ### 2.6 Differential compatibility tests
 

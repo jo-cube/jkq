@@ -243,6 +243,10 @@ Default: `1024`.
 
 Global retained byte budget.
 
+Admission conservatively includes parsing copies and the largest possible
+serialized projection for the compiled plan. A projection that duplicates large
+source values can therefore reduce concurrency before it reaches the byte limit.
+
 Size syntax should support binary units such as `MiB` and `GiB`, with plain integers interpreted as bytes.
 
 Default: `256MiB`.
@@ -319,7 +323,7 @@ Set a librdkafka property. Repeatable.
 
 Later repeated values for the same key override earlier ones.
 
-The runtime always sets `enable.auto.commit=false`, `enable.auto.offset.store=false`, and `enable.partition.eof=true`. These properties are owned by the direct-assignment and termination model and cannot be overridden through `-F` or `-X`. When `group.id` is absent, the runtime supplies `jkq`; a configured group identifier is accepted but no group subscription or offset commit occurs.
+The runtime always sets `enable.auto.commit=false`, `enable.auto.offset.store=false`, and `enable.partition.eof=true`. These properties are owned by the direct-assignment and termination model; specifying any of them through `-F` or `-X` is a command-line configuration error. When `group.id` is absent, the runtime supplies `jkq`; a configured group identifier is accepted but no group subscription or offset commit occurs.
 
 ### Default config discovery
 

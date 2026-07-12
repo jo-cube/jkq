@@ -118,6 +118,11 @@ false
 
 Number handling follows the backend's practical signed 64-bit, unsigned 64-bit, and floating-point representations. The product does not promise arbitrary-precision numbers.
 
+Mixed integer and floating-point comparisons are exact for the represented
+values; integers are not first rounded through `f64`. Projected floating-point
+values use compact round-trip JSON notation. Pass-through preserves the original
+number spelling.
+
 ## 6. Operators
 
 ### 6.1 Equality
