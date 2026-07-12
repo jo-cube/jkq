@@ -3,7 +3,7 @@ use std::{
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -36,6 +36,31 @@ const CONTROL_POLL: Duration = Duration::from_millis(10);
 pub enum PipelineError {
     Runtime(String),
     Output(io::Error),
+}
+
+enum RecordedFailure {
+    Runtime(String),
+    Output(io::ErrorKind, String),
+}
+
+impl RecordedFailure {
+    fn from_error(error: &PipelineError) -> Self {
+        match error {
+            PipelineError::Runtime(message) => Self::Runtime(message.clone()),
+            PipelineError::Output(error) => Self::Output(error.kind(), error.to_string()),
+        }
+    }
+
+    fn into_error(self) -> PipelineError {
+        match self {
+            Self::Runtime(message) => PipelineError::Runtime(message),
+            Self::Output(kind, message) => PipelineError::Output(io::Error::new(kind, message)),
+        }
+    }
+}
+
+fn record_failure(first: &OnceLock<RecordedFailure>, error: &PipelineError) {
+    let _ = first.set(RecordedFailure::from_error(error));
 }
 
 impl fmt::Display for PipelineError {
@@ -221,10 +246,12 @@ pub fn run_pipeline(
     let (completion_tx, completion_rx) = bounded::<Completion>(capacity);
     let (release_tx, release_rx) = bounded::<Release>(capacity);
     let started = Instant::now();
+    let first_failure = Arc::new(OnceLock::new());
 
-    thread::scope(|scope| {
+    let signal = thread::scope(|scope| {
         let poller_shutdown = Arc::clone(&shutdown);
         let poller_stats = Arc::clone(&stats);
+        let poller_failure = Arc::clone(&first_failure);
         let poller = scope.spawn(move || {
             poll_loop(
                 config,
@@ -235,6 +262,7 @@ pub fn run_pipeline(
                 signals,
                 poller_stats,
                 started,
+                poller_failure,
             )
         });
 
@@ -243,41 +271,64 @@ pub fn run_pipeline(
             let receiver = work_rx.clone();
             let sender = completion_tx.clone();
             let worker_stats = Arc::clone(&stats);
-            workers.push(scope.spawn(move || worker_loop(config, receiver, sender, worker_stats)));
+            let worker_shutdown = Arc::clone(&shutdown);
+            let worker_failure = Arc::clone(&first_failure);
+            workers.push(scope.spawn(move || {
+                guard_worker(worker_shutdown, worker_failure, || {
+                    worker_loop(config, receiver, sender, worker_stats);
+                });
+            }));
         }
         drop(work_rx);
         drop(completion_tx);
 
-        let writer_result = writer_loop(
-            config,
-            writer,
-            completion_rx,
-            release_tx,
-            Arc::clone(&shutdown),
-            Arc::clone(&stats),
-        );
+        let writer_result = catch_unwind(AssertUnwindSafe(|| {
+            writer_loop(
+                config,
+                writer,
+                completion_rx,
+                release_tx,
+                Arc::clone(&shutdown),
+                Arc::clone(&stats),
+                Arc::clone(&first_failure),
+            )
+        }));
+        if writer_result.is_err() {
+            let error = PipelineError::Runtime("output writer panicked".to_owned());
+            record_failure(&first_failure, &error);
+            shutdown.store(true, Ordering::SeqCst);
+        }
 
-        let mut join_error = None;
         for worker in workers {
-            if worker.join().is_err() && join_error.is_none() {
-                join_error = Some("compute worker panicked".to_owned());
+            if worker.join().is_err() {
+                let error = PipelineError::Runtime("compute worker panicked".to_owned());
+                record_failure(&first_failure, &error);
                 shutdown.store(true, Ordering::SeqCst);
             }
         }
-        let poll_result = poller
-            .join()
-            .map_err(|_| PipelineError::Runtime("Kafka poll thread panicked".to_owned()))?;
+        let poll_result = match poller.join() {
+            Ok(result) => result,
+            Err(_) => {
+                let error = PipelineError::Runtime("Kafka poll thread panicked".to_owned());
+                record_failure(&first_failure, &error);
+                return None;
+            }
+        };
+        poll_result.signal
+    });
 
-        writer_result?;
-        if let Some(error) = join_error.or(poll_result.error) {
-            return Err(PipelineError::Runtime(error));
-        }
-        Ok(poll_result.signal)
-    })
+    match Arc::try_unwrap(first_failure) {
+        Ok(first_failure) => match first_failure.into_inner() {
+            Some(error) => Err(error.into_error()),
+            None => Ok(signal),
+        },
+        Err(_) => Err(PipelineError::Runtime(
+            "internal failure state remained shared after shutdown".to_owned(),
+        )),
+    }
 }
 
 struct PollResult {
-    error: Option<String>,
     signal: Option<i32>,
 }
 
@@ -291,12 +342,12 @@ fn poll_loop(
     signals: &mut Signals,
     stats: Arc<Stats>,
     started: Instant,
+    first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> PollResult {
     let mut admission = Admission::new(&config.partitions, config.limits);
     let mut work_tx = Some(work_tx);
     let mut pending: Option<OwnedRecord> = None;
     let mut stopping = false;
-    let mut error = None;
     let mut signal = None;
     let mut admitted = 0_u64;
     let mut next_stats = config.stats_interval;
@@ -306,8 +357,7 @@ fn poll_loop(
             match release_rx.try_recv() {
                 Ok(release) => {
                     if let Err(release_error) = admission.release(release) {
-                        error.get_or_insert(release_error);
-                        shutdown.store(true, Ordering::SeqCst);
+                        runtime_failure(&first_failure, &shutdown, release_error);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -328,8 +378,7 @@ fn poll_loop(
             work_tx.take();
         }
         if let Err(pause_error) = admission.sync_pauses(&mut input, stopping, pending.is_some()) {
-            error.get_or_insert(pause_error);
-            shutdown.store(true, Ordering::SeqCst);
+            runtime_failure(&first_failure, &shutdown, pause_error);
             stopping = true;
             work_tx.take();
         }
@@ -342,16 +391,20 @@ fn poll_loop(
             match release_rx.recv_timeout(CONTROL_POLL) {
                 Ok(release) => {
                     if let Err(release_error) = admission.release(release) {
-                        error.get_or_insert(release_error);
+                        runtime_failure(&first_failure, &shutdown, release_error);
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if let Err(poll_error) = input.poll() {
-                        error.get_or_insert(poll_error);
+                        runtime_failure(&first_failure, &shutdown, poll_error);
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    error.get_or_insert("completion release channel closed early".to_owned());
+                    runtime_failure(
+                        &first_failure,
+                        &shutdown,
+                        "completion release channel closed early".to_owned(),
+                    );
                     break;
                 }
             }
@@ -366,8 +419,7 @@ fn poll_loop(
                     work_tx.as_ref().expect("running poller has work sender"),
                     &stats,
                 ) {
-                    error = Some(admit_error);
-                    shutdown.store(true, Ordering::SeqCst);
+                    runtime_failure(&first_failure, &shutdown, admit_error);
                 } else {
                     admitted += 1;
                 }
@@ -375,16 +427,16 @@ fn poll_loop(
                 pending = Some(record);
                 match input.poll() {
                     Ok(PollEvent::Record(_)) => {
-                        error = Some(
+                        runtime_failure(
+                            &first_failure,
+                            &shutdown,
                             "Kafka returned a record while all partitions were paused for byte backpressure"
                                 .to_owned(),
                         );
-                        shutdown.store(true, Ordering::SeqCst);
                     }
                     Ok(PollEvent::Done | PollEvent::Idle) => {}
                     Err(poll_error) => {
-                        error = Some(poll_error);
-                        shutdown.store(true, Ordering::SeqCst);
+                        runtime_failure(&first_failure, &shutdown, poll_error);
                     }
                 }
             }
@@ -400,8 +452,7 @@ fn poll_loop(
                         work_tx.as_ref().expect("running poller has work sender"),
                         &stats,
                     ) {
-                        error = Some(admit_error);
-                        shutdown.store(true, Ordering::SeqCst);
+                        runtime_failure(&first_failure, &shutdown, admit_error);
                     } else {
                         admitted += 1;
                     }
@@ -412,13 +463,29 @@ fn poll_loop(
             Ok(PollEvent::Idle) => {}
             Ok(PollEvent::Done) => stopping = true,
             Err(poll_error) => {
-                error = Some(poll_error);
-                shutdown.store(true, Ordering::SeqCst);
+                runtime_failure(&first_failure, &shutdown, poll_error);
             }
         }
     }
 
-    PollResult { error, signal }
+    PollResult { signal }
+}
+
+fn runtime_failure(first: &OnceLock<RecordedFailure>, shutdown: &AtomicBool, message: String) {
+    record_failure(first, &PipelineError::Runtime(message));
+    shutdown.store(true, Ordering::SeqCst);
+}
+
+fn guard_worker(
+    shutdown: Arc<AtomicBool>,
+    first: Arc<OnceLock<RecordedFailure>>,
+    worker: impl FnOnce(),
+) {
+    if catch_unwind(AssertUnwindSafe(worker)).is_err() {
+        let error = PipelineError::Runtime("compute worker panicked".to_owned());
+        record_failure(&first, &error);
+        shutdown.store(true, Ordering::SeqCst);
+    }
 }
 
 fn report_periodic(
@@ -525,6 +592,7 @@ fn writer_loop(
     release_tx: Sender<Release>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Stats>,
+    first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> Result<(), PipelineError> {
     let mut orderer = Orderer::default();
     let mut failure = None;
@@ -537,8 +605,12 @@ fn writer_loop(
                 Err((message, completion)) => {
                     let completion = *completion;
                     release(&release_tx, &completion);
-                    failure.get_or_insert(PipelineError::Runtime(message));
-                    shutdown.store(true, Ordering::SeqCst);
+                    writer_failure(
+                        &mut failure,
+                        &first_failure,
+                        &shutdown,
+                        PipelineError::Runtime(message),
+                    );
                     Vec::new()
                 }
             }
@@ -547,15 +619,23 @@ fn writer_loop(
             if failure.is_none() {
                 match completion.outcome {
                     CompletionOutcome::Fatal(ref message) => {
-                        failure = Some(PipelineError::Runtime(message.clone()));
-                        shutdown.store(true, Ordering::SeqCst);
+                        writer_failure(
+                            &mut failure,
+                            &first_failure,
+                            &shutdown,
+                            PipelineError::Runtime(message.clone()),
+                        );
                     }
                     CompletionOutcome::Action(ref action) => {
                         if let Err(error) =
                             write_action(config, writer, &completion.source, action, &stats)
                         {
-                            failure = Some(PipelineError::Output(error));
-                            shutdown.store(true, Ordering::SeqCst);
+                            writer_failure(
+                                &mut failure,
+                                &first_failure,
+                                &shutdown,
+                                PipelineError::Output(error),
+                            );
                         }
                     }
                 }
@@ -569,14 +649,37 @@ fn writer_loop(
         for completion in &pending {
             release(&release_tx, completion);
         }
-        failure.get_or_insert(PipelineError::Runtime(
-            "completion channel closed with a partition sequence gap".to_owned(),
-        ));
+        writer_failure(
+            &mut failure,
+            &first_failure,
+            &shutdown,
+            PipelineError::Runtime(
+                "completion channel closed with a partition sequence gap".to_owned(),
+            ),
+        );
     }
-    if failure.is_none() {
-        writer.flush().map_err(PipelineError::Output)?;
+    if failure.is_none()
+        && let Err(error) = writer.flush()
+    {
+        writer_failure(
+            &mut failure,
+            &first_failure,
+            &shutdown,
+            PipelineError::Output(error),
+        );
     }
     failure.map_or(Ok(()), Err)
+}
+
+fn writer_failure(
+    failure: &mut Option<PipelineError>,
+    first: &OnceLock<RecordedFailure>,
+    shutdown: &AtomicBool,
+    error: PipelineError,
+) {
+    record_failure(first, &error);
+    failure.get_or_insert(error);
+    shutdown.store(true, Ordering::SeqCst);
 }
 
 fn release(sender: &Sender<Release>, completion: &Completion) {
@@ -682,6 +785,7 @@ mod tests {
             release_tx,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Stats::default()),
+            Arc::new(OnceLock::new()),
         )
         .unwrap();
 
@@ -718,6 +822,7 @@ mod tests {
             release_tx,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Stats::default()),
+            Arc::new(OnceLock::new()),
         )
         .unwrap();
 
@@ -731,5 +836,25 @@ mod tests {
         let mut next = config.stats_interval;
         report_periodic(&config, &Stats::default(), Instant::now(), &mut next);
         assert_eq!(next, config.stats_interval);
+    }
+
+    #[test]
+    fn worker_panic_records_the_first_failure_and_starts_shutdown() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let first = Arc::new(OnceLock::new());
+        guard_worker(Arc::clone(&shutdown), Arc::clone(&first), || {
+            panic!("worker failure")
+        });
+        assert!(shutdown.load(Ordering::SeqCst));
+        assert!(matches!(
+            first.get(),
+            Some(RecordedFailure::Runtime(message)) if message == "compute worker panicked"
+        ));
+
+        record_failure(&first, &PipelineError::Runtime("later failure".to_owned()));
+        assert!(matches!(
+            first.get(),
+            Some(RecordedFailure::Runtime(message)) if message == "compute worker panicked"
+        ));
     }
 }
