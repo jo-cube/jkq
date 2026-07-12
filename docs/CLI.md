@@ -157,6 +157,32 @@ Write one compact JSON envelope per emitted record.
 
 Mutually exclusive with `-f`.
 
+#### Schema
+
+The envelope represents byte fields as JSON strings. Valid UTF-8 is emitted directly with encoding `"utf8"`; other bytes use RFC 4648 base64 with encoding `"base64"`. Null keys, header values, and payloads use JSON `null`, a null encoding, and length `-1`.
+
+Fields are emitted in this order:
+
+```json
+{
+  "topic": "events",
+  "partition": 3,
+  "offset": 42,
+  "timestamp": null,
+  "timestampType": null,
+  "key": "key",
+  "keyEncoding": "utf8",
+  "keyLength": 3,
+  "headers": [],
+  "action": "project",
+  "payload": "{\"id\":1}",
+  "payloadEncoding": "utf8",
+  "payloadLength": 8
+}
+```
+
+UTF-8 JSON payload bytes are represented as a string, not embedded as a JSON value. This preserves exact pass-through bytes, including whitespace and object order, and permits `--on-invalid-json pass` without a second envelope schema. `timestampType` is `"createTime"`, `"logAppendTime"`, or null. Each header contains `name`, `value`, `valueEncoding`, and `valueLength` in source order. Envelopes are compact and newline-terminated.
+
 ### Default output
 
 When neither `-f` nor `-J` is selected, default to:
@@ -207,15 +233,21 @@ Disables per-partition ordering. Does not allow byte interleaving.
 
 Global maximum admitted records not yet fully drained.
 
+Default: `1024`.
+
 ### `--max-inflight-bytes <size>`
 
 Global retained byte budget.
 
 Size syntax should support binary units such as `MiB` and `GiB`, with plain integers interpreted as bytes.
 
+Default: `256MiB`.
+
 ### `--max-inflight-per-partition <count>`
 
 Maximum admitted, not-yet-drained records for one partition.
+
+Default: `256`. This value cannot exceed the global record limit.
 
 ### `--worker-buffer-retain <size>`
 

@@ -171,14 +171,28 @@ Repeated predicate options short-circuit in command-line order.
 
 **Decision:** Tests freeze meaningful behavior and invariants, not coverage percentages.
 
-## D26. Deferred questions
+## D26. Initial defaults
+
+**Decision:** Start with 1,024 global in-flight records, 256 MiB retained payload bytes, and 256 in-flight records per partition. The worker count is `max(1, available_parallelism - 2)` and is capped at 1,024 when explicitly configured.
+
+**Reason:** These are conservative operational defaults, not performance claims. All limits remain explicit CLI configuration.
+
+## D27. String length
+
+**Decision:** `length(string)` counts Unicode scalar values.
+
+**Reason:** This matches user-visible character expectations without adding Unicode segmentation dependencies.
+
+## D28. JSON envelope bytes
+
+**Decision:** Keys, header values, and post-transform payloads use UTF-8 strings when valid and RFC 4648 base64 otherwise. Each byte field has an explicit encoding and byte length. Null uses JSON `null`, null encoding, and length `-1`.
+
+Payload JSON is not embedded as a JSON value. It remains a byte representation so pass-through output is exact and invalid-JSON pass policy has one schema. Field order, tombstones, timestamps, headers, and newline framing are frozen by golden tests.
+
+## D29. Deferred questions
 
 The following are deliberately deferred until implementation or benchmark evidence exists:
 
-- final JSON envelope byte/string encoding schema;
-- exact default memory limits;
-- exact default worker-count formula after benchmarking;
-- whether string length counts Unicode scalar values or UTF-8 bytes;
 - whether to add a custom single-pass path extractor;
 - whether unordered mode provides enough measured value to remain public;
 - whether implicit default config-file discovery is desirable;

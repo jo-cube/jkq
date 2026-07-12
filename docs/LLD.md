@@ -683,9 +683,7 @@ This format is not binary-safe. Users requiring binary-safe headers should use J
 
 ## 17. JSON Envelope
 
-Define a stable internal serializable structure rather than assembling strings.
-
-A candidate schema:
+The initial schema is compact, newline-terminated, and emitted in the following field order:
 
 ```json
 {
@@ -694,7 +692,7 @@ A candidate schema:
   "offset": 42,
   "timestamp": 1720000000000,
   "timestampType": "createTime",
-  "key": "base64-or-utf8",
+  "key": "abc",
   "keyEncoding": "utf8",
   "keyLength": 3,
   "headers": [
@@ -706,22 +704,17 @@ A candidate schema:
     }
   ],
   "action": "project",
-  "payload": {"id": 1},
+  "payload": "{\"id\":1}",
+  "payloadEncoding": "utf8",
   "payloadLength": 8
 }
 ```
 
-Before implementation, decide and freeze:
+For keys, header values, and payloads, valid UTF-8 is represented directly with encoding `"utf8"`; other bytes use RFC 4648 base64 with encoding `"base64"`. Null bytes use JSON `null`, a null encoding, and length `-1`. Header objects contain `name`, `value`, `valueEncoding`, and `valueLength` in source order.
 
-- UTF-8 versus base64 selection;
-- whether valid JSON payload is embedded as JSON or represented as text;
-- exact tombstone representation;
-- absent timestamp representation;
-- header encoding.
+Payloads are strings rather than embedded JSON. This preserves exact pass-through bytes, supports invalid-JSON pass policy, and avoids changing JSON whitespace, numeric spelling, or object order. Tombstones use `payload: null`, `payloadEncoding: null`, `payloadLength: -1`, and action `"tombstone"`. JSON text `null` is the UTF-8 string `"null"` with length `4`.
 
-The preferred product behavior is to embed projected or pass-through JSON as JSON, after validating it. Tombstones use `payload: null` plus `payloadLength: -1` and `action: "tombstone"`. Because JSON text `null` would also serialize as `null`, `payloadLength` and `action` preserve the distinction.
-
-Golden tests are mandatory.
+An absent timestamp uses null for both `timestamp` and `timestampType`. Available types are `"createTime"` and `"logAppendTime"`. Golden tests freeze binary encoding, null representation, field order, and the trailing newline.
 
 ## 18. Error Policies
 

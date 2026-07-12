@@ -226,11 +226,11 @@ length(expr)
 
 Returns:
 
-- Unicode scalar count or UTF-8 byte count for strings, chosen once and frozen by tests;
+- Unicode scalar count for strings;
 - element count for arrays;
 - field count for objects.
 
-Use Unicode scalar count for user expectations, unless benchmark evidence demonstrates unacceptable cost. Document the final choice in this file.
+Unicode scalar count is the initial compatibility contract and is frozen by evaluator tests.
 
 Missing produces `Missing`. Unsupported scalar types are evaluation errors.
 
