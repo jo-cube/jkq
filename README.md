@@ -40,6 +40,19 @@ jkq -b localhost:9092 -t events -p 0 \
 
 Run the normal repository checks with `make check`.
 
+## Building
+
+Install the Rust toolchain selected by `rust-toolchain.toml` and the native build
+tools required by `rdkafka`, then run:
+
+```sh
+cargo build --release --locked
+```
+
+The build compiles librdkafka and OpenSSL from pinned crate sources. On Unix, a C
+compiler, `make`, and Perl are required; `pkg-config` may also be needed for native
+compression libraries on the target platform.
+
 ## Runtime limits
 
 `--max-inflight-records`, `--max-inflight-bytes`, and `--max-inflight-per-partition` bound admitted work. The byte charge conservatively covers parsing copies and projected output, so duplicative projections may reduce concurrency. A record larger than the byte budget runs alone. Kafka polling continues while assigned partitions are paused, and partitions resume below the documented low-water thresholds.

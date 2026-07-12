@@ -13,7 +13,7 @@ This directory is the authoritative design set for the project.
 | [Releases](RELEASES.md) | Versioning, release assets, checksums, supported platforms, and installer contract |
 | [Decisions](DECISIONS.md) | Accepted design decisions and deliberately deferred work |
 
-The root `AGENTS.md` contains repository-wide contribution instructions. The root `BOOTSTRAP_PROMPT.md` contains the initial implementation task.
+The root `AGENTS.md` contains repository-wide contribution instructions.
 
 ## Authority
 
