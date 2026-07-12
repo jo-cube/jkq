@@ -11,7 +11,7 @@ use crate::{
 };
 
 const DEFAULT_MAX_INFLIGHT_RECORDS: usize = 1_024;
-const DEFAULT_MAX_INFLIGHT_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_MAX_INFLIGHT_BYTES: &str = "256MiB";
 const DEFAULT_MAX_INFLIGHT_PER_PARTITION: usize = 256;
 
 #[derive(Debug, Parser)]
@@ -20,58 +20,85 @@ const DEFAULT_MAX_INFLIGHT_PER_PARTITION: usize = 256;
     about = "Consume explicitly assigned Kafka partitions and transform JSON records"
 )]
 pub struct RawCli {
+    /// Comma-separated bootstrap broker list
     #[arg(short = 'b', long)]
     brokers: Option<String>,
+    /// Kafka topic to consume
     #[arg(short = 't', long)]
     topic: String,
+    /// Partition to consume; repeat for multiple partitions
     #[arg(short = 'p', long = "partition", required = true)]
     partitions: Vec<i32>,
+    /// Start position or s@/e@ timestamp boundary
     #[arg(short = 'o', long = "offset", allow_hyphen_values = true)]
     offsets: Vec<String>,
+    /// Exclusive end offset for every selected partition
     #[arg(long, allow_hyphen_values = true)]
     end_offset: Option<i64>,
+    /// Maximum admitted input records
     #[arg(short = 'c', long)]
     count: Option<u64>,
+    /// Exit after reaching the current end of every partition
     #[arg(short = 'e', long)]
     exit_at_end: bool,
+    /// Capture startup high watermarks as fixed exclusive ends
     #[arg(long)]
     snapshot: bool,
+    /// Drop records matching this predicate; repeatable
     #[arg(long)]
     drop_if: Vec<String>,
+    /// Tombstone records matching this predicate; repeatable
     #[arg(long)]
     tombstone_if: Vec<String>,
+    /// Project each surviving record with this expression
     #[arg(long)]
     project: Option<String>,
+    /// Kcat-style output format
     #[arg(short = 'f', long, conflicts_with = "json_envelope")]
     format: Option<String>,
+    /// Emit one JSON envelope per output record
     #[arg(short = 'J', long, conflicts_with = "format")]
     json_envelope: bool,
+    /// Flush stdout after every output record
     #[arg(short = 'u', long)]
     unbuffered: bool,
+    /// Write final statistics to stderr
     #[arg(long)]
     stats: bool,
+    /// Write periodic statistics, for example 500ms, 5s, or 1m
     #[arg(long, value_parser = parse_duration)]
     stats_interval: Option<Duration>,
+    /// Suppress non-error diagnostics
     #[arg(short = 'q', long)]
     quiet: bool,
+    /// Number of compute workers
     #[arg(short = 'j', long)]
     jobs: Option<usize>,
+    /// Emit records in completion order
     #[arg(long)]
     unordered: bool,
+    /// Maximum admitted records awaiting ordered drain
     #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_RECORDS)]
     max_inflight_records: usize,
-    #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_BYTES, value_parser = parse_size)]
+    /// Retained-byte budget; supports KiB, MiB, and GiB
+    #[arg(long, default_value = DEFAULT_MAX_INFLIGHT_BYTES, value_parser = parse_size)]
     max_inflight_bytes: usize,
+    /// Maximum admitted records per partition
     #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_PER_PARTITION)]
     max_inflight_per_partition: usize,
+    /// Policy for malformed non-tombstone payloads
     #[arg(long, value_enum, default_value_t = RawInvalidJsonPolicy::Fail)]
     on_invalid_json: RawInvalidJsonPolicy,
+    /// Policy for predicate or projection failures
     #[arg(long, value_enum, default_value_t = RawEvaluationPolicy::Fail)]
     on_eval_error: RawEvaluationPolicy,
+    /// Policy for recoverable Kafka record errors
     #[arg(long, value_enum, default_value_t = KafkaErrorPolicy::Fail)]
     on_kafka_error: KafkaErrorPolicy,
+    /// Librdkafka key=value configuration file
     #[arg(short = 'F', long)]
     config: Option<PathBuf>,
+    /// Librdkafka key=value property; repeatable
     #[arg(short = 'X', long = "property")]
     properties: Vec<String>,
 }
@@ -127,9 +154,7 @@ pub enum OutputPlan {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct RuntimeConfig {
-    pub brokers: Vec<String>,
     pub topic: String,
     pub partitions: Vec<i32>,
     pub start: StartPosition,
@@ -260,17 +285,11 @@ impl RawCli {
         let broker_value = kafka_properties
             .get("bootstrap.servers")
             .ok_or_else(|| "brokers are required through -b or bootstrap.servers".to_owned())?;
-        let brokers = broker_value
-            .split(',')
-            .map(str::trim)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if brokers.iter().any(String::is_empty) {
+        if broker_value.split(',').map(str::trim).any(str::is_empty) {
             return Err("broker list contains an empty entry".to_owned());
         }
 
         Ok(RuntimeConfig {
-            brokers,
             topic: self.topic,
             partitions: self.partitions,
             start,
@@ -431,6 +450,8 @@ fn parse_size(value: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     fn resolve(arguments: &[&str]) -> Result<RuntimeConfig, String> {
@@ -513,7 +534,7 @@ mod tests {
             "new",
         ])
         .unwrap();
-        assert_eq!(config.brokers, ["new"]);
+        assert_eq!(config.kafka_properties["bootstrap.servers"], "new");
         assert_eq!(config.kafka_properties["a"], "2");
     }
 
@@ -542,5 +563,12 @@ mod tests {
         assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
         assert!(parse_size("1MB").is_err());
         assert!(parse_duration("0ms").is_err());
+    }
+
+    #[test]
+    fn help_describes_assignment_and_runtime_limits() {
+        let help = RawCli::command().render_long_help().to_string();
+        assert!(help.contains("Partition to consume; repeat for multiple partitions"));
+        assert!(help.contains("Retained-byte budget; supports KiB, MiB, and GiB"));
     }
 }
