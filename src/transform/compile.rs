@@ -67,8 +67,6 @@ impl OutputBound {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanCapabilities {
     pub parses_json: bool,
-    pub can_pass_through: bool,
-    pub requires_original_on_error: bool,
     pub requires_original_bytes: bool,
 }
 
@@ -207,8 +205,6 @@ impl Compiler {
             projection,
             capabilities: PlanCapabilities {
                 parses_json,
-                can_pass_through,
-                requires_original_on_error: preserve_invalid_json,
                 requires_original_bytes,
             },
             payload_budget: PayloadBudget {

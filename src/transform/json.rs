@@ -1,11 +1,13 @@
-use std::{borrow::Cow, cmp::Ordering, fmt};
+use std::{cmp::Ordering, fmt};
 
-use simd_json::{BorrowedValue, StaticNode};
+use simd_json::{Node, Tape, ValueType, prelude::*, tape::Value as TapeValue};
 
 use super::{
     compile::{CompiledExpr, CompiledKind, Function, TransformPlan},
     syntax::{BinaryOp, Literal, PathSegment, Span},
 };
+
+const MAX_JSON_DEPTH: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidJsonPolicy {
@@ -111,29 +113,20 @@ pub fn execute_report(
     } else {
         (payload, None)
     };
-    let document = match simd_json::to_borrowed_value(&mut parse_buffer) {
+    let document = match simd_json::to_tape(&mut parse_buffer) {
         Ok(document) => document,
         Err(error) => {
-            return match policies.invalid_json {
-                InvalidJsonPolicy::Fail => Err(TransformError::InvalidJson(error.to_string())),
-                InvalidJsonPolicy::Drop => Ok(Execution {
-                    action: Action::Drop,
-                    issue: Some(ExecutionIssue::InvalidJson),
-                }),
-                InvalidJsonPolicy::Tombstone => Ok(Execution {
-                    action: Action::Tombstone,
-                    issue: Some(ExecutionIssue::InvalidJson),
-                }),
-                InvalidJsonPolicy::Pass => Ok(Execution {
-                    action: Action::PassThrough(
-                        original.expect("pass policy requires original bytes"),
-                    ),
-                    issue: Some(ExecutionIssue::InvalidJson),
-                }),
-            };
+            return invalid_json(
+                policies.invalid_json,
+                original,
+                format!("{:?} at byte {}", error.error(), error.index()),
+            );
         }
     };
-    let action = match evaluate(plan, &document) {
+    if let Err(error) = validate_depth(&document) {
+        return invalid_json(policies.invalid_json, original, error);
+    }
+    let action = match evaluate(plan, document.as_value()) {
         Ok(EvaluatedAction::Drop) => Action::Drop,
         Ok(EvaluatedAction::Tombstone) => Action::Tombstone,
         Ok(EvaluatedAction::PassThrough) => {
@@ -162,6 +155,53 @@ pub fn execute_report(
     })
 }
 
+fn invalid_json(
+    policy: InvalidJsonPolicy,
+    original: Option<Vec<u8>>,
+    message: String,
+) -> Result<Execution, TransformError> {
+    match policy {
+        InvalidJsonPolicy::Fail => Err(TransformError::InvalidJson(message)),
+        InvalidJsonPolicy::Drop => Ok(Execution {
+            action: Action::Drop,
+            issue: Some(ExecutionIssue::InvalidJson),
+        }),
+        InvalidJsonPolicy::Tombstone => Ok(Execution {
+            action: Action::Tombstone,
+            issue: Some(ExecutionIssue::InvalidJson),
+        }),
+        InvalidJsonPolicy::Pass => Ok(Execution {
+            action: Action::PassThrough(original.expect("pass policy requires original bytes")),
+            issue: Some(ExecutionIssue::InvalidJson),
+        }),
+    }
+}
+
+fn validate_depth(tape: &Tape<'_>) -> Result<(), String> {
+    let mut ends = Vec::new();
+    for (index, node) in tape.0.iter().enumerate() {
+        while ends.last().is_some_and(|end| *end <= index) {
+            ends.pop();
+        }
+        let count = match node {
+            Node::Array { count, .. } | Node::Object { count, .. } => *count,
+            _ => continue,
+        };
+        if ends.len() == MAX_JSON_DEPTH {
+            return Err(format!(
+                "JSON nesting exceeds the maximum depth of {MAX_JSON_DEPTH}"
+            ));
+        }
+        ends.push(
+            index
+                .checked_add(count)
+                .and_then(|end| end.checked_add(1))
+                .ok_or_else(|| "JSON nesting range overflowed usize".to_owned())?,
+        );
+    }
+    Ok(())
+}
+
 enum EvaluatedAction {
     Drop,
     Tombstone,
@@ -171,7 +211,7 @@ enum EvaluatedAction {
 
 fn evaluate(
     plan: &TransformPlan,
-    document: &BorrowedValue<'_>,
+    document: TapeValue<'_, '_>,
 ) -> Result<EvaluatedAction, TransformError> {
     let slots = plan
         .paths
@@ -180,12 +220,8 @@ fn evaluate(
             let mut value = Some(document);
             for segment in &path.0 {
                 value = match (value, segment) {
-                    (Some(BorrowedValue::Object(object)), PathSegment::Field(field)) => {
-                        object.get(field.as_str())
-                    }
-                    (Some(BorrowedValue::Array(array)), PathSegment::Index(index)) => {
-                        array.get(*index)
-                    }
+                    (Some(value), PathSegment::Field(field)) => value.get(field.as_str()),
+                    (Some(value), PathSegment::Index(index)) => value.get_idx(*index),
                     _ => None,
                 };
             }
@@ -224,7 +260,7 @@ fn evaluate(
 
 fn predicate_bool(
     expression: &CompiledExpr,
-    slots: &[Option<&BorrowedValue<'_>>],
+    slots: &[Option<TapeValue<'_, '_>>],
 ) -> Result<bool, TransformError> {
     match eval(expression, slots)? {
         Value::Bool(value) => Ok(value),
@@ -243,15 +279,15 @@ enum Value<'a> {
     I64(i64),
     U64(u64),
     F64(f64),
-    String(Cow<'a, str>),
+    String(String),
     Array(Vec<Value<'a>>),
     Object(Vec<(String, Value<'a>)>),
-    Source(&'a BorrowedValue<'a>),
+    Source(TapeValue<'a, 'a>),
 }
 
 fn eval<'a>(
     expression: &CompiledExpr,
-    slots: &[Option<&'a BorrowedValue<'a>>],
+    slots: &[Option<TapeValue<'a, 'a>>],
 ) -> Result<Value<'a>, TransformError> {
     match &expression.kind {
         CompiledKind::Literal(literal) => Ok(match literal {
@@ -260,7 +296,7 @@ fn eval<'a>(
             Literal::I64(value) => Value::I64(*value),
             Literal::U64(value) => Value::U64(*value),
             Literal::F64(value) => Value::F64(*value),
-            Literal::String(value) => Value::String(Cow::Owned(value.clone())),
+            Literal::String(value) => Value::String(value.clone()),
         }),
         CompiledKind::Slot(slot) => Ok(slots[*slot].map_or(Value::Missing, source_value)),
         CompiledKind::Array(values) => {
@@ -331,7 +367,7 @@ fn eval<'a>(
 fn call<'a>(
     function: Function,
     arguments: &[CompiledExpr],
-    slots: &[Option<&'a BorrowedValue<'a>>],
+    slots: &[Option<TapeValue<'a, 'a>>],
     span: Span,
 ) -> Result<Value<'a>, TransformError> {
     let first = eval(&arguments[0], slots)?;
@@ -349,11 +385,15 @@ fn call<'a>(
             Value::String(value) => Ok(Value::U64(value.chars().count() as u64)),
             Value::Array(value) => Ok(Value::U64(value.len() as u64)),
             Value::Object(value) => Ok(Value::U64(value.len() as u64)),
-            Value::Source(BorrowedValue::String(value)) => {
-                Ok(Value::U64(value.chars().count() as u64))
-            }
-            Value::Source(BorrowedValue::Array(value)) => Ok(Value::U64(value.len() as u64)),
-            Value::Source(BorrowedValue::Object(value)) => Ok(Value::U64(value.len() as u64)),
+            Value::Source(value) if value.value_type() == ValueType::String => Ok(Value::U64(
+                value.as_str().expect("string tape value").chars().count() as u64,
+            )),
+            Value::Source(value) if value.value_type() == ValueType::Array => Ok(Value::U64(
+                value.as_array().expect("array tape value").len() as u64,
+            )),
+            Value::Source(value) if value.value_type() == ValueType::Object => Ok(Value::U64(
+                value.as_object().expect("object tape value").len() as u64,
+            )),
             _ => Err(evaluation_error(
                 span,
                 "length expects a string, array, or object",
@@ -401,27 +441,31 @@ enum Type {
 fn value_type(value: &Value<'_>) -> Type {
     match value {
         Value::Missing => Type::Missing,
-        Value::Null | Value::Source(BorrowedValue::Static(StaticNode::Null)) => Type::Null,
-        Value::Bool(_) | Value::Source(BorrowedValue::Static(StaticNode::Bool(_))) => Type::Bool,
-        Value::I64(_)
-        | Value::U64(_)
-        | Value::F64(_)
-        | Value::Source(BorrowedValue::Static(
-            StaticNode::I64(_) | StaticNode::U64(_) | StaticNode::F64(_),
-        )) => Type::Number,
-        Value::String(_) | Value::Source(BorrowedValue::String(_)) => Type::String,
-        Value::Array(_) | Value::Source(BorrowedValue::Array(_)) => Type::Array,
-        Value::Object(_) | Value::Source(BorrowedValue::Object(_)) => Type::Object,
+        Value::Null => Type::Null,
+        Value::Bool(_) => Type::Bool,
+        Value::I64(_) | Value::U64(_) | Value::F64(_) => Type::Number,
+        Value::String(_) => Type::String,
+        Value::Array(_) => Type::Array,
+        Value::Object(_) => Type::Object,
+        Value::Source(value) => match value.value_type() {
+            ValueType::Null => Type::Null,
+            ValueType::Bool => Type::Bool,
+            ValueType::I64 | ValueType::U64 | ValueType::F64 => Type::Number,
+            ValueType::String => Type::String,
+            ValueType::Array => Type::Array,
+            ValueType::Object => Type::Object,
+            _ => unreachable!("unsupported tape value type"),
+        },
     }
 }
 
-fn source_value<'a>(value: &'a BorrowedValue<'a>) -> Value<'a> {
-    match value {
-        BorrowedValue::Static(StaticNode::Null) => Value::Null,
-        BorrowedValue::Static(StaticNode::Bool(value)) => Value::Bool(*value),
-        BorrowedValue::Static(StaticNode::I64(value)) => Value::I64(*value),
-        BorrowedValue::Static(StaticNode::U64(value)) => Value::U64(*value),
-        BorrowedValue::Static(StaticNode::F64(value)) => Value::F64(*value),
+fn source_value<'a>(value: TapeValue<'a, 'a>) -> Value<'a> {
+    match value.value_type() {
+        ValueType::Null => Value::Null,
+        ValueType::Bool => Value::Bool(value.as_bool().expect("boolean tape value")),
+        ValueType::I64 => Value::I64(value.as_i64().expect("signed tape value")),
+        ValueType::U64 => Value::U64(value.as_u64().expect("unsigned tape value")),
+        ValueType::F64 => Value::F64(value.as_f64().expect("float tape value")),
         _ => Value::Source(value),
     }
 }
@@ -429,7 +473,7 @@ fn source_value<'a>(value: &'a BorrowedValue<'a>) -> Value<'a> {
 fn as_string<'a>(value: &'a Value<'a>) -> Option<&'a str> {
     match value {
         Value::String(value) => Some(value),
-        Value::Source(BorrowedValue::String(value)) => Some(value),
+        Value::Source(value) => value.as_str(),
         _ => None,
     }
 }
@@ -507,9 +551,15 @@ fn number(value: &Value<'_>) -> Option<Number> {
         Value::I64(value) => Number::I64(*value),
         Value::U64(value) => Number::U64(*value),
         Value::F64(value) => Number::F64(*value),
-        Value::Source(BorrowedValue::Static(StaticNode::I64(value))) => Number::I64(*value),
-        Value::Source(BorrowedValue::Static(StaticNode::U64(value))) => Number::U64(*value),
-        Value::Source(BorrowedValue::Static(StaticNode::F64(value))) => Number::F64(*value),
+        Value::Source(value) if value.value_type() == ValueType::I64 => {
+            Number::I64(value.as_i64().expect("signed tape value"))
+        }
+        Value::Source(value) if value.value_type() == ValueType::U64 => {
+            Number::U64(value.as_u64().expect("unsigned tape value"))
+        }
+        Value::Source(value) if value.value_type() == ValueType::F64 => {
+            Number::F64(value.as_f64().expect("float tape value"))
+        }
         _ => return None,
     })
 }
@@ -584,7 +634,7 @@ fn unsigned_float_order(integer: u64, float: f64) -> Option<Ordering> {
 fn bool_value(value: &Value<'_>) -> Option<bool> {
     match value {
         Value::Bool(value) => Some(*value),
-        Value::Source(BorrowedValue::Static(StaticNode::Bool(value))) => Some(*value),
+        Value::Source(value) => value.as_bool(),
         _ => None,
     }
 }
@@ -592,27 +642,17 @@ fn bool_value(value: &Value<'_>) -> Option<bool> {
 fn write_json(value: &Value<'_>, output: &mut Vec<u8>, span: Span) -> Result<(), TransformError> {
     match value {
         Value::Missing => return Err(evaluation_error(span, "cannot serialize missing value")),
-        Value::Null | Value::Source(BorrowedValue::Static(StaticNode::Null)) => {
-            output.extend_from_slice(b"null")
-        }
-        Value::Bool(value) | Value::Source(BorrowedValue::Static(StaticNode::Bool(value))) => {
-            output.extend_from_slice(if *value { b"true" } else { b"false" })
-        }
-        Value::I64(value) | Value::Source(BorrowedValue::Static(StaticNode::I64(value))) => {
-            output.extend_from_slice(value.to_string().as_bytes())
-        }
-        Value::U64(value) | Value::Source(BorrowedValue::Static(StaticNode::U64(value))) => {
-            output.extend_from_slice(value.to_string().as_bytes())
-        }
-        Value::F64(value) | Value::Source(BorrowedValue::Static(StaticNode::F64(value))) => {
+        Value::Null => output.extend_from_slice(b"null"),
+        Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
+        Value::I64(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        Value::U64(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        Value::F64(value) => {
             if !value.is_finite() {
                 return Err(evaluation_error(span, "cannot serialize non-finite number"));
             }
             output.extend_from_slice(format!("{value:?}").as_bytes());
         }
-        Value::String(value) | Value::Source(BorrowedValue::String(value)) => {
-            write_string(value, output)
-        }
+        Value::String(value) => write_string(value, output),
         Value::Array(values) => {
             output.push(b'[');
             for (index, value) in values.iter().enumerate() {
@@ -620,16 +660,6 @@ fn write_json(value: &Value<'_>, output: &mut Vec<u8>, span: Span) -> Result<(),
                     output.push(b',');
                 }
                 write_json(value, output, span)?;
-            }
-            output.push(b']');
-        }
-        Value::Source(BorrowedValue::Array(values)) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                write_json(&Value::Source(value), output, span)?;
             }
             output.push(b']');
         }
@@ -645,18 +675,9 @@ fn write_json(value: &Value<'_>, output: &mut Vec<u8>, span: Span) -> Result<(),
             }
             output.push(b'}');
         }
-        Value::Source(BorrowedValue::Object(fields)) => {
-            output.push(b'{');
-            for (index, (key, value)) in fields.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                write_string(key, output);
-                output.push(b':');
-                write_json(&Value::Source(value), output, span)?;
-            }
-            output.push(b'}');
-        }
+        Value::Source(value) => value
+            .write(output)
+            .map_err(|error| evaluation_error(span, format!("cannot serialize value: {error}")))?,
     }
     Ok(())
 }
@@ -1000,6 +1021,65 @@ mod tests {
             error
                 .to_string()
                 .starts_with("tombstone predicate evaluation error")
+        );
+    }
+
+    #[test]
+    fn invalid_json_errors_report_coordinates_without_payload_content() {
+        let plan = build_plan(&["false".to_owned()], &[], None, false).unwrap();
+        let error = execute(&plan, Some(b"secret".to_vec()), FAIL).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("at byte"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+    }
+
+    #[test]
+    fn excessive_json_nesting_uses_the_invalid_json_policy() {
+        let plan = build_plan(&["false".to_owned()], &[], None, false).unwrap();
+        let accepted = format!(
+            "{}0{}",
+            "[".repeat(MAX_JSON_DEPTH),
+            "]".repeat(MAX_JSON_DEPTH)
+        )
+        .into_bytes();
+        assert_eq!(
+            execute(&plan, Some(accepted.clone()), FAIL).unwrap(),
+            Action::PassThrough(accepted)
+        );
+
+        let input = format!(
+            "{}0{}",
+            "[".repeat(MAX_JSON_DEPTH + 1),
+            "]".repeat(MAX_JSON_DEPTH + 1)
+        )
+        .into_bytes();
+        let error = execute(&plan, Some(input.clone()), FAIL).unwrap_err();
+        assert!(error.to_string().contains("maximum depth"));
+
+        let execution = execute_report(
+            &plan,
+            Some(input),
+            ErrorPolicies {
+                invalid_json: InvalidJsonPolicy::Drop,
+                evaluation: EvaluationPolicy::Fail,
+            },
+        )
+        .unwrap();
+        assert_eq!(execution.action, Action::Drop);
+        assert_eq!(execution.issue, Some(ExecutionIssue::InvalidJson));
+    }
+
+    #[test]
+    fn tape_projection_preserves_nested_source_values() {
+        assert_eq!(
+            run(
+                &[],
+                &[],
+                Some(".value"),
+                Some(br#"{"value":{"b":[1,{"x":"y"}],"a":2}}"#),
+            )
+            .unwrap(),
+            Action::Project(br#"{"b":[1,{"x":"y"}],"a":2}"#.to_vec())
         );
     }
 }
