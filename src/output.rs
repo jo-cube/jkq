@@ -35,7 +35,6 @@ pub struct Header<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub enum TimestampType {
     CreateTime,
     LogAppendTime,
@@ -54,7 +53,6 @@ pub enum Payload<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub enum EmittedAction {
     Tombstone,
     PassThrough,
