@@ -1,7 +1,7 @@
+mod app;
 mod cli;
-#[allow(dead_code)]
+mod kafka;
 mod output;
-#[allow(dead_code)]
 mod transform;
 
 use clap::Parser;
@@ -12,9 +12,14 @@ fn main() {
             eprintln!("jkq: {error}");
             std::process::exit(2);
         }
-        Ok(_) => {
-            eprintln!("jkq: Kafka consumption is not implemented in this initial build");
-            std::process::exit(1);
+        Ok(config) => {
+            if let Err(error) = app::run(config) {
+                if error.is_broken_pipe() {
+                    return;
+                }
+                eprintln!("jkq: {error}");
+                std::process::exit(1);
+            }
         }
     }
 }

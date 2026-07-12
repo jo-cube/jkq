@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs, path::PathBuf, str::FromStr, time::Duration
 use clap::{Parser, ValueEnum};
 
 use crate::{
-    output::CompiledFormat,
+    output::{CompiledFormat, OutputRequirements},
     transform::{
         compile::{TransformPlan, build_plan},
         json::{ErrorPolicies, EvaluationPolicy, InvalidJsonPolicy},
@@ -122,7 +122,6 @@ pub struct RuntimeLimits {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum OutputPlan {
     Format(CompiledFormat),
     Envelope,
@@ -150,6 +149,19 @@ pub struct RuntimeConfig {
     pub stats: bool,
     pub stats_interval: Option<Duration>,
     pub quiet: bool,
+}
+
+impl OutputPlan {
+    pub fn requirements(&self) -> OutputRequirements {
+        match self {
+            Self::Format(format) => format.requirements(),
+            Self::Envelope => OutputRequirements {
+                key: true,
+                headers: true,
+                timestamp: true,
+            },
+        }
+    }
 }
 
 impl RawCli {

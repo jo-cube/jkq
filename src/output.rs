@@ -20,6 +20,13 @@ enum FormatToken {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledFormat(Vec<FormatToken>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputRequirements {
+    pub key: bool,
+    pub headers: bool,
+    pub timestamp: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Header<'a> {
     pub name: &'a str,
@@ -201,6 +208,23 @@ impl CompiledFormat {
             }
         }
         Ok(output)
+    }
+
+    pub fn requirements(&self) -> OutputRequirements {
+        OutputRequirements {
+            key: self
+                .0
+                .iter()
+                .any(|token| matches!(token, FormatToken::Key | FormatToken::KeyLength)),
+            headers: self
+                .0
+                .iter()
+                .any(|token| matches!(token, FormatToken::Headers)),
+            timestamp: self
+                .0
+                .iter()
+                .any(|token| matches!(token, FormatToken::Timestamp)),
+        }
     }
 }
 
