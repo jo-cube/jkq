@@ -51,15 +51,27 @@ pub struct Execution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransformError {
     InvalidJson(String),
-    Evaluation { span: Span, message: String },
+    Evaluation {
+        category: &'static str,
+        span: Span,
+        message: String,
+    },
 }
 
 impl fmt::Display for TransformError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidJson(message) => write!(f, "invalid JSON: {message}"),
-            Self::Evaluation { span, message } => {
-                write!(f, "evaluation error at byte {}: {message}", span.start)
+            Self::Evaluation {
+                category,
+                span,
+                message,
+            } => {
+                write!(
+                    f,
+                    "{category} evaluation error at byte {}: {message}",
+                    span.start
+                )
             }
         }
     }
@@ -182,25 +194,28 @@ fn evaluate(
         .collect::<Vec<_>>();
 
     for predicate in &plan.drops {
-        if predicate_bool(predicate, &slots)? {
+        if predicate_bool(predicate, &slots).map_err(|error| error.in_category("drop predicate"))? {
             return Ok(EvaluatedAction::Drop);
         }
     }
     for predicate in &plan.tombstones {
-        if predicate_bool(predicate, &slots)? {
+        if predicate_bool(predicate, &slots)
+            .map_err(|error| error.in_category("tombstone predicate"))?
+        {
             return Ok(EvaluatedAction::Tombstone);
         }
     }
     if let Some(projection) = &plan.projection {
-        let value = eval(projection, &slots)?;
+        let value = eval(projection, &slots).map_err(|error| error.in_category("projection"))?;
         if matches!(value, Value::Missing) {
-            return Err(evaluation_error(
-                projection.span,
-                "projection produced a missing value",
-            ));
+            return Err(
+                evaluation_error(projection.span, "projection produced a missing value")
+                    .in_category("projection"),
+            );
         }
         let mut bytes = Vec::new();
-        write_json(&value, &mut bytes, projection.span)?;
+        write_json(&value, &mut bytes, projection.span)
+            .map_err(|error| error.in_category("projection"))?;
         Ok(EvaluatedAction::Project(bytes))
     } else {
         Ok(EvaluatedAction::PassThrough)
@@ -484,6 +499,9 @@ enum Number {
     F64(f64),
 }
 
+const I64_EXCLUSIVE_MAX_F64: f64 = 9_223_372_036_854_775_808.0;
+const U64_EXCLUSIVE_MAX_F64: f64 = 18_446_744_073_709_551_616.0;
+
 fn number(value: &Value<'_>) -> Option<Number> {
     Some(match value {
         Value::I64(value) => Number::I64(*value),
@@ -515,11 +533,52 @@ fn numeric_order(left: Number, right: Number) -> Option<Ordering> {
             }
         }
         (Number::F64(left), Number::F64(right)) => left.partial_cmp(&right),
-        (Number::F64(left), Number::I64(right)) => left.partial_cmp(&(right as f64)),
-        (Number::F64(left), Number::U64(right)) => left.partial_cmp(&(right as f64)),
-        (Number::I64(left), Number::F64(right)) => (left as f64).partial_cmp(&right),
-        (Number::U64(left), Number::F64(right)) => (left as f64).partial_cmp(&right),
+        (Number::F64(left), Number::I64(right)) => {
+            integer_float_order(right, left).map(Ordering::reverse)
+        }
+        (Number::F64(left), Number::U64(right)) => {
+            unsigned_float_order(right, left).map(Ordering::reverse)
+        }
+        (Number::I64(left), Number::F64(right)) => integer_float_order(left, right),
+        (Number::U64(left), Number::F64(right)) => unsigned_float_order(left, right),
     }
+}
+
+fn integer_float_order(integer: i64, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    if float < i64::MIN as f64 {
+        return Some(Ordering::Greater);
+    }
+    if float >= I64_EXCLUSIVE_MAX_F64 {
+        return Some(Ordering::Less);
+    }
+    let truncated = float as i64;
+    Some(match integer.cmp(&truncated) {
+        Ordering::Equal if float.fract() == 0.0 => Ordering::Equal,
+        Ordering::Equal if float.is_sign_negative() => Ordering::Greater,
+        Ordering::Equal => Ordering::Less,
+        ordering => ordering,
+    })
+}
+
+fn unsigned_float_order(integer: u64, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    if float < 0.0 {
+        return Some(Ordering::Greater);
+    }
+    if float >= U64_EXCLUSIVE_MAX_F64 {
+        return Some(Ordering::Less);
+    }
+    let truncated = float as u64;
+    Some(match integer.cmp(&truncated) {
+        Ordering::Equal if float.fract() == 0.0 => Ordering::Equal,
+        Ordering::Equal => Ordering::Less,
+        ordering => ordering,
+    })
 }
 
 fn bool_value(value: &Value<'_>) -> Option<bool> {
@@ -549,7 +608,7 @@ fn write_json(value: &Value<'_>, output: &mut Vec<u8>, span: Span) -> Result<(),
             if !value.is_finite() {
                 return Err(evaluation_error(span, "cannot serialize non-finite number"));
             }
-            output.extend_from_slice(value.to_string().as_bytes());
+            output.extend_from_slice(format!("{value:?}").as_bytes());
         }
         Value::String(value) | Value::Source(BorrowedValue::String(value)) => {
             write_string(value, output)
@@ -627,8 +686,21 @@ pub(crate) fn write_string(value: &str, output: &mut Vec<u8>) {
 
 fn evaluation_error(span: Span, message: impl Into<String>) -> TransformError {
     TransformError::Evaluation {
+        category: "expression",
         span,
         message: message.into(),
+    }
+}
+
+impl TransformError {
+    fn in_category(mut self, category: &'static str) -> Self {
+        if let Self::Evaluation {
+            category: current, ..
+        } = &mut self
+        {
+            *current = category;
+        }
+        self
     }
 }
 
@@ -784,6 +856,33 @@ mod tests {
 
     #[test]
     fn native_integer_comparisons_do_not_lose_unsigned_precision() {
+        for (left, right, expected) in [
+            (
+                Number::U64(9_007_199_254_740_993),
+                Number::F64(9_007_199_254_740_992.0),
+                Ordering::Greater,
+            ),
+            (
+                Number::I64(i64::MIN),
+                Number::F64(i64::MIN as f64),
+                Ordering::Equal,
+            ),
+            (
+                Number::I64(i64::MAX),
+                Number::F64(I64_EXCLUSIVE_MAX_F64),
+                Ordering::Less,
+            ),
+            (
+                Number::U64(u64::MAX),
+                Number::F64(U64_EXCLUSIVE_MAX_F64),
+                Ordering::Less,
+            ),
+            (Number::I64(-1), Number::F64(-1.5), Ordering::Greater),
+            (Number::U64(1), Number::F64(1.5), Ordering::Less),
+        ] {
+            assert_eq!(numeric_order(left, right), Some(expected));
+            assert_eq!(numeric_order(right, left), Some(expected.reverse()));
+        }
         assert_eq!(
             run(
                 &[".large > 18446744073709551614"],
@@ -794,6 +893,49 @@ mod tests {
             .unwrap(),
             Action::Drop
         );
+        assert_eq!(
+            run(
+                &[".large != 9007199254740992.0"],
+                &[],
+                None,
+                Some(br#"{"large":9007199254740993}"#),
+            )
+            .unwrap(),
+            Action::Drop
+        );
+    }
+
+    #[test]
+    fn floating_point_projection_uses_short_round_trip_json() {
+        assert_eq!(
+            run(&[], &[], Some(".value"), Some(br#"{"value":1e200}"#)).unwrap(),
+            Action::Project(b"1e200".to_vec())
+        );
+    }
+
+    #[test]
+    fn compiled_payload_budget_covers_serialized_projections() {
+        for (projection, input) in [
+            (".value", br#"{"value":{"n":1e200,"s":"a\\nb"}}"#.as_slice()),
+            ("[.value, .value]", br#"{"value":"repeated"}"#.as_slice()),
+            (
+                "{value: coalesce(.missing, .value), size: length(.value)}",
+                br#"{"value":[1,2,3]}"#.as_slice(),
+            ),
+        ] {
+            let plan = build_plan(&[], &[], Some(projection), false).unwrap();
+            let budget = plan.payload_budget().bytes(input.len()).unwrap();
+            let execution = execute_report(&plan, Some(input.to_vec()), FAIL).unwrap();
+            let Action::Project(output) = execution.action else {
+                panic!("expected projection");
+            };
+            assert!(
+                input.len() + output.len() <= budget,
+                "{projection}: input={} output={} budget={budget}",
+                input.len(),
+                output.len()
+            );
+        }
     }
 
     #[test]
@@ -849,5 +991,15 @@ mod tests {
             assert_eq!(execution.action, expected);
             assert_eq!(execution.issue, Some(ExecutionIssue::Evaluation));
         }
+    }
+
+    #[test]
+    fn evaluation_errors_identify_the_expression_category() {
+        let error = run(&[], &["length(true) == 1"], None, Some(b"{}")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("tombstone predicate evaluation error")
+        );
     }
 }

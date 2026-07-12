@@ -9,6 +9,59 @@ pub struct TransformPlan {
     pub tombstones: Vec<CompiledExpr>,
     pub projection: Option<CompiledExpr>,
     pub capabilities: PlanCapabilities,
+    payload_budget: PayloadBudget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PayloadBudget {
+    input_factor: usize,
+    projection: OutputBound,
+}
+
+impl PayloadBudget {
+    // ponytail: affine whole-payload bounds favor safety over concurrency; transfer
+    // byte permits after evaluation only if projection-heavy benchmarks require it.
+    pub fn bytes(self, input_bytes: usize) -> Result<usize, String> {
+        self.input_factor
+            .checked_add(self.projection.factor)
+            .and_then(|factor| factor.checked_mul(input_bytes))
+            .and_then(|bytes| bytes.checked_add(self.projection.constant))
+            .ok_or_else(|| "record retained-byte charge overflowed usize".to_owned())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OutputBound {
+    factor: usize,
+    constant: usize,
+}
+
+impl OutputBound {
+    const BOOLEAN: Self = Self {
+        factor: 0,
+        constant: 5,
+    };
+
+    fn add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            factor: self.factor.checked_add(other.factor)?,
+            constant: self.constant.checked_add(other.constant)?,
+        })
+    }
+
+    fn with_constant(self, constant: usize) -> Option<Self> {
+        Some(Self {
+            factor: self.factor,
+            constant: self.constant.checked_add(constant)?,
+        })
+    }
+
+    fn max(self, other: Self) -> Self {
+        Self {
+            factor: self.factor.max(other.factor),
+            constant: self.constant.max(other.constant),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +189,17 @@ impl Compiler {
             .transpose()?;
         let can_pass_through = projection.is_none();
         let parses_json = !drops.is_empty() || !tombstones.is_empty() || projection.is_some();
+        let requires_original_bytes = can_pass_through || preserve_invalid_json;
+        let projection_bound = projection
+            .as_ref()
+            .map(expression_bound)
+            .transpose()
+            .map_err(|()| CompileError {
+                category: "projection",
+                span: projection.as_ref().expect("projection bound failed").span,
+                message: "maximum serialized size is too large".to_owned(),
+            })?
+            .unwrap_or_default();
         Ok(TransformPlan {
             paths: compiler.paths,
             drops,
@@ -145,7 +209,11 @@ impl Compiler {
                 parses_json,
                 can_pass_through,
                 requires_original_on_error: preserve_invalid_json,
-                requires_original_bytes: can_pass_through || preserve_invalid_json,
+                requires_original_bytes,
+            },
+            payload_budget: PayloadBudget {
+                input_factor: 1 + usize::from(parses_json && requires_original_bytes),
+                projection: projection_bound,
             },
         })
     }
@@ -228,6 +296,68 @@ impl Compiler {
     }
 }
 
+impl TransformPlan {
+    pub(crate) fn payload_budget(&self) -> PayloadBudget {
+        self.payload_budget
+    }
+}
+
+fn expression_bound(expression: &CompiledExpr) -> Result<OutputBound, ()> {
+    Ok(match &expression.kind {
+        CompiledKind::Literal(value) => OutputBound {
+            factor: 0,
+            constant: match value {
+                Literal::Null => 4,
+                Literal::Bool(true) => 4,
+                Literal::Bool(false) => 5,
+                Literal::I64(value) => value.to_string().len(),
+                Literal::U64(value) => value.to_string().len(),
+                Literal::F64(value) => format!("{value:?}").len(),
+                Literal::String(value) => json_string_bytes(value).ok_or(())?,
+            },
+        },
+        CompiledKind::Slot(_) => OutputBound {
+            factor: 1,
+            constant: 0,
+        },
+        CompiledKind::Array(values) => values
+            .iter()
+            .try_fold(OutputBound::default(), |bound, value| {
+                bound.add(expression_bound(value).ok()?)
+            })
+            .and_then(|bound| bound.with_constant(2 + values.len().saturating_sub(1)))
+            .ok_or(())?,
+        CompiledKind::Object(fields) => fields
+            .iter()
+            .try_fold(OutputBound::default(), |bound, (key, value)| {
+                bound
+                    .add(expression_bound(value).ok()?)
+                    .and_then(|bound| bound.with_constant(json_string_bytes(key)?.checked_add(1)?))
+            })
+            .and_then(|bound| bound.with_constant(2 + fields.len().saturating_sub(1)))
+            .ok_or(())?,
+        CompiledKind::Not(_) | CompiledKind::Binary(_, _, _) => OutputBound::BOOLEAN,
+        CompiledKind::Call(Function::Length, _) => OutputBound {
+            factor: 0,
+            constant: 20,
+        },
+        CompiledKind::Call(Function::Coalesce, arguments) => {
+            expression_bound(&arguments[0])?.max(expression_bound(&arguments[1])?)
+        }
+        CompiledKind::Call(_, _) => OutputBound::BOOLEAN,
+    })
+}
+
+fn json_string_bytes(value: &str) -> Option<usize> {
+    value.chars().try_fold(2_usize, |bytes, character| {
+        bytes.checked_add(match character {
+            '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+            value if value < '\u{20}' => 6,
+            value => value.len_utf8(),
+        })
+    })
+}
+
 fn function(name: &str) -> Option<(Function, usize)> {
     Some(match name {
         "exists" => (Function::Exists, 1),
@@ -274,5 +404,17 @@ mod tests {
     fn function_arity_is_checked_once_at_startup() {
         let error = build_plan(&["exists(.a, .b)".to_owned()], &[], None, false).unwrap_err();
         assert!(error.contains("expects 1 argument"));
+    }
+
+    #[test]
+    fn payload_budget_includes_parse_copies_and_projection_amplification() {
+        let projected = build_plan(&[], &[], Some("[.value, .value]"), false).unwrap();
+        assert_eq!(projected.payload_budget().bytes(100).unwrap(), 303);
+
+        let preserving = build_plan(&[], &[], Some("[.value, .value]"), true).unwrap();
+        assert_eq!(preserving.payload_budget().bytes(100).unwrap(), 403);
+
+        let pass_through = build_plan(&["true".to_owned()], &[], None, false).unwrap();
+        assert_eq!(pass_through.payload_budget().bytes(100).unwrap(), 200);
     }
 }

@@ -11,6 +11,7 @@ use rdkafka::{
 use crate::{
     cli::{EndPosition, KafkaErrorPolicy, RuntimeConfig, StartPosition},
     output::{OutputRequirements, Timestamp, TimestampType},
+    transform::compile::PayloadBudget,
 };
 
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,6 +52,7 @@ pub struct KafkaInput {
     topic: String,
     partitions: BTreeMap<i32, PartitionState>,
     requirements: OutputRequirements,
+    payload_budget: PayloadBudget,
     exit_at_end: bool,
     error_policy: KafkaErrorPolicy,
     quiet: bool,
@@ -147,6 +149,7 @@ impl KafkaInput {
             topic: config.topic.clone(),
             partitions,
             requirements: config.output.requirements(),
+            payload_budget: config.transform.payload_budget(),
             exit_at_end: config.exit_at_end,
             error_policy: config.kafka_error,
             quiet: config.quiet,
@@ -206,7 +209,7 @@ impl KafkaInput {
             return Ok(PollEvent::Idle);
         }
 
-        let retained_bytes = retained_bytes(&message, self.requirements)?;
+        let retained_bytes = retained_bytes(&message, self.requirements, self.payload_budget)?;
         let record = OwnedRecord {
             partition,
             offset: message.offset(),
@@ -299,8 +302,11 @@ impl KafkaInput {
 fn retained_bytes(
     message: &rdkafka::message::BorrowedMessage<'_>,
     requirements: OutputRequirements,
+    payload_budget: PayloadBudget,
 ) -> Result<usize, String> {
-    let mut bytes = message.payload_len();
+    let mut bytes = message
+        .payload()
+        .map_or(Ok(0), |payload| payload_budget.bytes(payload.len()))?;
     if requirements.key {
         bytes = bytes
             .checked_add(message.key_len())
