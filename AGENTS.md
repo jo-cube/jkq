@@ -201,3 +201,25 @@ A change is complete only when:
 - memory remains bounded under slow output and large records;
 - partition ordering remains correct unless unordered mode was explicitly selected;
 - performance-sensitive changes include benchmark evidence or a clear non-regression rationale.
+
+## graphify
+
+This project may have a local knowledge graph at `graphify-out/`. The directory
+is generated and git-ignored, so fresh clones will not have it until an agent or
+developer builds it locally.
+
+Rules:
+
+- For codebase questions, first run `graphify query "<question>"` when
+  `graphify-out/graph.json` exists.
+- If `graphify-out/graph.json` is missing and graphify is available, run
+  `graphify .` before relying on graph queries.
+- Use `graphify path "<A>" "<B>"` for relationships and
+  `graphify explain "<concept>"` for focused concepts.
+- Dirty graph files are expected after hooks or incremental updates; they are
+  not a reason to skip graphify.
+- If `graphify-out/wiki/index.md` exists, use it for broad navigation instead
+  of raw source browsing.
+- Read `graphify-out/GRAPH_REPORT.md` only for broad architecture review or
+  when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current.
