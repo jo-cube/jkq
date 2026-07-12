@@ -30,12 +30,14 @@ pub struct OwnedRecord {
     pub key: Option<Vec<u8>>,
     pub headers: Vec<OwnedHeader>,
     pub payload: Option<Vec<u8>>,
+    pub retained_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PartitionState {
     end_exclusive: Option<i64>,
     done: bool,
+    paused: bool,
 }
 
 pub enum PollEvent {
@@ -134,12 +136,13 @@ impl KafkaInput {
                     PartitionState {
                         end_exclusive,
                         done: end_exclusive.is_some_and(|end| start >= end),
+                        paused: false,
                     },
                 )
             })
             .collect();
 
-        let input = Self {
+        let mut input = Self {
             consumer,
             topic: config.topic.clone(),
             partitions,
@@ -154,7 +157,7 @@ impl KafkaInput {
             .filter_map(|(partition, state)| state.done.then_some(*partition))
             .collect::<Vec<_>>();
         for partition in initially_done {
-            input.pause(partition)?;
+            input.set_paused(partition, true)?;
         }
         Ok(input)
     }
@@ -203,6 +206,7 @@ impl KafkaInput {
             return Ok(PollEvent::Idle);
         }
 
+        let retained_bytes = retained_bytes(&message, self.requirements)?;
         let record = OwnedRecord {
             partition,
             offset: message.offset(),
@@ -230,6 +234,7 @@ impl KafkaInput {
                 Vec::new()
             },
             payload: message.payload().map(<[u8]>::to_vec),
+            retained_bytes,
         };
         Ok(PollEvent::Record(record))
     }
@@ -258,16 +263,60 @@ impl KafkaInput {
         if let Some(state) = self.partitions.get_mut(&partition) {
             state.done = true;
         }
-        self.pause(partition)
+        self.set_paused(partition, true)
     }
 
-    fn pause(&self, partition: i32) -> Result<(), String> {
+    pub fn set_paused(&mut self, partition: i32, paused: bool) -> Result<(), String> {
+        let Some(state) = self.partitions.get_mut(&partition) else {
+            return Err(format!(
+                "cannot control unassigned topic {} partition {partition}",
+                self.topic
+            ));
+        };
+        let paused = paused || state.done;
+        if state.paused == paused {
+            return Ok(());
+        }
         let mut partitions = TopicPartitionList::new();
         partitions.add_partition(&self.topic, partition);
-        self.consumer
-            .pause(&partitions)
-            .map_err(|error| format!("cannot pause {} partition {partition}: {error}", self.topic))
+        if paused {
+            self.consumer.pause(&partitions).map_err(|error| {
+                format!("cannot pause {} partition {partition}: {error}", self.topic)
+            })?;
+        } else {
+            self.consumer.resume(&partitions).map_err(|error| {
+                format!(
+                    "cannot resume {} partition {partition}: {error}",
+                    self.topic
+                )
+            })?;
+        }
+        state.paused = paused;
+        Ok(())
     }
+}
+
+fn retained_bytes(
+    message: &rdkafka::message::BorrowedMessage<'_>,
+    requirements: OutputRequirements,
+) -> Result<usize, String> {
+    let mut bytes = message.payload_len();
+    if requirements.key {
+        bytes = bytes
+            .checked_add(message.key_len())
+            .ok_or_else(|| "record retained-byte charge overflowed usize".to_owned())?;
+    }
+    if requirements.headers
+        && let Some(headers) = message.headers()
+    {
+        for header in headers.iter() {
+            bytes = bytes
+                .checked_add(header.key.len())
+                .and_then(|bytes| bytes.checked_add(header.value.map_or(0, <[u8]>::len)))
+                .ok_or_else(|| "record retained-byte charge overflowed usize".to_owned())?;
+        }
+    }
+    Ok(bytes)
 }
 
 fn create_consumer(config: &RuntimeConfig) -> Result<BaseConsumer, String> {

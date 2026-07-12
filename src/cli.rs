@@ -113,8 +113,7 @@ pub enum EndPosition {
     Snapshot,
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
 pub struct RuntimeLimits {
     pub max_inflight_records: usize,
     pub max_inflight_bytes: usize,

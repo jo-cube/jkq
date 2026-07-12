@@ -36,6 +36,18 @@ pub enum Action {
     Project(Vec<u8>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionIssue {
+    InvalidJson,
+    Evaluation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Execution {
+    pub action: Action,
+    pub issue: Option<ExecutionIssue>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransformError {
     InvalidJson(String),
@@ -55,16 +67,31 @@ impl fmt::Display for TransformError {
 
 impl std::error::Error for TransformError {}
 
+#[cfg(test)]
 pub fn execute(
     plan: &TransformPlan,
     payload: Option<Vec<u8>>,
     policies: ErrorPolicies,
 ) -> Result<Action, TransformError> {
+    execute_report(plan, payload, policies).map(|execution| execution.action)
+}
+
+pub fn execute_report(
+    plan: &TransformPlan,
+    payload: Option<Vec<u8>>,
+    policies: ErrorPolicies,
+) -> Result<Execution, TransformError> {
     let Some(payload) = payload else {
-        return Ok(Action::Tombstone);
+        return Ok(Execution {
+            action: Action::Tombstone,
+            issue: None,
+        });
     };
     if !plan.capabilities.parses_json {
-        return Ok(Action::PassThrough(payload));
+        return Ok(Execution {
+            action: Action::PassThrough(payload),
+            issue: None,
+        });
     }
 
     let (mut parse_buffer, original) = if plan.capabilities.requires_original_bytes {
@@ -77,27 +104,50 @@ pub fn execute(
         Err(error) => {
             return match policies.invalid_json {
                 InvalidJsonPolicy::Fail => Err(TransformError::InvalidJson(error.to_string())),
-                InvalidJsonPolicy::Drop => Ok(Action::Drop),
-                InvalidJsonPolicy::Tombstone => Ok(Action::Tombstone),
-                InvalidJsonPolicy::Pass => Ok(Action::PassThrough(
-                    original.expect("pass policy requires original bytes"),
-                )),
+                InvalidJsonPolicy::Drop => Ok(Execution {
+                    action: Action::Drop,
+                    issue: Some(ExecutionIssue::InvalidJson),
+                }),
+                InvalidJsonPolicy::Tombstone => Ok(Execution {
+                    action: Action::Tombstone,
+                    issue: Some(ExecutionIssue::InvalidJson),
+                }),
+                InvalidJsonPolicy::Pass => Ok(Execution {
+                    action: Action::PassThrough(
+                        original.expect("pass policy requires original bytes"),
+                    ),
+                    issue: Some(ExecutionIssue::InvalidJson),
+                }),
             };
         }
     };
-    match evaluate(plan, &document) {
-        Ok(EvaluatedAction::Drop) => Ok(Action::Drop),
-        Ok(EvaluatedAction::Tombstone) => Ok(Action::Tombstone),
-        Ok(EvaluatedAction::PassThrough) => Ok(Action::PassThrough(
-            original.expect("pass-through plan requires original bytes"),
-        )),
-        Ok(EvaluatedAction::Project(bytes)) => Ok(Action::Project(bytes)),
+    let action = match evaluate(plan, &document) {
+        Ok(EvaluatedAction::Drop) => Action::Drop,
+        Ok(EvaluatedAction::Tombstone) => Action::Tombstone,
+        Ok(EvaluatedAction::PassThrough) => {
+            Action::PassThrough(original.expect("pass-through plan requires original bytes"))
+        }
+        Ok(EvaluatedAction::Project(bytes)) => Action::Project(bytes),
         Err(error) => match policies.evaluation {
-            EvaluationPolicy::Fail => Err(error),
-            EvaluationPolicy::Drop => Ok(Action::Drop),
-            EvaluationPolicy::Tombstone => Ok(Action::Tombstone),
+            EvaluationPolicy::Fail => return Err(error),
+            EvaluationPolicy::Drop => {
+                return Ok(Execution {
+                    action: Action::Drop,
+                    issue: Some(ExecutionIssue::Evaluation),
+                });
+            }
+            EvaluationPolicy::Tombstone => {
+                return Ok(Execution {
+                    action: Action::Tombstone,
+                    issue: Some(ExecutionIssue::Evaluation),
+                });
+            }
         },
-    }
+    };
+    Ok(Execution {
+        action,
+        issue: None,
+    })
 }
 
 enum EvaluatedAction {
@@ -769,18 +819,17 @@ mod tests {
             (InvalidJsonPolicy::Drop, Action::Drop),
             (InvalidJsonPolicy::Tombstone, Action::Tombstone),
         ] {
-            assert_eq!(
-                execute(
-                    &invalid,
-                    Some(b"invalid".to_vec()),
-                    ErrorPolicies {
-                        invalid_json: policy,
-                        evaluation: EvaluationPolicy::Fail,
-                    },
-                )
-                .unwrap(),
-                expected
-            );
+            let execution = execute_report(
+                &invalid,
+                Some(b"invalid".to_vec()),
+                ErrorPolicies {
+                    invalid_json: policy,
+                    evaluation: EvaluationPolicy::Fail,
+                },
+            )
+            .unwrap();
+            assert_eq!(execution.action, expected);
+            assert_eq!(execution.issue, Some(ExecutionIssue::InvalidJson));
         }
 
         let evaluation = build_plan(&["length(true) == 1".to_owned()], &[], None, false).unwrap();
@@ -788,18 +837,17 @@ mod tests {
             (EvaluationPolicy::Drop, Action::Drop),
             (EvaluationPolicy::Tombstone, Action::Tombstone),
         ] {
-            assert_eq!(
-                execute(
-                    &evaluation,
-                    Some(b"{}".to_vec()),
-                    ErrorPolicies {
-                        invalid_json: InvalidJsonPolicy::Fail,
-                        evaluation: policy,
-                    },
-                )
-                .unwrap(),
-                expected
-            );
+            let execution = execute_report(
+                &evaluation,
+                Some(b"{}".to_vec()),
+                ErrorPolicies {
+                    invalid_json: InvalidJsonPolicy::Fail,
+                    evaluation: policy,
+                },
+            )
+            .unwrap();
+            assert_eq!(execution.action, expected);
+            assert_eq!(execution.issue, Some(ExecutionIssue::Evaluation));
         }
     }
 }

@@ -1,24 +1,34 @@
 use std::{
     fmt,
     io::{self, BufWriter, Write},
+    sync::Arc,
+    time::Instant,
 };
 
 use crate::{
-    cli::{OutputPlan, RuntimeConfig},
-    kafka::{KafkaInput, OwnedRecord, PollEvent},
-    output::{self, EmittedAction, Header, OutputRecord, Payload},
-    transform::json::{self, Action},
+    cli::RuntimeConfig,
+    kafka::KafkaInput,
+    runtime::{self, PipelineError, SignalControl, Stats},
 };
 
 #[derive(Debug)]
 pub enum AppError {
     Runtime(String),
     Output(io::Error),
+    Interrupted(i32),
 }
 
 impl AppError {
     pub fn is_broken_pipe(&self) -> bool {
         matches!(self, Self::Output(error) if error.kind() == io::ErrorKind::BrokenPipe)
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Interrupted(signal_hook::consts::SIGINT) => 130,
+            Self::Interrupted(signal_hook::consts::SIGTERM) => 143,
+            _ => 1,
+        }
     }
 }
 
@@ -27,6 +37,16 @@ impl fmt::Display for AppError {
         match self {
             Self::Runtime(message) => formatter.write_str(message),
             Self::Output(error) => write!(formatter, "output error: {error}"),
+            Self::Interrupted(signal) => write!(formatter, "interrupted by signal {signal}"),
+        }
+    }
+}
+
+impl From<PipelineError> for AppError {
+    fn from(error: PipelineError) -> Self {
+        match error {
+            PipelineError::Runtime(message) => Self::Runtime(message),
+            PipelineError::Output(error) => Self::Output(error),
         }
     }
 }
@@ -42,79 +62,35 @@ pub fn run(config: RuntimeConfig) -> Result<(), AppError> {
 }
 
 fn run_with_writer(config: &RuntimeConfig, mut writer: impl Write) -> Result<(), AppError> {
-    let mut input = KafkaInput::prepare(config).map_err(AppError::Runtime)?;
-    consume(config, &mut input, &mut writer)
+    let mut signals = SignalControl::install().map_err(AppError::Runtime)?;
+    let input = KafkaInput::prepare(config).map_err(AppError::Runtime)?;
+    consume(config, input, &mut writer, &mut signals)
 }
 
 fn consume(
     config: &RuntimeConfig,
-    input: &mut KafkaInput,
-    mut writer: impl Write,
-) -> Result<(), AppError> {
-    let mut admitted = 0_u64;
-    loop {
-        if config.count_limit.is_some_and(|limit| admitted >= limit) {
-            break;
-        }
-        match input.poll().map_err(AppError::Runtime)? {
-            PollEvent::Record(record) => {
-                admitted += 1;
-                write_record(config, record, &mut writer)?;
-            }
-            PollEvent::Idle => {}
-            PollEvent::Done => break,
-        }
-    }
-    writer.flush().map_err(AppError::Output)
-}
-
-fn write_record(
-    config: &RuntimeConfig,
-    record: OwnedRecord,
+    input: KafkaInput,
     writer: &mut impl Write,
+    signals: &mut SignalControl,
 ) -> Result<(), AppError> {
-    let action =
-        json::execute(&config.transform, record.payload, config.errors).map_err(|error| {
-            AppError::Runtime(format!(
-                "transform failed at {} partition {} offset {}: {error}",
-                config.topic, record.partition, record.offset
-            ))
-        })?;
-    let (payload, emitted_action) = match action {
-        Action::Drop => return Ok(()),
-        Action::Tombstone => (Payload::Tombstone, EmittedAction::Tombstone),
-        Action::PassThrough(ref bytes) => (Payload::Bytes(bytes), EmittedAction::PassThrough),
-        Action::Project(ref bytes) => (Payload::Bytes(bytes), EmittedAction::Project),
-    };
-    let headers = record
-        .headers
-        .iter()
-        .map(|header| Header {
-            name: &header.name,
-            value: header.value.as_deref(),
-        })
-        .collect::<Vec<_>>();
-    let output_record = OutputRecord {
-        topic: &config.topic,
-        partition: record.partition,
-        offset: record.offset,
-        timestamp: record.timestamp,
-        key: record.key.as_deref(),
-        headers: &headers,
-        payload,
-        action: emitted_action,
-    };
-    let bytes = match &config.output {
-        OutputPlan::Format(format) => format
-            .render(&output_record)
-            .map_err(|error| AppError::Runtime(error.to_string()))?,
-        OutputPlan::Envelope => output::render_envelope(&output_record),
-    };
-    writer.write_all(&bytes).map_err(AppError::Output)?;
-    if config.unbuffered {
-        writer.flush().map_err(AppError::Output)?;
+    let stats = Arc::new(Stats::default());
+    let started = Instant::now();
+    let (shutdown, pending_signals) = signals.parts();
+    let result = runtime::run_pipeline(
+        config,
+        input,
+        writer,
+        shutdown,
+        pending_signals,
+        Arc::clone(&stats),
+    );
+    if config.stats {
+        eprintln!("jkq: stats {}", stats.report(started.elapsed()));
     }
-    Ok(())
+    match result.map_err(AppError::from)? {
+        Some(signal) => Err(AppError::Interrupted(signal)),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -210,11 +186,12 @@ mod tests {
             "-f",
             "%p:%o:%K:%k:%S:%s:%h\n",
         ]);
-        let mut input = KafkaInput::prepare(&config).unwrap();
+        let input = KafkaInput::prepare(&config).unwrap();
         fixture.produce(0, Some(br#"{"value":1}"#), None, 102, None);
 
         let mut output = Vec::new();
-        consume(&config, &mut input, &mut output).unwrap();
+        let mut signals = SignalControl::install().unwrap();
+        consume(&config, input, &mut output, &mut signals).unwrap();
         let mut lines = output.split(|byte| *byte == b'\n').collect::<Vec<_>>();
         lines.retain(|line| !line.is_empty());
         lines.sort_unstable();
@@ -276,5 +253,34 @@ mod tests {
         let eof = fixture.config(&["-p", "0", "-e", "-f", "%o\n"]);
         run_with_writer(&eof, &mut output).unwrap();
         assert_eq!(output, b"0\n1\n2\n");
+    }
+
+    #[test]
+    fn byte_backpressure_drains_oversized_records_one_at_a_time() {
+        let fixture = Fixture::new("oversized-backpressure", 1);
+        for value in [br#"{"value":0}"#, br#"{"value":1}"#, br#"{"value":2}"#] {
+            fixture.produce(0, Some(value), None, 0, None);
+        }
+        let config = fixture.config(&[
+            "-p",
+            "0",
+            "--snapshot",
+            "-j",
+            "2",
+            "--max-inflight-records",
+            "2",
+            "--max-inflight-per-partition",
+            "1",
+            "--max-inflight-bytes",
+            "4",
+            "-f",
+            "%o:%s\\n",
+        ]);
+        let mut output = Vec::new();
+        run_with_writer(&config, &mut output).unwrap();
+        assert_eq!(
+            output,
+            b"0:{\"value\":0}\n1:{\"value\":1}\n2:{\"value\":2}\n"
+        );
     }
 }

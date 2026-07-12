@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod kafka;
 mod output;
+mod runtime;
 mod transform;
 
 use clap::Parser;
@@ -18,7 +19,7 @@ fn main() {
                     return;
                 }
                 eprintln!("jkq: {error}");
-                std::process::exit(1);
+                std::process::exit(error.exit_code());
             }
         }
     }
