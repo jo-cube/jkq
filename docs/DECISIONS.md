@@ -214,3 +214,14 @@ Deferred questions must be resolved in the relevant specification before a stabl
 **Backpressure:** Global record and byte pressure pauses every selected partition. Per-partition record pressure pauses only that partition. Resume occurs below 75% of each triggering limit. One already-polled candidate may wait outside admitted accounting, and one oversized record may be admitted only when no other admitted bytes remain. Byte admission uses a conservative compiled bound covering owned input, required parse copies, and projected output. Record formatting and JSON envelopes stream through the writer rather than staging another complete output record.
 
 **Shutdown:** The first `SIGINT` or `SIGTERM` stops admission and drains. A second termination signal uses signal-hook's conditional process exit so blocked output cannot prevent forced shutdown.
+
+## D32. Tape-backed JSON execution and depth
+
+**Decision:** Parse transformed records into simd-json's tape rather than its borrowed
+DOM. Reject inputs deeper than 128 nested containers through the invalid-JSON policy.
+
+**Reason:** A release-mode probe on Rust 1.97 and Apple ARM64 measured tape about
+29–68% faster for one to five early or late paths in a roughly 16 KiB, 200-field
+object, while also avoiding recursive source-DOM construction. Twenty independent
+late-field lookups were about 40% slower because tape object lookup is linear. Keep
+the simpler independent lookup plan until representative workloads justify a trie.

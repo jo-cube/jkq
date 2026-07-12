@@ -150,6 +150,7 @@ Suggested JSON fixtures:
 - empty object and array;
 - duplicate source keys;
 - malformed documents at different positions;
+- documents immediately below and above the maximum nesting depth;
 - very large string values.
 
 Kafka fixtures:

@@ -14,7 +14,7 @@ raw CLI and Kafka properties
 → single compiled output writer
 ```
 
-The implemented transform boundary owns a positioned handwritten parser, deduplicated path slots, strict evaluation, and a `simd-json` backend. Kafka tombstones bypass parsing. Valid unmatched input retains exact source bytes; projections serialize compact JSON in expression field order.
+The implemented transform boundary owns a positioned handwritten parser, deduplicated path slots, strict evaluation, and a `simd-json` tape backend. Kafka tombstones bypass parsing. Valid unmatched input retains exact source bytes; projections serialize compact JSON in expression field order. Parsed JSON is limited to 128 nesting levels and over-limit records follow the invalid-JSON policy.
 
 The output boundary compiles format strings once and operates on source metadata plus the post-transform payload. It distinguishes tombstones from empty bytes and JSON `null`. JSON envelopes use a golden-tested byte representation described in [the low-level design](docs/LLD.md#17-json-envelope).
 

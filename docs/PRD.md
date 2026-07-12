@@ -319,6 +319,8 @@ Initial policies:
 
 Default policies are `fail`.
 
+JSON deeper than 128 nested arrays or objects is handled by the invalid-JSON policy.
+
 ### FR12. Parallelism
 
 - `-j, --jobs <count>` configures compute workers.

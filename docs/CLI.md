@@ -276,6 +276,9 @@ pass
 
 Default: `fail`.
 
+Syntactically valid JSON deeper than 128 nested arrays or objects is treated as
+invalid JSON so worker stack use remains bounded.
+
 ### `--on-eval-error <policy>`
 
 Values:

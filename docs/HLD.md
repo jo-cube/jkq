@@ -102,7 +102,7 @@ Responsibilities:
 
 ### 3.5 JSON backend
 
-The first implementation uses `simd-json` behind a narrow internal interface.
+The first implementation uses `simd-json`'s non-recursive tape behind a narrow internal interface.
 
 Responsibilities:
 
@@ -113,12 +113,16 @@ Responsibilities:
 - serialize projected JSON;
 - return one explicit action.
 
+The backend rejects JSON deeper than 128 container levels before evaluation. This
+keeps recursive projection serialization within a controlled stack bound; the
+configured invalid-JSON policy handles the record.
+
 The interface must not expose `simd-json` value types outside the backend module.
 
 ### 3.6 Compute workers
 
 Each long-lived worker keeps backend execution state local. The initial backend uses
-record-owned parse and projection buffers; reusable worker-local buffers remain a
+record-owned tape and projection buffers; reusable worker-local buffers remain a
 benchmark-driven optimization rather than part of the current runtime contract.
 
 Workers:

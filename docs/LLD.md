@@ -506,7 +506,12 @@ Choose the path through a compile-time capability flag, not per-record guesswork
 
 ### 12.2 Path extraction
 
-The first implementation may use a borrowed or tape representation and resolve only compiled paths. It should avoid creating an owned `Value` tree.
+The first implementation uses simd-json's tape representation and resolves only
+compiled paths. It does not create an owned source `Value` tree. A local release-mode
+probe on Rust 1.97 and Apple ARM64 found tape materially faster for one to five early
+or late fields; twenty late independent lookups were slower because tape objects are
+scanned linearly. A shared-prefix trie remains deferred until representative
+benchmarks show that case matters.
 
 The initial compiler deduplicates identical complete paths. A later path trie may
 also deduplicate shared prefixes such as:
@@ -520,6 +525,10 @@ so they become one traversal into `.customer`.
 
 Add that trie only when the selected backend can exploit it and benchmarks show
 the independent traversals matter.
+
+The backend accepts at most 128 nested JSON containers. It validates tape node
+ranges iteratively before evaluation; exceeding the limit is an invalid-JSON
+condition and follows the selected policy.
 
 ### 12.3 Projection serialization
 
