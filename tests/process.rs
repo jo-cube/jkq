@@ -65,21 +65,29 @@ fn wait(mut child: Child) -> Output {
     child.wait_with_output().unwrap()
 }
 
-fn wait_until_polling(mut child: Child) -> (Child, thread::JoinHandle<Vec<u8>>) {
+fn wait_until_polling(
+    mut child: Child,
+) -> (Child, thread::JoinHandle<Vec<u8>>, mpsc::Receiver<()>) {
     let stderr = child.stderr.take().unwrap();
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (line_tx, line_rx) = mpsc::channel();
     let stderr_reader = thread::spawn(move || {
         let mut stderr = BufReader::new(stderr);
         let mut output = Vec::new();
-        stderr.read_until(b'\n', &mut output).unwrap();
-        ready_tx.send(()).unwrap();
-        stderr.read_to_end(&mut output).unwrap();
+        loop {
+            if stderr.read_until(b'\n', &mut output).unwrap() == 0 {
+                break;
+            }
+            if line_tx.send(()).is_err() {
+                stderr.read_to_end(&mut output).unwrap();
+                break;
+            }
+        }
         output
     });
-    ready_rx
+    line_rx
         .recv_timeout(Duration::from_secs(3))
         .expect("jkq did not begin polling");
-    (child, stderr_reader)
+    (child, stderr_reader, line_rx)
 }
 
 #[test]
@@ -110,7 +118,7 @@ fn first_termination_signal_drains_and_uses_signal_exit_code() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let (child, stderr_reader) = wait_until_polling(child);
+    let (child, stderr_reader, _stats_lines) = wait_until_polling(child);
     let status = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
         .status()
@@ -131,7 +139,7 @@ fn first_termination_signal_drains_and_uses_signal_exit_code() {
 #[test]
 fn second_termination_signal_forces_a_blocked_writer_to_exit() {
     let fixture = Fixture::new("signal-force");
-    let mut payload = vec![b'a'; 128 * 1024];
+    let mut payload = vec![b'a'; 512 * 1024];
     payload.insert(0, b'"');
     payload.push(b'"');
     fixture.produce(&payload);
@@ -142,15 +150,27 @@ fn second_termination_signal_forces_a_blocked_writer_to_exit() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let (child, stderr_reader) = wait_until_polling(child);
-    for _ in 0..2 {
-        let status = Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(status.success());
-        thread::sleep(Duration::from_millis(50));
-    }
+    let (mut child, stderr_reader, stats_lines) = wait_until_polling(child);
+    let mut stdout = child.stdout.take().unwrap();
+    let mut first_output_byte = [0];
+    stdout.read_exact(&mut first_output_byte).unwrap();
+    assert_eq!(first_output_byte, [b'"']);
+    while stats_lines.try_recv().is_ok() {}
+
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    stats_lines
+        .recv_timeout(Duration::from_secs(3))
+        .expect("poller did not begin graceful drain while stdout was blocked");
+
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
 
     let output = wait(child);
     assert_eq!(output.status.code(), Some(143));
