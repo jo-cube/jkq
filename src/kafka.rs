@@ -10,7 +10,7 @@ use rdkafka::{
 
 use crate::{
     cli::{EndPosition, KafkaErrorPolicy, RuntimeConfig, StartPosition},
-    output::{OutputRequirements, Timestamp, TimestampType},
+    output::{Header, OutputRequirements, Timestamp, TimestampType},
     transform::compile::PayloadBudget,
 };
 
@@ -18,18 +18,12 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
-pub struct OwnedHeader {
-    pub name: String,
-    pub value: Option<Vec<u8>>,
-}
-
-#[derive(Debug)]
 pub struct OwnedRecord {
     pub partition: i32,
     pub offset: i64,
     pub timestamp: Option<Timestamp>,
     pub key: Option<Vec<u8>>,
-    pub headers: Vec<OwnedHeader>,
+    pub headers: Vec<Header>,
     pub payload: Option<Vec<u8>>,
     pub retained_bytes: usize,
 }
@@ -51,6 +45,7 @@ pub struct KafkaInput {
     consumer: BaseConsumer,
     topic: String,
     partitions: BTreeMap<i32, PartitionState>,
+    remaining_partitions: usize,
     requirements: OutputRequirements,
     payload_budget: PayloadBudget,
     exit_at_end: bool,
@@ -142,12 +137,14 @@ impl KafkaInput {
                     },
                 )
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        let remaining_partitions = partitions.values().filter(|state| !state.done).count();
 
         let mut input = Self {
             consumer,
             topic: config.topic.clone(),
             partitions,
+            remaining_partitions,
             requirements: config.output.requirements(),
             payload_budget: config.transform.payload_budget(),
             exit_at_end: config.exit_at_end,
@@ -166,7 +163,7 @@ impl KafkaInput {
     }
 
     pub fn poll(&mut self) -> Result<PollEvent, String> {
-        if self.partitions.values().all(|state| state.done) {
+        if self.remaining_partitions == 0 {
             return Ok(PollEvent::Done);
         }
         let Some(result) = self.consumer.poll(POLL_TIMEOUT) else {
@@ -228,7 +225,7 @@ impl KafkaInput {
                     .headers()
                     .into_iter()
                     .flat_map(Headers::iter)
-                    .map(|header| OwnedHeader {
+                    .map(|header| Header {
                         name: header.key.to_owned(),
                         value: header.value.map(<[u8]>::to_vec),
                     })
@@ -264,6 +261,9 @@ impl KafkaInput {
 
     fn finish(&mut self, partition: i32) -> Result<(), String> {
         if let Some(state) = self.partitions.get_mut(&partition) {
+            if !state.done {
+                self.remaining_partitions -= 1;
+            }
             state.done = true;
         }
         self.set_paused(partition, true)

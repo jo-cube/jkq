@@ -29,9 +29,9 @@ pub struct OutputRequirements {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Header<'a> {
-    pub name: &'a str,
-    pub value: Option<&'a [u8]>,
+pub struct Header {
+    pub name: String,
+    pub value: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,7 +65,7 @@ pub struct OutputRecord<'a> {
     pub offset: i64,
     pub timestamp: Option<Timestamp>,
     pub key: Option<&'a [u8]>,
-    pub headers: &'a [Header<'a>],
+    pub headers: &'a [Header],
     pub payload: Payload<'a>,
     pub action: EmittedAction,
 }
@@ -222,7 +222,7 @@ impl CompiledFormat {
                         }
                         write_bytes(output, header.name.as_bytes(), &mut written)?;
                         write_bytes(output, b"=", &mut written)?;
-                        match header.value {
+                        match header.value.as_deref() {
                             None => write_bytes(output, b"NULL", &mut written)?,
                             Some(value) => write_bytes(output, value, &mut written)?,
                         }
@@ -266,10 +266,30 @@ fn write_bytes(output: &mut impl Write, bytes: &[u8], written: &mut usize) -> io
 
 fn write_decimal(
     output: &mut impl Write,
-    value: impl ToString,
+    value: impl fmt::Display,
     written: &mut usize,
 ) -> io::Result<()> {
-    write_bytes(output, value.to_string().as_bytes(), written)
+    write!(&mut DecimalWriter { output, written }, "{value}")
+}
+
+struct DecimalWriter<'a, W> {
+    output: &'a mut W,
+    written: &'a mut usize,
+}
+
+impl<W: Write> Write for DecimalWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self.output.write(bytes)?;
+        *self.written = self
+            .written
+            .checked_add(count)
+            .ok_or_else(|| io::Error::other("formatted record length overflowed usize"))?;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
 }
 
 fn write_optional_length(
@@ -318,8 +338,8 @@ pub fn write_envelope(record: &OutputRecord<'_>, output: &mut impl Write) -> io:
             write_bytes(output, b",", &mut written)?;
         }
         write_bytes(output, b"{\"name\":", &mut written)?;
-        write_json_string(output, header.name, &mut written)?;
-        write_bytes_fields(output, "value", header.value, &mut written)?;
+        write_json_string(output, &header.name, &mut written)?;
+        write_bytes_fields(output, "value", header.value.as_deref(), &mut written)?;
         write_bytes(output, b"}", &mut written)?;
     }
     write_bytes(output, b"],\"action\":", &mut written)?;
@@ -491,16 +511,16 @@ mod tests {
     fn formatter_emits_byte_exact_metadata_escapes_and_headers() {
         let headers = [
             Header {
-                name: "null",
+                name: "null".to_owned(),
                 value: None,
             },
             Header {
-                name: "empty",
-                value: Some(b""),
+                name: "empty".to_owned(),
+                value: Some(Vec::new()),
             },
             Header {
-                name: "raw",
-                value: Some(b"x"),
+                name: "raw".to_owned(),
+                value: Some(b"x".to_vec()),
             },
         ];
         let record = OutputRecord {
@@ -552,8 +572,8 @@ mod tests {
     #[test]
     fn envelope_schema_preserves_nulls_and_binary_bytes() {
         let headers = [Header {
-            name: "trace",
-            value: Some(&[0xff]),
+            name: "trace".to_owned(),
+            value: Some(vec![0xff]),
         }];
         let record = OutputRecord {
             headers: &headers,

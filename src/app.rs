@@ -11,6 +11,8 @@ use crate::{
     runtime::{self, PipelineError, SignalControl, Stats},
 };
 
+const STDOUT_BUFFER_BYTES: usize = 64 * 1024;
+
 #[derive(Debug)]
 pub enum AppError {
     Runtime(String),
@@ -57,7 +59,7 @@ pub fn run(config: RuntimeConfig) -> Result<(), AppError> {
     if config.unbuffered {
         run_with_writer(&config, lock)
     } else {
-        run_with_writer(&config, BufWriter::new(lock))
+        run_with_writer(&config, BufWriter::with_capacity(STDOUT_BUFFER_BYTES, lock))
     }
 }
 
@@ -73,7 +75,7 @@ fn consume(
     writer: &mut impl Write,
     signals: &mut SignalControl,
 ) -> Result<(), AppError> {
-    let stats = Arc::new(Stats::default());
+    let stats = Arc::new(Stats::new(config.stats));
     let started = Instant::now();
     let (shutdown, pending_signals) = signals.parts();
     let result = runtime::run_pipeline(

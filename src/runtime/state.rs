@@ -21,6 +21,8 @@ pub(super) struct Admission {
     pub total_records: usize,
     total_bytes: usize,
     global_limited: bool,
+    all_paused: bool,
+    partition_pause_dirty: bool,
     partitions: BTreeMap<i32, PartitionAdmission>,
     limits: RuntimeLimits,
 }
@@ -31,6 +33,8 @@ impl Admission {
             total_records: 0,
             total_bytes: 0,
             global_limited: false,
+            all_paused: false,
+            partition_pause_dirty: false,
             partitions: partitions
                 .iter()
                 .map(|partition| {
@@ -78,6 +82,8 @@ impl Admission {
             .checked_add(1)
             .ok_or_else(|| format!("partition {partition} sequence overflow"))?;
         state.in_flight += 1;
+        self.partition_pause_dirty |=
+            update_partition_limit(state, self.limits.max_inflight_per_partition);
         self.total_records += 1;
         self.total_bytes = self
             .total_bytes
@@ -103,12 +109,14 @@ impl Admission {
             ));
         }
         state.in_flight -= 1;
+        self.partition_pause_dirty |=
+            update_partition_limit(state, self.limits.max_inflight_per_partition);
         self.total_records -= 1;
         self.total_bytes -= release.retained_bytes;
         Ok(())
     }
 
-    fn update_limits(&mut self, pending: bool) {
+    fn update_global_limit(&mut self, pending: bool) {
         if self.global_limited {
             self.global_limited = pending
                 || self.total_records >= low_water(self.limits.max_inflight_records)
@@ -118,14 +126,6 @@ impl Admission {
                 || self.total_records >= self.limits.max_inflight_records
                 || self.total_bytes >= self.limits.max_inflight_bytes;
         }
-        for state in self.partitions.values_mut() {
-            if state.limited {
-                state.limited =
-                    state.in_flight >= low_water(self.limits.max_inflight_per_partition);
-            } else {
-                state.limited = state.in_flight >= self.limits.max_inflight_per_partition;
-            }
-        }
     }
 
     pub fn sync_pauses(
@@ -134,20 +134,36 @@ impl Admission {
         stopping: bool,
         pending: bool,
     ) -> Result<(), String> {
-        self.update_limits(pending);
+        self.update_global_limit(pending);
+        let all_paused = stopping || self.global_limited;
+        if all_paused == self.all_paused && !self.partition_pause_dirty {
+            return Ok(());
+        }
         for (partition, state) in &mut self.partitions {
-            let pause = stopping || self.global_limited || state.limited;
+            let pause = all_paused || state.limited;
             if pause != state.applied_paused {
                 input.set_paused(*partition, pause)?;
                 state.applied_paused = pause;
             }
         }
+        self.all_paused = all_paused;
+        self.partition_pause_dirty = false;
         Ok(())
     }
 }
 
 fn low_water(limit: usize) -> usize {
     limit.saturating_mul(3).div_ceil(4)
+}
+
+fn update_partition_limit(state: &mut PartitionAdmission, limit: usize) -> bool {
+    let previous = state.limited;
+    state.limited = if state.limited {
+        state.in_flight >= low_water(limit)
+    } else {
+        state.in_flight >= limit
+    };
+    state.limited != previous
 }
 
 struct PartitionOrder {
@@ -164,7 +180,8 @@ impl Orderer {
     pub fn insert(
         &mut self,
         completion: Completion,
-    ) -> Result<Vec<Completion>, (String, Box<Completion>)> {
+        ready: &mut Vec<Completion>,
+    ) -> Result<(), (String, Box<Completion>)> {
         let state = self
             .partitions
             .entry(completion.partition)
@@ -183,13 +200,18 @@ impl Orderer {
                 Box::new(completion),
             ));
         }
-        state.pending.insert(completion.sequence, completion);
-        let mut ready = Vec::new();
+        if completion.sequence == state.next_sequence {
+            ready.push(completion);
+            state.next_sequence += 1;
+        } else {
+            state.pending.insert(completion.sequence, completion);
+            return Ok(());
+        }
         while let Some(completion) = state.pending.remove(&state.next_sequence) {
             ready.push(completion);
             state.next_sequence += 1;
         }
-        Ok(ready)
+        Ok(())
     }
 
     pub fn take_pending(&mut self) -> Vec<Completion> {
@@ -226,32 +248,33 @@ mod tests {
     #[test]
     fn completion_frontier_orders_each_partition_and_advances_across_drop() {
         let mut orderer = Orderer::default();
-        assert!(
-            orderer
-                .insert(completion(0, 2, 1, Action::Tombstone))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            orderer
-                .insert(completion(0, 1, 1, Action::Drop))
-                .unwrap()
-                .is_empty()
-        );
-        let ready = orderer
-            .insert(completion(0, 0, 1, Action::PassThrough(b"a".to_vec())))
+        let mut ready = Vec::new();
+        orderer
+            .insert(completion(0, 2, 1, Action::Tombstone), &mut ready)
+            .unwrap();
+        assert!(ready.is_empty());
+        orderer
+            .insert(completion(0, 1, 1, Action::Drop), &mut ready)
+            .unwrap();
+        assert!(ready.is_empty());
+        orderer
+            .insert(
+                completion(0, 0, 1, Action::PassThrough(b"a".to_vec())),
+                &mut ready,
+            )
             .unwrap();
         assert_eq!(
             ready.iter().map(|item| item.sequence).collect::<Vec<_>>(),
             [0, 1, 2]
         );
-        assert_eq!(
-            orderer
-                .insert(completion(1, 0, 1, Action::PassThrough(b"b".to_vec())))
-                .unwrap()[0]
-                .partition,
-            1
-        );
+        ready.clear();
+        orderer
+            .insert(
+                completion(1, 0, 1, Action::PassThrough(b"b".to_vec())),
+                &mut ready,
+            )
+            .unwrap();
+        assert_eq!(ready[0].partition, 1);
     }
 
     #[test]
@@ -292,7 +315,7 @@ mod tests {
         for _ in 0..4 {
             admission.reserve(0, 10).unwrap();
         }
-        admission.update_limits(false);
+        admission.update_global_limit(false);
         assert!(admission.global_limited);
         assert!(admission.partitions[&0].limited);
         for expected_limited in [true, false] {
@@ -302,7 +325,7 @@ mod tests {
                     retained_bytes: 10,
                 })
                 .unwrap();
-            admission.update_limits(false);
+            admission.update_global_limit(false);
             assert_eq!(admission.global_limited, expected_limited);
         }
         for _ in 0..2 {

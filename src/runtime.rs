@@ -21,7 +21,7 @@ use signal_hook::{
 
 use crate::{
     cli::{OutputPlan, RuntimeConfig},
-    kafka::{KafkaInput, OwnedHeader, OwnedRecord, PollEvent},
+    kafka::{KafkaInput, OwnedRecord, PollEvent},
     output::{self, EmittedAction, Header, OutputRecord, Payload, Timestamp},
     transform::json::{self, Action, ExecutionIssue, TransformError},
 };
@@ -118,6 +118,7 @@ impl Drop for SignalControl {
 
 #[derive(Default)]
 pub struct Stats {
+    enabled: bool,
     admitted: AtomicU64,
     input_tombstones: AtomicU64,
     input_bytes: AtomicU64,
@@ -132,6 +133,13 @@ pub struct Stats {
 }
 
 impl Stats {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ..Self::default()
+        }
+    }
+
     pub fn report(&self, elapsed: Duration) -> String {
         format!(
             "admitted={} input_tombstones={} input_bytes={} dropped={} generated_tombstones={} passed={} projected={} invalid_json={} evaluation_failures={} output_records={} output_bytes={} elapsed_ms={}",
@@ -151,6 +159,9 @@ impl Stats {
     }
 
     fn admit(&self, record: &OwnedRecord) {
+        if !self.enabled {
+            return;
+        }
         self.admitted.fetch_add(1, Ordering::Relaxed);
         if record.payload.is_none() {
             self.input_tombstones.fetch_add(1, Ordering::Relaxed);
@@ -162,6 +173,9 @@ impl Stats {
     }
 
     fn transformed(&self, action: &Action, issue: Option<ExecutionIssue>, source_tombstone: bool) {
+        if !self.enabled {
+            return;
+        }
         match issue {
             Some(ExecutionIssue::InvalidJson) => {
                 self.invalid_json.fetch_add(1, Ordering::Relaxed);
@@ -189,6 +203,9 @@ impl Stats {
     }
 
     fn failed(&self, error: &TransformError) {
+        if !self.enabled {
+            return;
+        }
         match error {
             TransformError::InvalidJson(_) => {
                 self.invalid_json.fetch_add(1, Ordering::Relaxed);
@@ -196,6 +213,13 @@ impl Stats {
             TransformError::Evaluation { .. } => {
                 self.evaluation_failures.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    fn emitted(&self, bytes: usize) {
+        if self.enabled {
+            self.output_records.fetch_add(1, Ordering::Relaxed);
+            add(&self.output_bytes, bytes);
         }
     }
 }
@@ -209,13 +233,18 @@ struct WorkItem {
     record: OwnedRecord,
 }
 
+enum Dispatcher {
+    Transform(Sender<WorkItem>),
+    Identity(Sender<Completion>),
+}
+
 #[derive(Debug)]
 struct SourceRecord {
     partition: i32,
     offset: i64,
     timestamp: Option<Timestamp>,
     key: Option<Vec<u8>>,
-    headers: Vec<OwnedHeader>,
+    headers: Vec<Header>,
 }
 
 #[derive(Debug)]
@@ -247,16 +276,22 @@ pub fn run_pipeline(
     let (release_tx, release_rx) = bounded::<Release>(capacity);
     let started = Instant::now();
     let first_failure = Arc::new(OnceLock::new());
+    let transforms_json = config.transform.capabilities.parses_json;
 
     let signal = thread::scope(|scope| {
         let poller_shutdown = Arc::clone(&shutdown);
         let poller_stats = Arc::clone(&stats);
         let poller_failure = Arc::clone(&first_failure);
+        let dispatcher = if transforms_json {
+            Dispatcher::Transform(work_tx)
+        } else {
+            Dispatcher::Identity(completion_tx.clone())
+        };
         let poller = scope.spawn(move || {
             poll_loop(
                 config,
                 input,
-                work_tx,
+                dispatcher,
                 release_rx,
                 poller_shutdown,
                 signals,
@@ -266,18 +301,20 @@ pub fn run_pipeline(
             )
         });
 
-        let mut workers = Vec::with_capacity(config.jobs);
-        for _ in 0..config.jobs {
-            let receiver = work_rx.clone();
-            let sender = completion_tx.clone();
-            let worker_stats = Arc::clone(&stats);
-            let worker_shutdown = Arc::clone(&shutdown);
-            let worker_failure = Arc::clone(&first_failure);
-            workers.push(scope.spawn(move || {
-                guard_worker(worker_shutdown, worker_failure, || {
-                    worker_loop(config, receiver, sender, worker_stats);
-                });
-            }));
+        let mut workers = Vec::with_capacity(if transforms_json { config.jobs } else { 0 });
+        if transforms_json {
+            for _ in 0..config.jobs {
+                let receiver = work_rx.clone();
+                let sender = completion_tx.clone();
+                let worker_stats = Arc::clone(&stats);
+                let worker_shutdown = Arc::clone(&shutdown);
+                let worker_failure = Arc::clone(&first_failure);
+                workers.push(scope.spawn(move || {
+                    guard_worker(worker_shutdown, worker_failure, || {
+                        worker_loop(config, receiver, sender, worker_stats);
+                    });
+                }));
+            }
         }
         drop(work_rx);
         drop(completion_tx);
@@ -336,7 +373,7 @@ struct PollResult {
 fn poll_loop(
     config: &RuntimeConfig,
     mut input: KafkaInput,
-    work_tx: Sender<WorkItem>,
+    dispatcher: Dispatcher,
     release_rx: Receiver<Release>,
     shutdown: Arc<AtomicBool>,
     signals: &mut Signals,
@@ -345,7 +382,7 @@ fn poll_loop(
     first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> PollResult {
     let mut admission = Admission::new(&config.partitions, config.limits);
-    let mut work_tx = Some(work_tx);
+    let mut dispatcher = Some(dispatcher);
     let mut pending: Option<OwnedRecord> = None;
     let mut stopping = false;
     let mut signal = None;
@@ -375,12 +412,12 @@ fn poll_loop(
         }
         if stopping {
             pending = None;
-            work_tx.take();
+            dispatcher.take();
         }
         if let Err(pause_error) = admission.sync_pauses(&mut input, stopping, pending.is_some()) {
             runtime_failure(&first_failure, &shutdown, pause_error);
             stopping = true;
-            work_tx.take();
+            dispatcher.take();
         }
         report_periodic(config, &stats, started, &mut next_stats);
 
@@ -416,7 +453,9 @@ fn poll_loop(
                 if let Err(admit_error) = admit(
                     record,
                     &mut admission,
-                    work_tx.as_ref().expect("running poller has work sender"),
+                    dispatcher
+                        .as_ref()
+                        .expect("running poller has a dispatcher"),
                     &stats,
                 ) {
                     runtime_failure(&first_failure, &shutdown, admit_error);
@@ -449,7 +488,9 @@ fn poll_loop(
                     if let Err(admit_error) = admit(
                         record,
                         &mut admission,
-                        work_tx.as_ref().expect("running poller has work sender"),
+                        dispatcher
+                            .as_ref()
+                            .expect("running poller has a dispatcher"),
                         &stats,
                     ) {
                         runtime_failure(&first_failure, &shutdown, admit_error);
@@ -509,14 +550,51 @@ fn report_periodic(
 fn admit(
     record: OwnedRecord,
     admission: &mut Admission,
-    work_tx: &Sender<WorkItem>,
+    dispatcher: &Dispatcher,
     stats: &Stats,
 ) -> Result<(), String> {
     let partition = record.partition;
     let retained_bytes = record.retained_bytes;
     let sequence = admission.reserve(partition, retained_bytes)?;
     stats.admit(&record);
-    if let Err(send_error) = work_tx.try_send(WorkItem { sequence, record }) {
+    let send_result = match dispatcher {
+        Dispatcher::Transform(sender) => sender
+            .try_send(WorkItem { sequence, record })
+            .map_err(|error| error.to_string()),
+        Dispatcher::Identity(sender) => {
+            let OwnedRecord {
+                partition,
+                offset,
+                timestamp,
+                key,
+                headers,
+                payload,
+                retained_bytes,
+            } = record;
+            let source_tombstone = payload.is_none();
+            let action = match payload {
+                Some(bytes) => Action::PassThrough(bytes),
+                None => Action::Tombstone,
+            };
+            stats.transformed(&action, None, source_tombstone);
+            sender
+                .try_send(Completion {
+                    partition,
+                    sequence,
+                    retained_bytes,
+                    source: SourceRecord {
+                        partition,
+                        offset,
+                        timestamp,
+                        key,
+                        headers,
+                    },
+                    outcome: CompletionOutcome::Action(action),
+                })
+                .map_err(|error| error.to_string())
+        }
+    };
+    if let Err(send_error) = send_result {
         admission.release(Release {
             partition,
             retained_bytes,
@@ -532,6 +610,7 @@ fn worker_loop(
     completion_tx: Sender<Completion>,
     stats: Arc<Stats>,
 ) {
+    let mut backend = json::Backend::default();
     for work in work_rx {
         let WorkItem { sequence, record } = work;
         let OwnedRecord {
@@ -545,7 +624,7 @@ fn worker_loop(
         } = record;
         let source_tombstone = payload.is_none();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            json::execute_report(&config.transform, payload, config.errors)
+            backend.execute_report(&config.transform, payload, config.errors)
         }));
         let outcome = match result {
             Ok(Ok(execution)) => {
@@ -595,27 +674,26 @@ fn writer_loop(
     first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> Result<(), PipelineError> {
     let mut orderer = Orderer::default();
+    let mut ready = Vec::new();
     let mut failure = None;
+    let ordered = !config.unordered && config.transform.capabilities.parses_json;
     for completion in completion_rx {
-        let ready = if config.unordered {
-            vec![completion]
-        } else {
-            match orderer.insert(completion) {
-                Ok(ready) => ready,
-                Err((message, completion)) => {
-                    let completion = *completion;
-                    release(&release_tx, &completion);
-                    writer_failure(
-                        &mut failure,
-                        &first_failure,
-                        &shutdown,
-                        PipelineError::Runtime(message),
-                    );
-                    Vec::new()
-                }
+        ready.clear();
+        if ordered {
+            if let Err((message, completion)) = orderer.insert(completion, &mut ready) {
+                let completion = *completion;
+                release(&release_tx, &completion);
+                writer_failure(
+                    &mut failure,
+                    &first_failure,
+                    &shutdown,
+                    PipelineError::Runtime(message),
+                );
             }
-        };
-        for completion in ready {
+        } else {
+            ready.push(completion);
+        }
+        for completion in ready.drain(..) {
             if failure.is_none() {
                 match completion.outcome {
                     CompletionOutcome::Fatal(ref message) => {
@@ -702,21 +780,13 @@ fn write_action(
         Action::PassThrough(bytes) => (Payload::Bytes(bytes), EmittedAction::PassThrough),
         Action::Project(bytes) => (Payload::Bytes(bytes), EmittedAction::Project),
     };
-    let headers = source
-        .headers
-        .iter()
-        .map(|header| Header {
-            name: &header.name,
-            value: header.value.as_deref(),
-        })
-        .collect::<Vec<_>>();
     let output_record = OutputRecord {
         topic: &config.topic,
         partition: source.partition,
         offset: source.offset,
         timestamp: source.timestamp,
         key: source.key.as_deref(),
-        headers: &headers,
+        headers: &source.headers,
         payload,
         action: emitted_action,
     };
@@ -727,8 +797,7 @@ fn write_action(
     if config.unbuffered {
         writer.flush()?;
     }
-    stats.output_records.fetch_add(1, Ordering::Relaxed);
-    add(&stats.output_bytes, output_bytes);
+    stats.emitted(output_bytes);
     Ok(())
 }
 
@@ -762,8 +831,52 @@ mod tests {
     }
 
     #[test]
+    fn identity_dispatch_completes_without_a_worker() {
+        let (completion_tx, completion_rx) = bounded(1);
+        let dispatcher = Dispatcher::Identity(completion_tx);
+        let mut admission = Admission::new(
+            &[0],
+            crate::cli::RuntimeLimits {
+                max_inflight_records: 1,
+                max_inflight_bytes: 1024,
+                max_inflight_per_partition: 1,
+            },
+        );
+        admit(
+            OwnedRecord {
+                partition: 0,
+                offset: 7,
+                timestamp: None,
+                key: None,
+                headers: Vec::new(),
+                payload: Some(b"exact".to_vec()),
+                retained_bytes: 5,
+            },
+            &mut admission,
+            &dispatcher,
+            &Stats::default(),
+        )
+        .unwrap();
+
+        let completion = completion_rx.recv().unwrap();
+        assert_eq!(completion.sequence, 0);
+        assert!(matches!(
+            completion.outcome,
+            CompletionOutcome::Action(Action::PassThrough(ref bytes)) if bytes == b"exact"
+        ));
+    }
+
+    #[test]
+    fn disabled_statistics_do_not_touch_counters() {
+        let stats = Stats::default();
+        stats.emitted(10);
+        assert!(stats.report(Duration::ZERO).starts_with("admitted=0 "));
+        assert!(stats.report(Duration::ZERO).contains("output_bytes=0 "));
+    }
+
+    #[test]
     fn ordered_writer_drains_reverse_completions_and_releases_drops() {
-        let config = config(&["-f", "%p:%o:%S:%s\\n"]);
+        let config = config(&["--drop-if", "false", "-f", "%p:%o:%S:%s\\n"]);
         let (completion_tx, completion_rx) = bounded(3);
         let (release_tx, release_rx) = bounded(3);
         completion_tx
