@@ -18,14 +18,11 @@ Keep the product narrow. It is a stream-processing command, not a general Kafka 
 
 Treat these documents as the current product and architecture contract:
 
-1. `docs/PRD.md`
-2. `docs/HLD.md`
-3. `docs/LLD.md`
-4. `docs/CLI.md`
-5. `docs/EXPRESSION_LANGUAGE.md`
-6. `docs/TESTING.md`
-7. `docs/RELEASES.md`
-8. `docs/DECISIONS.md`
+1. `README.md` for purpose and scope;
+2. `docs/usage.md` for CLI and output behavior;
+3. `docs/expression-language.md` for expression semantics;
+4. `docs/architecture.md` for boundaries and invariants;
+5. `docs/development.md` for tests, dependencies, and local workflows.
 
 When code and documentation disagree, determine whether the code is wrong or the contract needs an intentional revision. Do not silently preserve accidental behavior.
 
@@ -93,7 +90,7 @@ Do not add both overlapping libraries for the same concern without benchmark or 
 
 ## Architectural Invariants
 
-These invariants must remain true unless the design documents are deliberately revised:
+These invariants must remain true unless the owning behavior or architecture document is deliberately revised:
 
 - Consumption uses direct partition assignment only.
 - One invocation consumes one topic and one or more explicitly selected partitions.
@@ -144,7 +141,7 @@ When fixing a defect:
 
 Documentation is part of the implementation.
 
-- Update the relevant specification when observable behavior changes.
+- Update the owning document when observable behavior changes.
 - Keep user-facing documentation concrete and example-driven.
 - Keep architecture documentation focused on boundaries, data flow, ownership, and invariants.
 - Record deliberate compatibility deviations.
@@ -164,7 +161,7 @@ Documentation is part of the implementation.
 
 Before implementation:
 
-1. read the relevant design documents;
+1. read the relevant documentation;
 2. identify the behavior being added or changed;
 3. locate the owning module rather than creating a parallel path;
 4. decide how the behavior will be verified.
@@ -191,7 +188,7 @@ Also run Kafka integration tests and performance smoke tests when the change aff
 
 A change is complete only when:
 
-- behavior matches the product and design documents;
+- behavior matches the product and architecture documentation;
 - new behavior has purposeful tests;
 - failure behavior is tested where material;
 - formatting, linting, and tests pass;

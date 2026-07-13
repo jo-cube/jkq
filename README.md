@@ -1,12 +1,9 @@
 # jkq
 
-`jkq` is a Rust command-line consumer for explicitly selected Kafka partitions whose record values are JSON. It applies a restricted predicate and projection language, then emits dropped, tombstoned, exact pass-through, or compact projected records with kcat-style formatting.
-
-The current implementation directly assigns Kafka partitions, resolves documented start and end positions, captures fixed snapshots, and runs JSON work through a bounded compute pool. Plain pass-through records bypass compute workers. It restores source order within each partition before one writer emits output, pauses Kafka partitions under record or byte pressure, and drains admitted work on termination.
-
-## Examples
-
-Project selected fields after filtering:
+`jkq` consumes explicitly selected Kafka partitions, transforms JSON record
+values, and writes the results to stdout. It is built for shell pipelines that
+need Kafka metadata, predictable ordering, and less JSON work than a general
+`jq` program.
 
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \
@@ -15,44 +12,86 @@ jkq -b localhost:9092 -t events -p 0 --snapshot \
   -f '%p\t%o\t%R%s\n'
 ```
 
-Preserve exact source JSON unless the record represents deletion:
+One input record produces one of four actions:
 
-```sh
-jkq -b localhost:9092 -t events -p 0 \
-  --tombstone-if '.deleted == true' -f '%K%k%R%s'
-```
+- **drop**: write nothing;
+- **tombstone**: retain the source metadata with a null Kafka payload;
+- **pass**: preserve the exact source value bytes;
+- **project**: write compact JSON produced by an expression.
 
-## Non-goals
+Kafka tombstones bypass JSON parsing and remain tombstones. Records stay in
+source order within each partition by default; there is no global order across
+partitions.
 
-`jkq` is not a producer, consumer-group client, Kafka administration suite, service, or complete jq implementation. One input record produces at most one output record.
+## What It Is For
 
-## Documentation
+Use `jkq` to:
 
-- [Product requirements](docs/PRD.md)
-- [Architecture](ARCHITECTURE.md)
-- [High-level design](docs/HLD.md)
-- [Low-level design](docs/LLD.md)
-- [CLI](docs/CLI.md)
-- [Expression language](docs/EXPRESSION_LANGUAGE.md)
-- [Testing](docs/TESTING.md)
-- [Release process](docs/RELEASES.md)
-- [Accepted decisions](docs/DECISIONS.md)
+- inspect or export a bounded range from a large JSON topic;
+- filter records before sending them to another command;
+- preserve source keys, offsets, timestamps, and headers;
+- emit compact projections instead of complete documents;
+- retain tombstone semantics in text or binary-framed output.
 
-Run the normal repository checks with `make check`.
+`jkq` is deliberately not a producer, consumer-group client, Kafka
+administration suite, service, or complete jq implementation. It consumes one
+topic per invocation through direct partition assignment.
 
-## Building
+## Build
 
-Install the Rust toolchain selected by `rust-toolchain.toml` and the native build
-tools required by `rdkafka`, then run:
+Install stable Rust and the native tools required to build bundled librdkafka
+and OpenSSL, then run:
 
 ```sh
 cargo build --release --locked
 ```
 
-The build compiles librdkafka and OpenSSL from pinned crate sources. On Unix, a C
-compiler, `make`, and Perl are required; `pkg-config` may also be needed for native
-compression libraries on the target platform.
+On Unix, this normally requires a C compiler, `make`, Perl, and `pkg-config`.
+The executable is written to `target/release/jkq`.
 
-## Runtime limits
+## Quick Use
 
-`--max-inflight-records`, `--max-inflight-bytes`, and `--max-inflight-per-partition` bound admitted work. The byte charge conservatively covers parsing copies and projected output, so duplicative projections may reduce concurrency. A record larger than the byte budget runs alone. Kafka polling continues while assigned partitions are paused, and partitions resume below the documented low-water thresholds.
+Consume a fixed snapshot of two partitions:
+
+```sh
+jkq -b localhost:9092 -t events -p 0 -p 1 --snapshot
+```
+
+Turn logical deletions into Kafka tombstones while preserving the key:
+
+```sh
+jkq -b localhost:9092 -t events -p 0 --snapshot \
+  --tombstone-if '.deleted == true' -f '%K%k%R%s'
+```
+
+Write metadata and the post-transform payload as newline-delimited JSON
+envelopes:
+
+```sh
+jkq -b localhost:9092 -t events -p 0 --snapshot -J
+```
+
+The default output is `%s\n`. Use `%R%s` or another explicit frame when
+payloads may contain newlines or arbitrary bytes.
+
+## Documentation
+
+- [Usage](docs/usage.md): offsets, transforms, output, errors, and runtime
+  controls.
+- [Expression language](docs/expression-language.md): supported syntax and
+  evaluation semantics.
+- [Architecture](docs/architecture.md): data flow, ownership, ordering, and
+  backpressure.
+- [Development](docs/development.md): repository shape, checks, tests, and
+  contribution boundaries.
+
+## Development
+
+Run the repository checks with:
+
+```sh
+make check
+```
+
+See [development.md](docs/development.md) before changing observable behavior
+or the data path.
