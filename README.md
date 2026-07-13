@@ -49,6 +49,9 @@ cargo build --release --locked
 On Unix, this normally requires a C compiler, `make`, Perl, and `pkg-config`.
 The executable is written to `target/release/jkq`.
 
+Tagged GitHub releases provide binary archives and SHA-256 checksums for Linux
+amd64, Linux arm64, and macOS arm64. There is no installer.
+
 ## Quick Use
 
 Consume a fixed snapshot of two partitions:

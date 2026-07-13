@@ -16,6 +16,7 @@ src/runtime/state.rs     admission and ordering state
 src/output.rs            formats and JSON envelopes
 tests/process.rs         Unix process tests
 .github/workflows/ci.yml source checks on Linux
+.github/workflows/release.yml tagged release archives and checksums
 ```
 
 [architecture.md](architecture.md) explains ownership and data flow.
@@ -48,9 +49,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-CI runs the same checks with the lockfile enforced. There is currently no
-release packaging workflow or installer; do not document release artifacts
-until that machinery exists.
+CI runs the same checks with the lockfile enforced. Tags matching `v*` run the
+release checks, build native Linux amd64, Linux arm64, and macOS arm64 archives,
+and attach each archive and its SHA-256 checksum to the GitHub release. There
+is no installer or crates.io publication.
 
 ## Tests
 
