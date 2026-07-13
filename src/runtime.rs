@@ -343,15 +343,14 @@ pub fn run_pipeline(
                 shutdown.store(true, Ordering::SeqCst);
             }
         }
-        let poll_result = match poller.join() {
+        match poller.join() {
             Ok(result) => result,
             Err(_) => {
                 let error = PipelineError::Runtime("Kafka poll thread panicked".to_owned());
                 record_failure(&first_failure, &error);
-                return None;
+                None
             }
-        };
-        poll_result.signal
+        }
     });
 
     match Arc::try_unwrap(first_failure) {
@@ -365,10 +364,6 @@ pub fn run_pipeline(
     }
 }
 
-struct PollResult {
-    signal: Option<i32>,
-}
-
 #[allow(clippy::too_many_arguments)]
 fn poll_loop(
     config: &RuntimeConfig,
@@ -380,7 +375,7 @@ fn poll_loop(
     stats: Arc<Stats>,
     started: Instant,
     first_failure: Arc<OnceLock<RecordedFailure>>,
-) -> PollResult {
+) -> Option<i32> {
     let mut admission = Admission::new(&config.partitions, config.limits);
     let mut dispatcher = Some(dispatcher);
     let mut pending: Option<OwnedRecord> = None;
@@ -509,7 +504,7 @@ fn poll_loop(
         }
     }
 
-    PollResult { signal }
+    signal
 }
 
 fn runtime_failure(first: &OnceLock<RecordedFailure>, shutdown: &AtomicBool, message: String) {
@@ -824,6 +819,12 @@ mod tests {
         }
     }
 
+    fn fatal_completion(partition: i32, sequence: u64, bytes: usize) -> Completion {
+        let mut completion = completion(partition, sequence, bytes, Action::Drop);
+        completion.outcome = CompletionOutcome::Fatal("fatal transform".to_owned());
+        completion
+    }
+
     fn config(arguments: &[&str]) -> RuntimeConfig {
         let mut base = vec!["jkq", "-b", "unused", "-t", "events", "-p", "0"];
         base.extend_from_slice(arguments);
@@ -903,6 +904,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, b"0:0:1:a\n0:2:-1:\n");
+        let releases = release_rx.iter().collect::<Vec<_>>();
+        assert_eq!(releases.len(), 3);
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| release.retained_bytes)
+                .sum::<usize>(),
+            6
+        );
+    }
+
+    #[test]
+    fn ordered_writer_stops_at_first_fatal_result_and_releases_every_completion() {
+        let config = config(&["--drop-if", "false"]);
+        let (completion_tx, completion_rx) = bounded(3);
+        let (release_tx, release_rx) = bounded(3);
+        completion_tx
+            .send(completion(0, 2, 3, Action::PassThrough(b"c".to_vec())))
+            .unwrap();
+        completion_tx.send(fatal_completion(0, 1, 2)).unwrap();
+        completion_tx
+            .send(completion(0, 0, 1, Action::PassThrough(b"a".to_vec())))
+            .unwrap();
+        drop(completion_tx);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let first_failure = Arc::new(OnceLock::new());
+        let mut output = Vec::new();
+        let error = writer_loop(
+            &config,
+            &mut output,
+            completion_rx,
+            release_tx,
+            Arc::clone(&shutdown),
+            Arc::new(Stats::default()),
+            Arc::clone(&first_failure),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, PipelineError::Runtime(ref message) if message == "fatal transform")
+        );
+        assert_eq!(output, b"a\n");
+        assert!(shutdown.load(Ordering::SeqCst));
+        assert!(matches!(
+            first_failure.get(),
+            Some(RecordedFailure::Runtime(message)) if message == "fatal transform"
+        ));
         let releases = release_rx.iter().collect::<Vec<_>>();
         assert_eq!(releases.len(), 3);
         assert_eq!(
