@@ -121,9 +121,11 @@ The interface must not expose `simd-json` value types outside the backend module
 
 ### 3.6 Compute workers
 
-Each long-lived worker keeps backend execution state local. The initial backend uses
-record-owned tape and projection buffers; reusable worker-local buffers remain a
-benchmark-driven optimization rather than part of the current runtime contract.
+Each long-lived worker keeps backend execution state local. The initial backend reuses
+simd-json parser buffers, tape storage, and the original-preserving parse buffer across
+records. Parser state is discarded after an input or tape allocation exceeds 8 MiB so
+one exceptional record does not permanently inflate a worker. Projection output remains
+record-owned because it moves to the writer.
 
 Workers:
 
@@ -144,8 +146,8 @@ For each partition, maintain:
 
 When a completion arrives:
 
-1. store it if its sequence is ahead;
-2. emit it immediately if it matches the frontier;
+1. emit it immediately if it matches the frontier;
+2. store it only if its sequence is ahead;
 3. repeatedly drain newly contiguous completions;
 4. release admission budget for every drained input, including drops;
 5. mark a partition complete when its terminal boundary has drained.
@@ -171,6 +173,10 @@ The default runtime uses operating-system threads:
 - one poll/admission thread;
 - `N` compute workers;
 - one completion/order/write thread.
+
+When the compiled plan does not parse JSON, the poller sends pass-through and tombstone
+completions directly to the writer. Compute workers and order restoration are skipped;
+the single poller already observes each partition in source order.
 
 A dedicated reporting thread is not required initially. Periodic statistics can be emitted from the poll loop or writer based on shared atomics and snapshots.
 

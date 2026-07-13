@@ -2,7 +2,7 @@
 
 `jkq` is a Rust command-line consumer for explicitly selected Kafka partitions whose record values are JSON. It applies a restricted predicate and projection language, then emits dropped, tombstoned, exact pass-through, or compact projected records with kcat-style formatting.
 
-The current implementation directly assigns Kafka partitions, resolves documented start and end positions, captures fixed snapshots, and runs owned records through a bounded compute pool. It restores source order within each partition before one writer emits output, pauses Kafka partitions under record or byte pressure, and drains admitted work on termination.
+The current implementation directly assigns Kafka partitions, resolves documented start and end positions, captures fixed snapshots, and runs JSON work through a bounded compute pool. Plain pass-through records bypass compute workers. It restores source order within each partition before one writer emits output, pauses Kafka partitions under record or byte pressure, and drains admitted work on termination.
 
 ## Examples
 

@@ -483,7 +483,7 @@ Required when pass-through or invalid-JSON pass policy is possible.
 
 ```text
 original Vec<u8>
-→ clone into an owned parse buffer
+→ copy into a reusable worker-local parse buffer
 → parse mutable buffer
 → retain original unchanged
 ```
@@ -503,6 +503,8 @@ owned payload Vec<u8>
 ```
 
 Choose the path through a compile-time capability flag, not per-record guesswork.
+Each worker also reuses simd-json's parser buffers and tape allocation. Inputs or tape
+allocations above 8 MiB are processed normally and then discarded rather than retained.
 
 ### 12.2 Path extraction
 
@@ -609,6 +611,10 @@ Each worker loop:
 4. send completion;
 5. terminate when the work channel closes or cancellation is fatal.
 
+If the compiled plan does not parse JSON, do not start compute workers. The poller moves
+the owned payload directly into a completion, preserving tombstones and exact source
+bytes while retaining the same admission and writer backpressure.
+
 Worker panics must not silently hang the pipeline. Join failures become internal fatal errors.
 
 ## 15. Ordering Algorithm
@@ -623,12 +629,17 @@ struct PartitionOrderState {
 }
 ```
 
-A `BTreeMap` is simple and sufficient initially. Since sequences are dense, a deque-based gap buffer may be benchmarked later.
+A `BTreeMap` stores only genuine out-of-order gaps. An in-order completion advances the
+frontier directly without entering the map. Since sequences are dense, a deque-based gap
+buffer may be benchmarked later.
 
 ### 15.2 Insert and drain
 
 ```text
-insert completion by sequence
+if completion matches next_sequence:
+    emit it directly
+else:
+    insert completion by sequence
 while pending contains next_sequence:
     remove completion
     handle outcome

@@ -211,6 +211,10 @@ Deferred questions must be resolved in the relevant specification before a stabl
 
 **Decision:** One poll/admission thread distributes records over bounded crossbeam channels to a fixed worker pool. The calling thread is the sole completion restorer and output writer. Retained charges are released only after ordered drain; unordered mode releases after immediate write or drop.
 
+Plans that do not parse JSON bypass the compute pool and send completions directly from
+the poller to the writer. This removes unnecessary thread and channel hops while keeping
+admission, output serialization, and backpressure unchanged.
+
 **Backpressure:** Global record and byte pressure pauses every selected partition. Per-partition record pressure pauses only that partition. Resume occurs below 75% of each triggering limit. One already-polled candidate may wait outside admitted accounting, and one oversized record may be admitted only when no other admitted bytes remain. Byte admission uses a conservative compiled bound covering owned input, required parse copies, and projected output. Record formatting and JSON envelopes stream through the writer rather than staging another complete output record.
 
 **Shutdown:** The first `SIGINT` or `SIGTERM` stops admission and drains. A second termination signal uses signal-hook's conditional process exit so blocked output cannot prevent forced shutdown.
@@ -225,3 +229,7 @@ DOM. Reject inputs deeper than 128 nested containers through the invalid-JSON po
 object, while also avoiding recursive source-DOM construction. Twenty independent
 late-field lookups were about 40% slower because tape object lookup is linear. Keep
 the simpler independent lookup plan until representative workloads justify a trie.
+
+Each worker reuses simd-json parser buffers and tape storage. Parser state is discarded
+when an input or tape allocation exceeds 8 MiB. Projection bytes remain record-owned so
+they can move to the writer without copying.

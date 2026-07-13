@@ -410,8 +410,9 @@ Scenarios:
 Compare against:
 
 - kcat alone;
-- kcat piped to jq;
 - any other relevant tool only when version and command are recorded.
+
+A kcat-plus-jq comparison is deferred until it represents a useful supported workload.
 
 ### 11.4 Benchmark reporting
 
