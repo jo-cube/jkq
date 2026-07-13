@@ -144,12 +144,17 @@ failures into an explicit action:
 arrays or objects is handled by the invalid-JSON policy. Fatal Kafka state
 errors remain fatal even when `--on-kafka-error continue` is selected.
 
+When `--on-invalid-json` is omitted and no expression needs JSON, the identity
+path does not parse payloads. Supplying the option explicitly forces JSON
+validation, including for an otherwise identity transform.
+
 ## Kafka Configuration
 
 `-F, --config <path>` reads librdkafka properties as `key=value` lines. Blank
 lines and lines beginning with `#` are ignored. `-X, --property key=value` is
 repeatable; later values replace earlier ones. Dedicated `-b` brokers take
-precedence over both.
+precedence over both. For `-X`, everything after the first `=` is the property
+value, including surrounding whitespace.
 
 `jkq` owns these properties and rejects attempts to set them:
 

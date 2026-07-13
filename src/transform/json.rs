@@ -790,7 +790,7 @@ impl TransformError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::compile::build_plan;
+    use crate::transform::compile::{JsonRequirement, build_plan};
 
     const FAIL: ErrorPolicies = ErrorPolicies {
         invalid_json: InvalidJsonPolicy::Fail,
@@ -810,7 +810,7 @@ mod tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             projection,
-            false,
+            JsonRequirement::AsNeeded,
         )
         .unwrap();
         execute(&plan, input.map(<[u8]>::to_vec), FAIL)
@@ -923,7 +923,13 @@ mod tests {
 
     #[test]
     fn invalid_json_pass_preserves_exact_bytes() {
-        let plan = build_plan(&["true".to_owned()], &[], None, true).unwrap();
+        let plan = build_plan(
+            &["true".to_owned()],
+            &[],
+            None,
+            JsonRequirement::PreserveInvalid,
+        )
+        .unwrap();
         let input = b"not json".to_vec();
         let action = execute(
             &plan,
@@ -939,7 +945,7 @@ mod tests {
 
     #[test]
     fn worker_backend_reuses_normal_scratch_and_discards_oversized_scratch() {
-        let pass = build_plan(&["false".to_owned()], &[], None, false).unwrap();
+        let pass = build_plan(&["false".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
         let mut backend = Backend::default();
         for input in [br#"{"value":"first"}"#.as_slice(), br#"{"value":2}"#] {
             let execution = backend
@@ -950,7 +956,7 @@ mod tests {
         assert!(backend.parse_buffer.capacity() >= br#"{"value":"first"}"#.len());
         assert!(backend.tape.as_ref().unwrap().0.capacity() > 1);
 
-        let drop = build_plan(&["true".to_owned()], &[], None, false).unwrap();
+        let drop = build_plan(&["true".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
         let mut oversized = vec![b' '; MAX_RETAINED_BUFFER_BYTES + 1];
         oversized.extend_from_slice(b"null");
         assert_eq!(
@@ -1033,7 +1039,7 @@ mod tests {
                 br#"{"value":[1,2,3]}"#.as_slice(),
             ),
         ] {
-            let plan = build_plan(&[], &[], Some(projection), false).unwrap();
+            let plan = build_plan(&[], &[], Some(projection), JsonRequirement::AsNeeded).unwrap();
             let budget = plan.payload_budget().bytes(input.len()).unwrap();
             let execution = execute_report(&plan, Some(input.to_vec()), FAIL).unwrap();
             let Action::Project(output) = execution.action else {
@@ -1066,7 +1072,8 @@ mod tests {
 
     #[test]
     fn error_policies_convert_invalid_json_and_evaluation_failures() {
-        let invalid = build_plan(&["true".to_owned()], &[], None, false).unwrap();
+        let invalid =
+            build_plan(&["true".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
         for (policy, expected) in [
             (InvalidJsonPolicy::Drop, Action::Drop),
             (InvalidJsonPolicy::Tombstone, Action::Tombstone),
@@ -1084,7 +1091,13 @@ mod tests {
             assert_eq!(execution.issue, Some(ExecutionIssue::InvalidJson));
         }
 
-        let evaluation = build_plan(&["length(true) == 1".to_owned()], &[], None, false).unwrap();
+        let evaluation = build_plan(
+            &["length(true) == 1".to_owned()],
+            &[],
+            None,
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
         for (policy, expected) in [
             (EvaluationPolicy::Drop, Action::Drop),
             (EvaluationPolicy::Tombstone, Action::Tombstone),
@@ -1115,7 +1128,7 @@ mod tests {
 
     #[test]
     fn invalid_json_errors_report_coordinates_without_payload_content() {
-        let plan = build_plan(&["false".to_owned()], &[], None, false).unwrap();
+        let plan = build_plan(&["false".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
         let error = execute(&plan, Some(b"secret".to_vec()), FAIL).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("at byte"), "{message}");
@@ -1124,7 +1137,7 @@ mod tests {
 
     #[test]
     fn excessive_json_nesting_uses_the_invalid_json_policy() {
-        let plan = build_plan(&["false".to_owned()], &[], None, false).unwrap();
+        let plan = build_plan(&["false".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
         let accepted = format!(
             "{}0{}",
             "[".repeat(MAX_JSON_DEPTH),

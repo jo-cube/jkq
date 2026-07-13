@@ -70,6 +70,13 @@ pub struct PlanCapabilities {
     pub requires_original_bytes: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonRequirement {
+    AsNeeded,
+    Validate,
+    PreserveInvalid,
+}
+
 #[derive(Clone, Debug)]
 pub struct CompiledExpr {
     pub kind: CompiledKind,
@@ -127,7 +134,7 @@ pub fn build_plan(
     drops: &[String],
     tombstones: &[String],
     projection: Option<&str>,
-    preserve_invalid_json: bool,
+    json_requirement: JsonRequirement,
 ) -> Result<TransformPlan, String> {
     let drops = drops
         .iter()
@@ -143,7 +150,7 @@ pub fn build_plan(
         .map(|source| syntax::parse(source, "projection"))
         .transpose()
         .map_err(|error| error.to_string())?;
-    Compiler::compile(drops, tombstones, projection, preserve_invalid_json)
+    Compiler::compile(drops, tombstones, projection, json_requirement)
         .map_err(|error| error.to_string())
 }
 
@@ -156,7 +163,7 @@ impl Compiler {
         drops: Vec<Expr>,
         tombstones: Vec<Expr>,
         projection: Option<Expr>,
-        preserve_invalid_json: bool,
+        json_requirement: JsonRequirement,
     ) -> Result<TransformPlan, CompileError> {
         let mut compiler = Self { paths: Vec::new() };
         for (category, predicates) in [
@@ -186,8 +193,12 @@ impl Compiler {
             .map(|expression| compiler.expression(expression, "projection"))
             .transpose()?;
         let can_pass_through = projection.is_none();
-        let parses_json = !drops.is_empty() || !tombstones.is_empty() || projection.is_some();
-        let requires_original_bytes = can_pass_through || preserve_invalid_json;
+        let parses_json = json_requirement != JsonRequirement::AsNeeded
+            || !drops.is_empty()
+            || !tombstones.is_empty()
+            || projection.is_some();
+        let requires_original_bytes =
+            can_pass_through || json_requirement == JsonRequirement::PreserveInvalid;
         let projection_bound = projection
             .as_ref()
             .map(expression_bound)
@@ -383,7 +394,7 @@ mod tests {
             &[".customer.id == 1".to_owned()],
             &["exists(.customer.id)".to_owned()],
             Some("{id: .customer.id}"),
-            false,
+            JsonRequirement::AsNeeded,
         )
         .unwrap();
         assert_eq!(plan.paths.len(), 1);
@@ -392,25 +403,45 @@ mod tests {
 
     #[test]
     fn duplicate_object_keys_are_rejected() {
-        let error = build_plan(&[], &[], Some("{id: 1, id: 2}"), false).unwrap_err();
+        let error =
+            build_plan(&[], &[], Some("{id: 1, id: 2}"), JsonRequirement::AsNeeded).unwrap_err();
         assert!(error.contains("duplicate projection key"));
     }
 
     #[test]
     fn function_arity_is_checked_once_at_startup() {
-        let error = build_plan(&["exists(.a, .b)".to_owned()], &[], None, false).unwrap_err();
+        let error = build_plan(
+            &["exists(.a, .b)".to_owned()],
+            &[],
+            None,
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap_err();
         assert!(error.contains("expects 1 argument"));
     }
 
     #[test]
     fn payload_budget_includes_parse_copies_and_projection_amplification() {
-        let projected = build_plan(&[], &[], Some("[.value, .value]"), false).unwrap();
+        let projected = build_plan(
+            &[],
+            &[],
+            Some("[.value, .value]"),
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
         assert_eq!(projected.payload_budget().bytes(100).unwrap(), 303);
 
-        let preserving = build_plan(&[], &[], Some("[.value, .value]"), true).unwrap();
+        let preserving = build_plan(
+            &[],
+            &[],
+            Some("[.value, .value]"),
+            JsonRequirement::PreserveInvalid,
+        )
+        .unwrap();
         assert_eq!(preserving.payload_budget().bytes(100).unwrap(), 403);
 
-        let pass_through = build_plan(&["true".to_owned()], &[], None, false).unwrap();
+        let pass_through =
+            build_plan(&["true".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
         assert_eq!(pass_through.payload_budget().bytes(100).unwrap(), 200);
     }
 }

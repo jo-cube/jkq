@@ -5,7 +5,7 @@ use clap::{Parser, ValueEnum};
 use crate::{
     output::{CompiledFormat, OutputRequirements},
     transform::{
-        compile::{TransformPlan, build_plan},
+        compile::{JsonRequirement, TransformPlan, build_plan},
         json::{ErrorPolicies, EvaluationPolicy, InvalidJsonPolicy},
     },
 };
@@ -87,8 +87,8 @@ pub struct RawCli {
     #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_PER_PARTITION)]
     max_inflight_per_partition: usize,
     /// Policy for malformed non-tombstone payloads
-    #[arg(long, value_enum, default_value_t = RawInvalidJsonPolicy::Fail)]
-    on_invalid_json: RawInvalidJsonPolicy,
+    #[arg(long, value_enum)]
+    on_invalid_json: Option<RawInvalidJsonPolicy>,
     /// Policy for predicate or projection failures
     #[arg(long, value_enum, default_value_t = RawEvaluationPolicy::Fail)]
     on_eval_error: RawEvaluationPolicy,
@@ -235,7 +235,12 @@ impl RawCli {
             explicit_end
         };
 
-        let invalid_json = match self.on_invalid_json {
+        let json_requirement = match self.on_invalid_json {
+            None => JsonRequirement::AsNeeded,
+            Some(RawInvalidJsonPolicy::Pass) => JsonRequirement::PreserveInvalid,
+            Some(_) => JsonRequirement::Validate,
+        };
+        let invalid_json = match self.on_invalid_json.unwrap_or(RawInvalidJsonPolicy::Fail) {
             RawInvalidJsonPolicy::Fail => InvalidJsonPolicy::Fail,
             RawInvalidJsonPolicy::Drop => InvalidJsonPolicy::Drop,
             RawInvalidJsonPolicy::Tombstone => InvalidJsonPolicy::Tombstone,
@@ -250,7 +255,7 @@ impl RawCli {
             &self.drop_if,
             &self.tombstone_if,
             self.project.as_deref(),
-            invalid_json == InvalidJsonPolicy::Pass,
+            json_requirement,
         )?;
         let output = if self.json_envelope {
             OutputPlan::Envelope
@@ -387,7 +392,7 @@ fn parse_property(value: &str) -> Result<(&str, &str), String> {
     if key.trim().is_empty() {
         return Err("property key must not be empty".to_owned());
     }
-    Ok((key.trim(), value.trim()))
+    Ok((key.trim(), value))
 }
 
 fn parse_config_file(path: &PathBuf) -> Result<BTreeMap<String, String>, String> {
@@ -405,7 +410,7 @@ fn parse_config(source: &str) -> Result<BTreeMap<String, String>, String> {
         }
         let (key, value) =
             parse_property(line).map_err(|error| format!("line {}: {error}", index + 1))?;
-        properties.insert(key.to_owned(), value.to_owned());
+        properties.insert(key.to_owned(), value.trim().to_owned());
     }
     Ok(properties)
 }
@@ -530,12 +535,37 @@ mod tests {
             "a=1",
             "-X",
             "a=2",
+            "-X",
+            "secret= padded ",
             "-b",
             "new",
         ])
         .unwrap();
         assert_eq!(config.kafka_properties["bootstrap.servers"], "new");
         assert_eq!(config.kafka_properties["a"], "2");
+        assert_eq!(config.kafka_properties["secret"], " padded ");
+    }
+
+    #[test]
+    fn explicit_invalid_json_policy_forces_validation_on_the_identity_path() {
+        let default = resolve(&["jkq", "-b", "x", "-t", "t", "-p", "0"]).unwrap();
+        assert!(!default.transform.capabilities.parses_json);
+
+        for policy in ["fail", "drop", "tombstone", "pass"] {
+            let explicit = resolve(&[
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                "-p",
+                "0",
+                "--on-invalid-json",
+                policy,
+            ])
+            .unwrap();
+            assert!(explicit.transform.capabilities.parses_json, "{policy}");
+        }
     }
 
     #[test]
