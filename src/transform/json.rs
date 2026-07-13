@@ -1,6 +1,6 @@
-use std::{cmp::Ordering, fmt};
+use std::{cmp::Ordering, fmt, io::Write};
 
-use simd_json::{Node, Tape, ValueType, prelude::*, tape::Value as TapeValue};
+use simd_json::{Buffers, Node, Tape, ValueType, prelude::*, tape::Value as TapeValue};
 
 use super::{
     compile::{CompiledExpr, CompiledKind, Function, TransformPlan},
@@ -8,6 +8,7 @@ use super::{
 };
 
 const MAX_JSON_DEPTH: usize = 128;
+const MAX_RETAINED_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidJsonPolicy {
@@ -90,69 +91,126 @@ pub fn execute(
     execute_report(plan, payload, policies).map(|execution| execution.action)
 }
 
+#[cfg(test)]
 pub fn execute_report(
     plan: &TransformPlan,
     payload: Option<Vec<u8>>,
     policies: ErrorPolicies,
 ) -> Result<Execution, TransformError> {
-    let Some(payload) = payload else {
-        return Ok(Execution {
-            action: Action::Tombstone,
-            issue: None,
-        });
-    };
-    if !plan.capabilities.parses_json {
-        return Ok(Execution {
-            action: Action::PassThrough(payload),
-            issue: None,
-        });
-    }
+    Backend::default().execute_report(plan, payload, policies)
+}
 
-    let (mut parse_buffer, original) = if plan.capabilities.requires_original_bytes {
-        (payload.clone(), Some(payload))
-    } else {
-        (payload, None)
-    };
-    let document = match simd_json::to_tape(&mut parse_buffer) {
-        Ok(document) => document,
-        Err(error) => {
-            return invalid_json(
+pub(crate) struct Backend {
+    buffers: Buffers,
+    // Resetting clears borrowed nodes before the tape is stored for the next input lifetime.
+    tape: Option<Tape<'static>>,
+    parse_buffer: Vec<u8>,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self {
+            buffers: Buffers::default(),
+            tape: Some(Tape::null()),
+            parse_buffer: Vec::new(),
+        }
+    }
+}
+
+impl Backend {
+    pub fn execute_report(
+        &mut self,
+        plan: &TransformPlan,
+        payload: Option<Vec<u8>>,
+        policies: ErrorPolicies,
+    ) -> Result<Execution, TransformError> {
+        let Some(payload) = payload else {
+            return Ok(Execution {
+                action: Action::Tombstone,
+                issue: None,
+            });
+        };
+        if !plan.capabilities.parses_json {
+            return Ok(Execution {
+                action: Action::PassThrough(payload),
+                issue: None,
+            });
+        }
+
+        let (mut parse_buffer, original) = if plan.capabilities.requires_original_bytes {
+            let mut parse_buffer = std::mem::take(&mut self.parse_buffer);
+            parse_buffer.clear();
+            parse_buffer.extend_from_slice(&payload);
+            (parse_buffer, Some(payload))
+        } else {
+            (payload, None)
+        };
+        let input_bytes = parse_buffer.len();
+        let mut tape = self.tape.take().unwrap_or_else(Tape::null).reset();
+        let result = match simd_json::fill_tape(&mut parse_buffer, &mut self.buffers, &mut tape) {
+            Ok(()) => self.evaluate_tape(plan, &tape, original, policies),
+            Err(error) => invalid_json(
                 policies.invalid_json,
                 original,
                 format!("{:?} at byte {}", error.error(), error.index()),
-            );
+            ),
+        };
+        let tape_bytes = tape
+            .0
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Node<'_>>());
+        if input_bytes <= MAX_RETAINED_BUFFER_BYTES && tape_bytes <= MAX_RETAINED_BUFFER_BYTES {
+            self.tape = Some(tape.reset());
+            if plan.capabilities.requires_original_bytes
+                && parse_buffer.capacity() <= MAX_RETAINED_BUFFER_BYTES
+            {
+                self.parse_buffer = parse_buffer;
+            }
+        } else {
+            self.buffers = Buffers::default();
+            self.tape = Some(Tape::null());
         }
-    };
-    if let Err(error) = validate_depth(&document) {
-        return invalid_json(policies.invalid_json, original, error);
+        result
     }
-    let action = match evaluate(plan, document.as_value()) {
-        Ok(EvaluatedAction::Drop) => Action::Drop,
-        Ok(EvaluatedAction::Tombstone) => Action::Tombstone,
-        Ok(EvaluatedAction::PassThrough) => {
-            Action::PassThrough(original.expect("pass-through plan requires original bytes"))
+
+    fn evaluate_tape(
+        &self,
+        plan: &TransformPlan,
+        tape: &Tape<'_>,
+        original: Option<Vec<u8>>,
+        policies: ErrorPolicies,
+    ) -> Result<Execution, TransformError> {
+        if let Err(error) = validate_depth(tape) {
+            return invalid_json(policies.invalid_json, original, error);
         }
-        Ok(EvaluatedAction::Project(bytes)) => Action::Project(bytes),
-        Err(error) => match policies.evaluation {
-            EvaluationPolicy::Fail => return Err(error),
-            EvaluationPolicy::Drop => {
-                return Ok(Execution {
-                    action: Action::Drop,
-                    issue: Some(ExecutionIssue::Evaluation),
-                });
+        let action = match evaluate(plan, tape.as_value()) {
+            Ok(EvaluatedAction::Drop) => Action::Drop,
+            Ok(EvaluatedAction::Tombstone) => Action::Tombstone,
+            Ok(EvaluatedAction::PassThrough) => {
+                Action::PassThrough(original.expect("pass-through plan requires original bytes"))
             }
-            EvaluationPolicy::Tombstone => {
-                return Ok(Execution {
-                    action: Action::Tombstone,
-                    issue: Some(ExecutionIssue::Evaluation),
-                });
-            }
-        },
-    };
-    Ok(Execution {
-        action,
-        issue: None,
-    })
+            Ok(EvaluatedAction::Project(bytes)) => Action::Project(bytes),
+            Err(error) => match policies.evaluation {
+                EvaluationPolicy::Fail => return Err(error),
+                EvaluationPolicy::Drop => {
+                    return Ok(Execution {
+                        action: Action::Drop,
+                        issue: Some(ExecutionIssue::Evaluation),
+                    });
+                }
+                EvaluationPolicy::Tombstone => {
+                    return Ok(Execution {
+                        action: Action::Tombstone,
+                        issue: Some(ExecutionIssue::Evaluation),
+                    });
+                }
+            },
+        };
+        Ok(Execution {
+            action,
+            issue: None,
+        })
+    }
 }
 
 fn invalid_json(
@@ -178,26 +236,26 @@ fn invalid_json(
 }
 
 fn validate_depth(tape: &Tape<'_>) -> Result<(), String> {
-    let mut ends = Vec::new();
+    let mut ends = [0; MAX_JSON_DEPTH];
+    let mut depth = 0;
     for (index, node) in tape.0.iter().enumerate() {
-        while ends.last().is_some_and(|end| *end <= index) {
-            ends.pop();
+        while depth > 0 && ends[depth - 1] <= index {
+            depth -= 1;
         }
         let count = match node {
             Node::Array { count, .. } | Node::Object { count, .. } => *count,
             _ => continue,
         };
-        if ends.len() == MAX_JSON_DEPTH {
+        if depth == MAX_JSON_DEPTH {
             return Err(format!(
                 "JSON nesting exceeds the maximum depth of {MAX_JSON_DEPTH}"
             ));
         }
-        ends.push(
-            index
-                .checked_add(count)
-                .and_then(|end| end.checked_add(1))
-                .ok_or_else(|| "JSON nesting range overflowed usize".to_owned())?,
-        );
+        ends[depth] = index
+            .checked_add(count)
+            .and_then(|end| end.checked_add(1))
+            .ok_or_else(|| "JSON nesting range overflowed usize".to_owned())?;
+        depth += 1;
     }
     Ok(())
 }
@@ -209,9 +267,9 @@ enum EvaluatedAction {
     Project(Vec<u8>),
 }
 
-fn evaluate(
-    plan: &TransformPlan,
-    document: TapeValue<'_, '_>,
+fn evaluate<'a>(
+    plan: &'a TransformPlan,
+    document: TapeValue<'a, 'a>,
 ) -> Result<EvaluatedAction, TransformError> {
     let slots = plan
         .paths
@@ -279,14 +337,14 @@ enum Value<'a> {
     I64(i64),
     U64(u64),
     F64(f64),
-    String(String),
+    String(&'a str),
     Array(Vec<Value<'a>>),
-    Object(Vec<(String, Value<'a>)>),
+    Object(Vec<(&'a str, Value<'a>)>),
     Source(TapeValue<'a, 'a>),
 }
 
 fn eval<'a>(
-    expression: &CompiledExpr,
+    expression: &'a CompiledExpr,
     slots: &[Option<TapeValue<'a, 'a>>],
 ) -> Result<Value<'a>, TransformError> {
     match &expression.kind {
@@ -296,7 +354,7 @@ fn eval<'a>(
             Literal::I64(value) => Value::I64(*value),
             Literal::U64(value) => Value::U64(*value),
             Literal::F64(value) => Value::F64(*value),
-            Literal::String(value) => Value::String(value.clone()),
+            Literal::String(value) => Value::String(value),
         }),
         CompiledKind::Slot(slot) => Ok(slots[*slot].map_or(Value::Missing, source_value)),
         CompiledKind::Array(values) => {
@@ -323,7 +381,7 @@ fn eval<'a>(
                         format!("object field {key:?} produced a missing value"),
                     ));
                 }
-                object.push((key.clone(), evaluated));
+                object.push((key.as_str(), evaluated));
             }
             Ok(Value::Object(object))
         }
@@ -366,7 +424,7 @@ fn eval<'a>(
 
 fn call<'a>(
     function: Function,
-    arguments: &[CompiledExpr],
+    arguments: &'a [CompiledExpr],
     slots: &[Option<TapeValue<'a, 'a>>],
     span: Span,
 ) -> Result<Value<'a>, TransformError> {
@@ -644,13 +702,13 @@ fn write_json(value: &Value<'_>, output: &mut Vec<u8>, span: Span) -> Result<(),
         Value::Missing => return Err(evaluation_error(span, "cannot serialize missing value")),
         Value::Null => output.extend_from_slice(b"null"),
         Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
-        Value::I64(value) => output.extend_from_slice(value.to_string().as_bytes()),
-        Value::U64(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        Value::I64(value) => write!(output, "{value}").expect("writing to a vector cannot fail"),
+        Value::U64(value) => write!(output, "{value}").expect("writing to a vector cannot fail"),
         Value::F64(value) => {
             if !value.is_finite() {
                 return Err(evaluation_error(span, "cannot serialize non-finite number"));
             }
-            output.extend_from_slice(format!("{value:?}").as_bytes());
+            write!(output, "{value:?}").expect("writing to a vector cannot fail");
         }
         Value::String(value) => write_string(value, output),
         Value::Array(values) => {
@@ -694,7 +752,11 @@ pub(crate) fn write_string(value: &str, output: &mut Vec<u8>) {
             '\r' => output.extend_from_slice(b"\\r"),
             '\t' => output.extend_from_slice(b"\\t"),
             value if value < '\u{20}' => {
-                output.extend_from_slice(format!("\\u{:04x}", value as u32).as_bytes());
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let value = value as usize;
+                output.extend_from_slice(b"\\u00");
+                output.push(HEX[(value >> 4) & 15]);
+                output.push(HEX[value & 15]);
             }
             value => {
                 let mut bytes = [0; 4];
@@ -873,6 +935,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(action, Action::PassThrough(input));
+    }
+
+    #[test]
+    fn worker_backend_reuses_normal_scratch_and_discards_oversized_scratch() {
+        let pass = build_plan(&["false".to_owned()], &[], None, false).unwrap();
+        let mut backend = Backend::default();
+        for input in [br#"{"value":"first"}"#.as_slice(), br#"{"value":2}"#] {
+            let execution = backend
+                .execute_report(&pass, Some(input.to_vec()), FAIL)
+                .unwrap();
+            assert_eq!(execution.action, Action::PassThrough(input.to_vec()));
+        }
+        assert!(backend.parse_buffer.capacity() >= br#"{"value":"first"}"#.len());
+        assert!(backend.tape.as_ref().unwrap().0.capacity() > 1);
+
+        let drop = build_plan(&["true".to_owned()], &[], None, false).unwrap();
+        let mut oversized = vec![b' '; MAX_RETAINED_BUFFER_BYTES + 1];
+        oversized.extend_from_slice(b"null");
+        assert_eq!(
+            backend
+                .execute_report(&drop, Some(oversized), FAIL)
+                .unwrap()
+                .action,
+            Action::Drop
+        );
+        assert_eq!(backend.parse_buffer.capacity(), 0);
+        assert_eq!(backend.tape.as_ref().unwrap().0.len(), 1);
     }
 
     #[test]
