@@ -1,5 +1,7 @@
 use std::fmt;
 
+const MAX_EXPRESSION_DEPTH: usize = 128;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Span {
     pub start: usize,
@@ -10,6 +12,7 @@ pub struct Span {
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
+    parenthesized: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,7 +98,11 @@ impl fmt::Display for ParseError {
             .find('\n')
             .map_or(self.source.len(), |index| self.span.start + index);
         let line = &self.source[line_start..line_end];
-        let caret = " ".repeat(self.span.start.saturating_sub(line_start));
+        let caret = " ".repeat(
+            self.source[line_start..self.span.start.min(self.source.len())]
+                .chars()
+                .count(),
+        );
         write!(
             f,
             "{} expression at byte {}: {}\n{}\n{}^",
@@ -149,11 +156,45 @@ pub fn parse(source: &str, category: &'static str) -> Result<Expr, ParseError> {
         tokens,
         cursor: 0,
     };
-    let expression = parser.parse_bp(0)?;
+    let expression = parser.parse_bp(0, 1)?;
     if !matches!(parser.current().kind, TokenKind::End) {
         return Err(parser.error_current("expected end of expression"));
     }
+    validate_depth(&expression, source, category)?;
     Ok(expression)
+}
+
+fn validate_depth(
+    expression: &Expr,
+    source: &str,
+    category: &'static str,
+) -> Result<(), ParseError> {
+    let mut pending = vec![(expression, 1_usize)];
+    while let Some((expression, depth)) = pending.pop() {
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(ParseError::new(
+                category,
+                expression.span,
+                format!("expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"),
+                source,
+            ));
+        }
+        match &expression.kind {
+            ExprKind::Array(values) | ExprKind::Call(_, values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            ExprKind::Object(fields) => {
+                pending.extend(fields.iter().map(|field| (&field.value, depth + 1)));
+            }
+            ExprKind::Unary(value) => pending.push((value, depth + 1)),
+            ExprKind::Binary(left, _, right) => {
+                pending.push((left, depth + 1));
+                pending.push((right, depth + 1));
+            }
+            ExprKind::Literal(_) | ExprKind::Path(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn lex(source: &str, category: &'static str) -> Result<Vec<Token>, ParseError> {
@@ -507,31 +548,38 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
-    fn parse_bp(&mut self, minimum: u8) -> Result<Expr, ParseError> {
+    fn parse_bp(&mut self, minimum: u8, depth: usize) -> Result<Expr, ParseError> {
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(self.error_current(&format!(
+                "expression nesting exceeds {MAX_EXPRESSION_DEPTH} levels"
+            )));
+        }
         let mut left = if matches!(self.current().kind, TokenKind::Not) {
             let start = self.take().span.start;
-            let expression = self.parse_bp(7)?;
+            let expression = self.parse_bp(7, depth + 1)?;
             Expr {
                 span: Span {
                     start,
                     end: expression.span.end,
                 },
                 kind: ExprKind::Unary(Box::new(expression)),
+                parenthesized: false,
             }
         } else {
-            self.parse_primary()?
+            self.parse_primary(depth)?
         };
         while let Some((operator, left_bp, right_bp)) = self.binary_operator() {
             if left_bp < minimum {
                 break;
             }
             if operator.is_comparison()
+                && !left.parenthesized
                 && matches!(left.kind, ExprKind::Binary(_, previous, _) if previous.is_comparison())
             {
                 return Err(self.error_current("chained comparisons are not supported"));
             }
             self.take();
-            let right = self.parse_bp(right_bp)?;
+            let right = self.parse_bp(right_bp, depth + 1)?;
             let span = Span {
                 start: left.span.start,
                 end: right.span.end,
@@ -539,12 +587,13 @@ impl Parser<'_> {
             left = Expr {
                 kind: ExprKind::Binary(Box::new(left), operator, Box::new(right)),
                 span,
+                parenthesized: false,
             };
         }
         Ok(left)
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+    fn parse_primary(&mut self, depth: usize) -> Result<Expr, ParseError> {
         let token = self.take();
         match token.kind {
             TokenKind::True => self.literal(token.span, Literal::Bool(true)),
@@ -553,23 +602,22 @@ impl Parser<'_> {
             TokenKind::String(value) => self.literal(token.span, Literal::String(value)),
             TokenKind::Number(value) => self.number(token.span, &value),
             TokenKind::Dot => self.path(token.span.start),
-            TokenKind::Identifier(name) => self.call(token.span.start, name),
+            TokenKind::Identifier(name) => self.call(token.span.start, name, depth),
             TokenKind::LeftParen => {
-                let expression = self.parse_bp(0)?;
+                let mut expression = self.parse_bp(0, depth + 1)?;
                 let end = self
                     .expect(TokenKind::RightParen, "expected ')' after expression")?
                     .span
                     .end;
-                Ok(Expr {
-                    span: Span {
-                        start: token.span.start,
-                        end,
-                    },
-                    ..expression
-                })
+                expression.span = Span {
+                    start: token.span.start,
+                    end,
+                };
+                expression.parenthesized = true;
+                Ok(expression)
             }
-            TokenKind::LeftBracket => self.array(token.span.start),
-            TokenKind::LeftBrace => self.object(token.span.start),
+            TokenKind::LeftBracket => self.array(token.span.start, depth),
+            TokenKind::LeftBrace => self.object(token.span.start, depth),
             _ => Err(ParseError::new(
                 self.category,
                 token.span,
@@ -583,6 +631,7 @@ impl Parser<'_> {
         Ok(Expr {
             kind: ExprKind::Literal(literal),
             span,
+            parenthesized: false,
         })
     }
 
@@ -639,6 +688,7 @@ impl Parser<'_> {
         Ok(Expr {
             kind: ExprKind::Path(Path(segments)),
             span: Span { start, end },
+            parenthesized: false,
         })
     }
 
@@ -661,12 +711,12 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn call(&mut self, start: usize, name: String) -> Result<Expr, ParseError> {
+    fn call(&mut self, start: usize, name: String, depth: usize) -> Result<Expr, ParseError> {
         self.expect(TokenKind::LeftParen, "expected '(' after function name")?;
         let mut arguments = Vec::new();
         if !matches!(self.current().kind, TokenKind::RightParen) {
             loop {
-                arguments.push(self.parse_bp(0)?);
+                arguments.push(self.parse_bp(0, depth + 1)?);
                 if !matches!(self.current().kind, TokenKind::Comma) {
                     break;
                 }
@@ -683,14 +733,15 @@ impl Parser<'_> {
         Ok(Expr {
             kind: ExprKind::Call(name, arguments),
             span: Span { start, end },
+            parenthesized: false,
         })
     }
 
-    fn array(&mut self, start: usize) -> Result<Expr, ParseError> {
+    fn array(&mut self, start: usize, depth: usize) -> Result<Expr, ParseError> {
         let mut values = Vec::new();
         if !matches!(self.current().kind, TokenKind::RightBracket) {
             loop {
-                values.push(self.parse_bp(0)?);
+                values.push(self.parse_bp(0, depth + 1)?);
                 if !matches!(self.current().kind, TokenKind::Comma) {
                     break;
                 }
@@ -704,10 +755,11 @@ impl Parser<'_> {
         Ok(Expr {
             kind: ExprKind::Array(values),
             span: Span { start, end },
+            parenthesized: false,
         })
     }
 
-    fn object(&mut self, start: usize) -> Result<Expr, ParseError> {
+    fn object(&mut self, start: usize, depth: usize) -> Result<Expr, ParseError> {
         let mut fields = Vec::new();
         if !matches!(self.current().kind, TokenKind::RightBrace) {
             loop {
@@ -717,7 +769,7 @@ impl Parser<'_> {
                     _ => return Err(self.error_previous("expected object key")),
                 };
                 self.expect(TokenKind::Colon, "expected ':' after object key")?;
-                let value = self.parse_bp(0)?;
+                let value = self.parse_bp(0, depth + 1)?;
                 fields.push(ObjectField {
                     key: name,
                     value,
@@ -736,6 +788,7 @@ impl Parser<'_> {
         Ok(Expr {
             kind: ExprKind::Object(fields),
             span: Span { start, end },
+            parenthesized: false,
         })
     }
 
@@ -820,5 +873,30 @@ mod tests {
             let error = parse(source, "predicate").unwrap_err();
             assert!(error.to_string().contains("byte"), "{source}: {error}");
         }
+    }
+
+    #[test]
+    fn expression_nesting_is_bounded_at_startup() {
+        let accepted = format!(
+            "{}true{}",
+            "(".repeat(MAX_EXPRESSION_DEPTH - 1),
+            ")".repeat(MAX_EXPRESSION_DEPTH - 1)
+        );
+        parse(&accepted, "predicate").unwrap();
+
+        let rejected = format!(
+            "{}true{}",
+            "(".repeat(MAX_EXPRESSION_DEPTH),
+            ")".repeat(MAX_EXPRESSION_DEPTH)
+        );
+        let error = parse(&rejected, "predicate").unwrap_err();
+        assert!(error.message.contains("exceeds 128 levels"));
+    }
+
+    #[test]
+    fn parenthesized_comparison_results_can_be_compared() {
+        parse("(true == true) == true", "predicate").unwrap();
+        parse("true == (true == true)", "predicate").unwrap();
+        assert!(parse("true == true == true", "predicate").is_err());
     }
 }

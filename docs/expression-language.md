@@ -40,7 +40,9 @@ From lowest to highest precedence:
 4. unary `not`
 5. primary expressions
 
-Comparisons cannot be chained. Use parentheses when precedence is not obvious.
+Comparisons cannot be chained. A comparison result may be compared when the
+nested comparison is explicitly parenthesized. Use parentheses when precedence
+is not obvious.
 
 Boolean operators require booleans and short-circuit. There is no truthiness:
 null, zero, empty strings, arrays, and objects are not booleans.
@@ -129,9 +131,10 @@ Parse errors include an expression category and byte position. Evaluation
 errors identify the failing expression and, while processing records, the
 topic, partition, and offset.
 
-JSON nested more than 128 arrays or objects is treated as invalid JSON. Source
-objects with duplicate keys follow simd-json's effective lookup behavior and
-are not separately diagnosed.
+Expressions nested more than 128 levels are rejected at startup. JSON nested
+more than 128 arrays or objects is treated as invalid JSON. Source objects with
+duplicate keys follow simd-json's effective lookup behavior and are not
+separately diagnosed.
 
 The language intentionally omits pipes, multiple results, assignments,
 reductions, sorting, grouping, joins, regular expressions, user functions,
