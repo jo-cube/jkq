@@ -81,9 +81,9 @@ releases accounting exactly once.
 ## JSON Execution
 
 The transform compiler parses expressions once, interns identical complete
-paths, and records whether original bytes must survive parsing. The backend
-uses simd-json's tape rather than an owned JSON tree and resolves only compiled
-paths.
+paths, rejects expression nesting beyond 128 levels, and records whether JSON
+validation and original bytes are required. The backend uses simd-json's tape
+rather than an owned JSON tree and resolves only compiled paths.
 
 Each worker owns its parser, tape, and scratch buffers, so evaluation needs no
 shared lock. Worker storage is reused across records and discarded after an
@@ -93,6 +93,8 @@ permanently growing every worker.
 When pass-through remains possible, the source payload stays unchanged and a
 worker-local copy is parsed. When every successful record is projected and no
 error policy needs the original, the owned payload can be parsed in place.
+An identity transform bypasses parsing unless `--on-invalid-json` is supplied
+explicitly.
 
 The backend validates container ranges iteratively and rejects nesting beyond
 128 levels through the invalid-JSON policy. Projection serialization is
@@ -150,8 +152,10 @@ and never extended. Completion means that the poller has stopped admitting the
 range and every admitted sequence has crossed its frontier.
 
 The first fatal error wins. It triggers shared cancellation, closes the work
-path, and drains or releases retained work where safe. Worker and writer panics
-are converted to pipeline failures rather than leaving another stage blocked.
+path, and drains retained work. The ordered writer emits preceding in-order
+records, emits nothing after the first fatal result, and releases accounting
+for every completion. Worker and writer panics are converted to pipeline
+failures rather than leaving another stage blocked.
 
 The first termination signal stops admission and drains. signal-hook arms the
 second signal for immediate process exit, which also handles a worker or stdout
