@@ -444,8 +444,9 @@ fn poll_loop(
         }
 
         if let Some(record) = pending.take() {
+            let partition = record.partition;
             if admission.can_reserve(record.partition, record.retained_bytes) {
-                if let Err(admit_error) = admit(
+                match admit(
                     record,
                     &mut admission,
                     dispatcher
@@ -453,9 +454,19 @@ fn poll_loop(
                         .expect("running poller has a dispatcher"),
                     &stats,
                 ) {
-                    runtime_failure(&first_failure, &shutdown, admit_error);
-                } else {
-                    admitted += 1;
+                    Err(admit_error) => {
+                        runtime_failure(&first_failure, &shutdown, admit_error);
+                    }
+                    Ok(sequence) => {
+                        admitted += 1;
+                        if config
+                            .count_per_partition
+                            .is_some_and(|limit| sequence + 1 >= limit)
+                            && let Err(error) = input.finish(partition)
+                        {
+                            runtime_failure(&first_failure, &shutdown, error);
+                        }
+                    }
                 }
             } else {
                 pending = Some(record);
@@ -479,8 +490,9 @@ fn poll_loop(
 
         match input.poll() {
             Ok(PollEvent::Record(record)) => {
+                let partition = record.partition;
                 if admission.can_reserve(record.partition, record.retained_bytes) {
-                    if let Err(admit_error) = admit(
+                    match admit(
                         record,
                         &mut admission,
                         dispatcher
@@ -488,9 +500,19 @@ fn poll_loop(
                             .expect("running poller has a dispatcher"),
                         &stats,
                     ) {
-                        runtime_failure(&first_failure, &shutdown, admit_error);
-                    } else {
-                        admitted += 1;
+                        Err(admit_error) => {
+                            runtime_failure(&first_failure, &shutdown, admit_error);
+                        }
+                        Ok(sequence) => {
+                            admitted += 1;
+                            if config
+                                .count_per_partition
+                                .is_some_and(|limit| sequence + 1 >= limit)
+                                && let Err(error) = input.finish(partition)
+                            {
+                                runtime_failure(&first_failure, &shutdown, error);
+                            }
+                        }
                     }
                 } else {
                     pending = Some(record);
@@ -547,7 +569,7 @@ fn admit(
     admission: &mut Admission,
     dispatcher: &Dispatcher,
     stats: &Stats,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let partition = record.partition;
     let retained_bytes = record.retained_bytes;
     let sequence = admission.reserve(partition, retained_bytes)?;
@@ -596,7 +618,7 @@ fn admit(
         })?;
         return Err(format!("cannot dispatch admitted record: {send_error}"));
     }
-    Ok(())
+    Ok(sequence)
 }
 
 fn worker_loop(

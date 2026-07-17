@@ -14,6 +14,9 @@ fn main() {
             std::process::exit(2);
         }
         Ok(config) => {
+            if config.check {
+                return;
+            }
             if let Err(error) = app::run(config) {
                 if error.is_broken_pipe() {
                     return;

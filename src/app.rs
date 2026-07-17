@@ -258,6 +258,40 @@ mod tests {
     }
 
     #[test]
+    fn per_partition_count_samples_every_selected_partition() {
+        let fixture = Fixture::new("count-per-partition", 2);
+        for partition in [0, 1] {
+            for value in 0..2 {
+                fixture.produce(
+                    partition,
+                    Some(value.to_string().as_bytes()),
+                    None,
+                    value,
+                    None,
+                );
+            }
+        }
+        let config = fixture.config(&[
+            "-p",
+            "0",
+            "-p",
+            "1",
+            "--count-per-partition",
+            "1",
+            "-f",
+            "%p:%o\\n",
+        ]);
+        let mut output = Vec::new();
+        run_with_writer(&config, &mut output).unwrap();
+        let mut lines = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        lines.sort_unstable();
+        assert_eq!(lines, [b"0:0".as_slice(), b"1:0".as_slice()]);
+    }
+
+    #[test]
     fn byte_backpressure_drains_oversized_records_one_at_a_time() {
         let fixture = Fixture::new("oversized-backpressure", 1);
         for value in [br#"{"value":0}"#, br#"{"value":1}"#, br#"{"value":2}"#] {

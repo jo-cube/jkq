@@ -259,7 +259,7 @@ impl KafkaInput {
         Ok(())
     }
 
-    fn finish(&mut self, partition: i32) -> Result<(), String> {
+    pub(crate) fn finish(&mut self, partition: i32) -> Result<(), String> {
         if let Some(state) = self.partitions.get_mut(&partition) {
             if !state.done {
                 self.remaining_partitions -= 1;

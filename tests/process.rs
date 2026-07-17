@@ -109,6 +109,33 @@ fn broken_pipe_is_quiet_success() {
 }
 
 #[test]
+fn check_validates_locally_without_connecting() {
+    let child = Command::new(env!("CARGO_BIN_EXE_jkq"))
+        .args([
+            "-b",
+            "unreachable.invalid:9092",
+            "-t",
+            "events",
+            "-p",
+            "0-2",
+            "--drop-if",
+            "not is_object(.)",
+            "-f",
+            "%a:%s\\n",
+            "--check",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let output = wait(child);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn first_termination_signal_drains_and_uses_signal_exit_code() {
     let fixture = Fixture::new("signal-drain");
     let child = fixture

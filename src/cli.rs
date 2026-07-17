@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, fs, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+    str::FromStr,
+    time::Duration,
+};
 
 use clap::{Parser, ValueEnum};
 
@@ -13,6 +19,7 @@ use crate::{
 const DEFAULT_MAX_INFLIGHT_RECORDS: usize = 1_024;
 const DEFAULT_MAX_INFLIGHT_BYTES: &str = "256MiB";
 const DEFAULT_MAX_INFLIGHT_PER_PARTITION: usize = 256;
+const MAX_SELECTED_PARTITIONS: usize = 100_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -26,9 +33,14 @@ pub struct RawCli {
     /// Kafka topic to consume
     #[arg(short = 't', long)]
     topic: String,
-    /// Partition to consume; repeat for multiple partitions
-    #[arg(short = 'p', long = "partition", required = true)]
-    partitions: Vec<i32>,
+    /// Partitions to consume, for example 0,2,4-7; repeatable
+    #[arg(
+        short = 'p',
+        long = "partition",
+        required = true,
+        allow_negative_numbers = true
+    )]
+    partitions: Vec<String>,
     /// Start position or s@/e@ timestamp boundary
     #[arg(short = 'o', long = "offset", allow_hyphen_values = true)]
     offsets: Vec<String>,
@@ -38,6 +50,9 @@ pub struct RawCli {
     /// Maximum admitted input records
     #[arg(short = 'c', long)]
     count: Option<u64>,
+    /// Maximum admitted input records per partition
+    #[arg(long, conflicts_with = "count")]
+    count_per_partition: Option<u64>,
     /// Exit after reaching the current end of every partition
     #[arg(short = 'e', long)]
     exit_at_end: bool,
@@ -101,6 +116,9 @@ pub struct RawCli {
     /// Librdkafka key=value property; repeatable
     #[arg(short = 'X', long = "property")]
     properties: Vec<String>,
+    /// Validate local configuration and exit without connecting
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -160,6 +178,7 @@ pub struct RuntimeConfig {
     pub start: StartPosition,
     pub end: Option<EndPosition>,
     pub count_limit: Option<u64>,
+    pub count_per_partition: Option<u64>,
     pub exit_at_end: bool,
     pub jobs: usize,
     pub unordered: bool,
@@ -173,6 +192,7 @@ pub struct RuntimeConfig {
     pub stats: bool,
     pub stats_interval: Option<Duration>,
     pub quiet: bool,
+    pub check: bool,
 }
 
 impl OutputPlan {
@@ -193,18 +213,12 @@ impl RawCli {
         if self.topic.is_empty() {
             return Err("topic must not be empty".to_owned());
         }
-        let mut unique = self.partitions.clone();
-        unique.sort_unstable();
-        if let Some(partition) = unique.iter().find(|partition| **partition < 0) {
-            return Err(format!(
-                "partition must be non-negative, received {partition}"
-            ));
-        }
-        if unique.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err("duplicate partition selection".to_owned());
-        }
+        let partitions = parse_partitions(&self.partitions)?;
         if self.count == Some(0) {
             return Err("count must be positive".to_owned());
+        }
+        if self.count_per_partition == Some(0) {
+            return Err("per-partition count must be positive".to_owned());
         }
         let jobs = self.jobs.unwrap_or_else(default_jobs);
         if jobs == 0 {
@@ -296,11 +310,12 @@ impl RawCli {
 
         Ok(RuntimeConfig {
             topic: self.topic,
-            partitions: self.partitions,
+            partitions,
             start,
             exit_at_end: self.exit_at_end || end.is_some(),
             end,
             count_limit: self.count,
+            count_per_partition: self.count_per_partition,
             jobs,
             unordered: self.unordered,
             limits: RuntimeLimits {
@@ -320,6 +335,7 @@ impl RawCli {
             stats: self.stats || self.stats_interval.is_some(),
             stats_interval: self.stats_interval,
             quiet: self.quiet,
+            check: self.check,
         })
     }
 }
@@ -330,6 +346,65 @@ fn default_jobs() -> usize {
         .unwrap_or(1)
         .saturating_sub(2)
         .max(1)
+}
+
+fn parse_partitions(values: &[String]) -> Result<Vec<i32>, String> {
+    let mut partitions = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        for selection in value.split(',').map(str::trim) {
+            if selection.is_empty() {
+                return Err("partition selection contains an empty entry".to_owned());
+            }
+            let (start, end) = if selection.starts_with('-') {
+                let partition = parse_partition(selection)?;
+                (partition, partition)
+            } else if let Some((start, end)) = selection.split_once('-') {
+                let start = parse_partition(start)?;
+                let end = parse_partition(end)?;
+                if start > end {
+                    return Err(format!(
+                        "partition range {selection:?} must be in ascending order"
+                    ));
+                }
+                (start, end)
+            } else {
+                let partition = parse_partition(selection)?;
+                (partition, partition)
+            };
+            let count = usize::try_from(i64::from(end) - i64::from(start) + 1)
+                .map_err(|_| "partition range is too large for this platform".to_owned())?;
+            if partitions
+                .len()
+                .checked_add(count)
+                .is_none_or(|total| total > MAX_SELECTED_PARTITIONS)
+            {
+                return Err(format!(
+                    "partition selection expands beyond the {MAX_SELECTED_PARTITIONS} partition limit"
+                ));
+            }
+            for partition in start..=end {
+                if !seen.insert(partition) {
+                    return Err(format!("duplicate partition selection {partition}"));
+                }
+                partitions.push(partition);
+            }
+        }
+    }
+    Ok(partitions)
+}
+
+fn parse_partition(value: &str) -> Result<i32, String> {
+    let partition = value
+        .parse::<i32>()
+        .map_err(|_| format!("partition {value:?} must be a non-negative integer"))?;
+    if partition < 0 {
+        Err(format!(
+            "partition must be non-negative, received {partition}"
+        ))
+    } else {
+        Ok(partition)
+    }
 }
 
 fn resolve_offsets(
@@ -487,11 +562,58 @@ mod tests {
     }
 
     #[test]
+    fn cli_expands_partition_lists_and_ranges() {
+        let config = resolve(&[
+            "jkq",
+            "-b",
+            "localhost",
+            "-t",
+            "events",
+            "-p",
+            "0,2,4-6",
+            "-p",
+            "8",
+        ])
+        .unwrap();
+        assert_eq!(config.partitions, [0, 2, 4, 5, 6, 8]);
+
+        for selection in ["2-1", "0,,1", "0-2,2", "0-100000"] {
+            let error =
+                resolve(&["jkq", "-b", "localhost", "-t", "events", "-p", selection]).unwrap_err();
+            assert!(error.contains("partition"), "{selection}: {error}");
+        }
+    }
+
+    #[test]
     fn cli_rejects_invalid_combinations_and_zero_limits() {
         for arguments in [
             vec!["jkq", "-b", "x", "-t", "t", "-p", "0", "-p", "0"],
             vec!["jkq", "-b", "x", "-t", "t", "-p", "-1"],
             vec!["jkq", "-b", "x", "-t", "t", "-p", "0", "-c", "0"],
+            vec![
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                "-p",
+                "0",
+                "--count-per-partition",
+                "0",
+            ],
+            vec![
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                "-p",
+                "0",
+                "-c",
+                "1",
+                "--count-per-partition",
+                "1",
+            ],
             vec![
                 "jkq",
                 "-b",
@@ -598,7 +720,9 @@ mod tests {
     #[test]
     fn help_describes_assignment_and_runtime_limits() {
         let help = RawCli::command().render_long_help().to_string();
-        assert!(help.contains("Partition to consume; repeat for multiple partitions"));
+        assert!(help.contains("Partitions to consume, for example 0,2,4-7"));
+        assert!(help.contains("Maximum admitted input records per partition"));
+        assert!(help.contains("Validate local configuration and exit without connecting"));
         assert!(help.contains("Retained-byte budget; supports KiB, MiB, and GiB"));
     }
 }
