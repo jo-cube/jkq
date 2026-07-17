@@ -669,7 +669,20 @@ impl Parser<'_> {
                 segments.push(PathSegment::Field(field));
             }
             TokenKind::LeftBracket => self.bracket_segment(&mut segments)?,
-            _ => return Err(self.error_current("expected path field after '.'")),
+            TokenKind::RightBracket
+            | TokenKind::RightBrace
+            | TokenKind::RightParen
+            | TokenKind::Comma
+            | TokenKind::Equal
+            | TokenKind::NotEqual
+            | TokenKind::Less
+            | TokenKind::LessEqual
+            | TokenKind::Greater
+            | TokenKind::GreaterEqual
+            | TokenKind::And
+            | TokenKind::Or
+            | TokenKind::End => {}
+            _ => return Err(self.error_current("expected path field or end of root expression")),
         }
         loop {
             match self.current().kind.clone() {
@@ -846,6 +859,7 @@ mod tests {
     fn lexer_and_parser_accept_documented_primitives() {
         for source in [
             ".id",
+            ".",
             ".items[0][\"a.b\"]",
             "-12",
             "12.5e2",
@@ -869,7 +883,7 @@ mod tests {
 
     #[test]
     fn malformed_syntax_reports_position() {
-        for source in ["\"unterminated", "1 < 2 < 3", ".[-1]", "{a .x}"] {
+        for source in ["\"unterminated", "1 < 2 < 3", ".[-1]", "..field", "{a .x}"] {
             let error = parse(source, "predicate").unwrap_err();
             assert!(error.to_string().contains("byte"), "{source}: {error}");
         }

@@ -9,6 +9,7 @@ one value or one error; it never produces a stream of values.
 Paths start at the input root:
 
 ```text
+.
 .id
 .customer.id
 .items[0].sku
@@ -16,9 +17,9 @@ Paths start at the input root:
 .["a.b"]
 ```
 
-Dot fields use identifiers. Bracket fields use JSON strings. Array indices are
-non-negative integers. There are no wildcards, slices, implicit iteration, or
-recursive descent.
+`.` selects the complete input document. Dot fields use identifiers. Bracket
+fields use JSON strings. Array indices are non-negative integers. There are no
+wildcards, slices, implicit iteration, or recursive descent.
 
 Supported literals are JSON null, booleans, strings, and practical signed,
 unsigned, and floating-point numbers:

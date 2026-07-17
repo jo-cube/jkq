@@ -857,6 +857,15 @@ mod tests {
     }
 
     #[test]
+    fn root_expression_projects_the_complete_document() {
+        assert_eq!(
+            run(&[], &[], Some("."), Some(b" { \"value\" : [1, 2] } ")).unwrap(),
+            Action::Project(br#"{"value":[1,2]}"#.to_vec())
+        );
+        assert_eq!(run(&["."], &[], None, Some(b"true")).unwrap(), Action::Drop);
+    }
+
+    #[test]
     fn boolean_operators_short_circuit_errors() {
         assert_eq!(
             run(&["true or length(true) == 1"], &[], None, Some(b"{}")).unwrap(),
