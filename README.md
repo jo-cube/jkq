@@ -54,10 +54,10 @@ amd64, Linux arm64, and macOS arm64. There is no installer.
 
 ## Quick Use
 
-Consume a fixed snapshot of two partitions:
+Consume a fixed snapshot of two explicitly selected partitions:
 
 ```sh
-jkq -b localhost:9092 -t events -p 0 -p 1 --snapshot
+jkq -b localhost:9092 -t events -p 0-1 --snapshot
 ```
 
 Turn logical deletions into Kafka tombstones while preserving the key:

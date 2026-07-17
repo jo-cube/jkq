@@ -50,6 +50,7 @@ Before polling, `jkq`:
 7. installs the bounded pipeline.
 
 A startup failure cannot produce partial record output.
+`--check` exits after compiling the local plans and does not create a consumer.
 
 The Kafka adapter calls `assign`, never `subscribe`. Automatic commits and
 offset storage are disabled. The poller is the only thread that calls the
@@ -151,6 +152,10 @@ Fixed ranges use exclusive end offsets. Snapshot boundaries are captured once
 and never extended. Completion means that the poller has stopped admitting the
 range and every admitted sequence has crossed its frontier.
 
+Global counts stop all admission after the configured number of input records.
+Per-partition counts mark each partition complete independently after its limit;
+already admitted records still cross the normal completion frontier.
+
 The first fatal error wins. It triggers shared cancellation, closes the work
 path, and drains retained work. The ordered writer emits preceding in-order
 records, emits nothing after the first fatal result, and releases accounting
@@ -170,6 +175,7 @@ that cannot make progress.
 - Pass-through preserves exact source payload bytes.
 - Ordering is per partition, never global.
 - Count limits apply to admitted input, not emitted output.
+- Per-partition count limits apply independently to each selected partition.
 - Tombstones, empty payloads, and JSON `null` remain distinct.
 - Queues, admitted records, and retained bytes are bounded.
 - stdout is record data; diagnostics and statistics use stderr.

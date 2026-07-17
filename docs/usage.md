@@ -1,20 +1,28 @@
 # Usage
 
-`jkq` has one mode: consume one Kafka topic through direct partition
-assignment, transform JSON values, and write record data to stdout. Run
-`jkq --help` for the complete option list.
+`jkq` consumes one Kafka topic through direct partition assignment, transforms
+JSON values, and writes record data to stdout. Run `jkq --help` for the complete
+option list.
+
+`--check` validates the complete local invocation and exits without creating a
+Kafka consumer. It checks required arguments, option combinations, partition
+selection, config-file syntax, expressions, and output formats. It does not
+test broker reachability or ask librdkafka to validate property values.
 
 ## Assignment and Ranges
 
 A broker list, topic, and at least one partition are required:
 
 ```sh
-jkq -b localhost:9092 -t events -p 0 -p 1
+jkq -b localhost:9092 -t events -p 0,2,4-7 -p 9
 ```
 
-`-p` is repeatable. Duplicate and negative partitions are rejected. `jkq`
-does not join a consumer group or commit offsets; a configured `group.id` is
-only passed to librdkafka.
+`-p` accepts comma-separated partitions and inclusive ascending ranges, and is
+repeatable. Selection order is preserved but does not create a cross-partition
+output order. Duplicate, descending, negative, and empty selections are
+rejected. A selection may expand to at most 100,000 partitions. `jkq` does not
+join a consumer group or commit offsets; a configured `group.id` is only passed
+to librdkafka.
 
 The default start is `beginning`. `-o, --offset` accepts:
 
@@ -36,6 +44,9 @@ Termination controls:
 
 - `-c, --count <n>` stops after admitting `n` input records across all
   partitions. Tombstones and records later dropped still count.
+- `--count-per-partition <n>` stops each partition after admitting `n` input
+  records from that partition. It cannot be combined with `--count`; tombstones
+  and records later dropped still count.
 - `-e, --exit-at-end` exits after all partitions reach their current ends and
   admitted work drains.
 - `--snapshot` captures each startup high watermark as a fixed exclusive end.
@@ -87,6 +98,7 @@ The default format is `%s\n`. `-f, --format` accepts these placeholders:
 | `%p` | source partition |
 | `%T` | source timestamp in milliseconds, or `-1` |
 | `%h` | source headers |
+| `%a` | emitted action: `tombstone`, `pass`, or `project` |
 | `%%` | literal `%` |
 
 Format literals support `\n`, `\r`, `\t`, `\\`, and `\xNN`. Unsupported or
