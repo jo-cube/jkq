@@ -16,6 +16,7 @@ enum FormatToken {
     Partition,
     Timestamp,
     Headers,
+    Action,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,6 +58,16 @@ pub enum EmittedAction {
     Tombstone,
     PassThrough,
     Project,
+}
+
+impl EmittedAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tombstone => "tombstone",
+            Self::PassThrough => "pass",
+            Self::Project => "project",
+        }
+    }
 }
 
 pub struct OutputRecord<'a> {
@@ -107,6 +118,7 @@ impl CompiledFormat {
                         b'p' => FormatToken::Partition,
                         b'T' => FormatToken::Timestamp,
                         b'h' => FormatToken::Headers,
+                        b'a' => FormatToken::Action,
                         b'%' => FormatToken::Literal(vec![b'%']),
                         value => {
                             return Err(FormatError(format!(
@@ -228,6 +240,9 @@ impl CompiledFormat {
                         }
                     }
                 }
+                FormatToken::Action => {
+                    write_bytes(output, record.action.as_str().as_bytes(), &mut written)?
+                }
             }
         }
         Ok(written)
@@ -343,15 +358,7 @@ pub fn write_envelope(record: &OutputRecord<'_>, output: &mut impl Write) -> io:
         write_bytes(output, b"}", &mut written)?;
     }
     write_bytes(output, b"],\"action\":", &mut written)?;
-    write_json_string(
-        output,
-        match record.action {
-            EmittedAction::Tombstone => "tombstone",
-            EmittedAction::PassThrough => "pass",
-            EmittedAction::Project => "project",
-        },
-        &mut written,
-    )?;
+    write_json_string(output, record.action.as_str(), &mut written)?;
     match record.payload {
         Payload::Tombstone => write_bytes_fields(output, "payload", None, &mut written)?,
         Payload::Bytes(bytes) => write_bytes_fields(output, "payload", Some(bytes), &mut written)?,
@@ -533,12 +540,12 @@ mod tests {
             ..record(Some(b"k"), Payload::Bytes(b"v"))
         };
         let format =
-            CompiledFormat::compile("%t\\t%p\\t%o\\t%T\\t%K%k\\t%S%s\\t%h%%\\x0a").unwrap();
+            CompiledFormat::compile("%a\\t%t\\t%p\\t%o\\t%T\\t%K%k\\t%S%s\\t%h%%\\x0a").unwrap();
         let mut output = Vec::new();
         let written = format.write_to(&record, &mut output).unwrap();
         assert_eq!(
             output,
-            b"events\t3\t42\t7\t1k\t1v\tnull=NULL,empty=,raw=x%\n"
+            b"pass\tevents\t3\t42\t7\t1k\t1v\tnull=NULL,empty=,raw=x%\n"
         );
         assert_eq!(written, output.len());
     }
