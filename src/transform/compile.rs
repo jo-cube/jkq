@@ -1,6 +1,6 @@
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, sync::Arc};
 
-use super::syntax::{self, BinaryOp, Expr, ExprKind, Literal, Path, Span};
+use super::syntax::{self, BinaryOp, Expr, ExprKind, Literal, Path, PathSegment, Span};
 
 #[derive(Clone, Debug)]
 pub struct TransformPlan {
@@ -87,6 +87,7 @@ pub struct CompiledExpr {
 pub enum CompiledKind {
     Literal(Literal),
     Slot(usize),
+    Variable { root: Arc<Constant>, path: Path },
     Array(Vec<CompiledExpr>),
     Object(Vec<(String, CompiledExpr)>),
     Not(Box<CompiledExpr>),
@@ -109,6 +110,53 @@ pub enum Function {
     EndsWith,
     Length,
     Coalesce,
+    If,
+    In,
+}
+
+#[derive(Clone, Debug)]
+pub enum Constant {
+    Literal(Literal),
+    Array(Vec<Constant>),
+    Object(Vec<(String, Constant)>),
+}
+
+impl Constant {
+    pub(crate) fn at(&self, path: &Path) -> Option<&Self> {
+        path.0
+            .iter()
+            .try_fold(self, |value, segment| match (value, segment) {
+                (Self::Object(fields), PathSegment::Field(name)) => fields
+                    .iter()
+                    .find_map(|(key, value)| (key == name).then_some(value)),
+                (Self::Array(values), PathSegment::Index(index)) => values.get(*index),
+                _ => None,
+            })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Arity {
+    Exactly(usize),
+    AtLeast(usize),
+}
+
+impl Arity {
+    fn accepts(self, count: usize) -> bool {
+        match self {
+            Self::Exactly(expected) => count == expected,
+            Self::AtLeast(minimum) => count >= minimum,
+        }
+    }
+
+    fn description(self) -> String {
+        match self {
+            Self::Exactly(count) => {
+                format!("{count} argument{}", if count == 1 { "" } else { "s" })
+            }
+            Self::AtLeast(count) => format!("at least {count} arguments"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,8 +182,16 @@ pub fn build_plan(
     drops: &[String],
     tombstones: &[String],
     projection: Option<&str>,
+    variables: Option<&str>,
     json_requirement: JsonRequirement,
 ) -> Result<TransformPlan, String> {
+    let variables = variables
+        .map(|source| syntax::parse(source, "--vars"))
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .map(variable_root)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let drops = drops
         .iter()
         .map(|source| syntax::parse(source, "drop predicate"))
@@ -150,12 +206,13 @@ pub fn build_plan(
         .map(|source| syntax::parse(source, "projection"))
         .transpose()
         .map_err(|error| error.to_string())?;
-    Compiler::compile(drops, tombstones, projection, json_requirement)
+    Compiler::compile(drops, tombstones, projection, variables, json_requirement)
         .map_err(|error| error.to_string())
 }
 
 struct Compiler {
     paths: Vec<Path>,
+    variables: Option<Arc<Constant>>,
 }
 
 impl Compiler {
@@ -163,9 +220,13 @@ impl Compiler {
         drops: Vec<Expr>,
         tombstones: Vec<Expr>,
         projection: Option<Expr>,
+        variables: Option<Constant>,
         json_requirement: JsonRequirement,
     ) -> Result<TransformPlan, CompileError> {
-        let mut compiler = Self { paths: Vec::new() };
+        let mut compiler = Self {
+            paths: Vec::new(),
+            variables: variables.map(Arc::new),
+        };
         for (category, predicates) in [
             ("drop predicate", drops.as_slice()),
             ("tombstone predicate", tombstones.as_slice()),
@@ -244,6 +305,14 @@ impl Compiler {
                     });
                 CompiledKind::Slot(slot)
             }
+            ExprKind::Variable(path) => CompiledKind::Variable {
+                root: Arc::clone(self.variables.as_ref().ok_or_else(|| CompileError {
+                    category,
+                    span,
+                    message: "$vars requires --vars".to_owned(),
+                })?),
+                path,
+            },
             ExprKind::Array(values) => CompiledKind::Array(
                 values
                     .into_iter()
@@ -258,7 +327,7 @@ impl Compiler {
                         return Err(CompileError {
                             category,
                             span: field.span,
-                            message: format!("duplicate projection key {:?}", field.key),
+                            message: format!("duplicate object key {:?}", field.key),
                         });
                     }
                     compiled.push((field.key, self.expression(field.value, category)?));
@@ -279,13 +348,13 @@ impl Compiler {
                     span,
                     message: format!("unsupported function {name:?}"),
                 })?;
-                if arguments.len() != arity {
+                if !arity.accepts(arguments.len()) {
                     return Err(CompileError {
                         category,
                         span,
                         message: format!(
-                            "function {name:?} expects {arity} argument{}, received {}",
-                            if arity == 1 { "" } else { "s" },
+                            "function {name:?} expects {}, received {}",
+                            arity.description(),
                             arguments.len()
                         ),
                     });
@@ -311,22 +380,16 @@ impl TransformPlan {
 
 fn expression_bound(expression: &CompiledExpr) -> Result<OutputBound, ()> {
     Ok(match &expression.kind {
-        CompiledKind::Literal(value) => OutputBound {
-            factor: 0,
-            constant: match value {
-                Literal::Null => 4,
-                Literal::Bool(true) => 4,
-                Literal::Bool(false) => 5,
-                Literal::I64(value) => value.to_string().len(),
-                Literal::U64(value) => value.to_string().len(),
-                Literal::F64(value) => format!("{value:?}").len(),
-                Literal::String(value) => json_string_bytes(value).ok_or(())?,
-            },
-        },
+        CompiledKind::Literal(value) => literal_bound(value)?,
         CompiledKind::Slot(_) => OutputBound {
             factor: 1,
             constant: 0,
         },
+        CompiledKind::Variable { root, path } => root
+            .at(path)
+            .map(constant_bound)
+            .transpose()?
+            .unwrap_or_default(),
         CompiledKind::Array(values) => values
             .iter()
             .try_fold(OutputBound::default(), |bound, value| {
@@ -348,10 +411,96 @@ fn expression_bound(expression: &CompiledExpr) -> Result<OutputBound, ()> {
             factor: 0,
             constant: 20,
         },
-        CompiledKind::Call(Function::Coalesce, arguments) => {
-            expression_bound(&arguments[0])?.max(expression_bound(&arguments[1])?)
+        CompiledKind::Call(Function::Coalesce, arguments) => arguments
+            .iter()
+            .try_fold(OutputBound::default(), |bound, argument| {
+                Ok::<_, ()>(bound.max(expression_bound(argument)?))
+            })?,
+        CompiledKind::Call(Function::If, arguments) => {
+            expression_bound(&arguments[1])?.max(expression_bound(&arguments[2])?)
         }
         CompiledKind::Call(_, _) => OutputBound::BOOLEAN,
+    })
+}
+
+fn variable_root(expression: Expr) -> Result<Constant, CompileError> {
+    let span = expression.span;
+    if !matches!(expression.kind, ExprKind::Object(_)) {
+        return Err(CompileError {
+            category: "--vars",
+            span,
+            message: "must be a JSON-shaped object".to_owned(),
+        });
+    }
+    constant(expression)
+}
+
+fn constant(expression: Expr) -> Result<Constant, CompileError> {
+    let span = expression.span;
+    Ok(match expression.kind {
+        ExprKind::Literal(value) => Constant::Literal(value),
+        ExprKind::Array(values) => {
+            Constant::Array(values.into_iter().map(constant).collect::<Result<_, _>>()?)
+        }
+        ExprKind::Object(fields) => {
+            let mut keys = HashSet::new();
+            let mut values = Vec::with_capacity(fields.len());
+            for field in fields {
+                if !keys.insert(field.key.clone()) {
+                    return Err(CompileError {
+                        category: "--vars",
+                        span: field.span,
+                        message: format!("duplicate object key {:?}", field.key),
+                    });
+                }
+                values.push((field.key, constant(field.value)?));
+            }
+            Constant::Object(values)
+        }
+        _ => {
+            return Err(CompileError {
+                category: "--vars",
+                span,
+                message: "values must contain only JSON-shaped constants".to_owned(),
+            });
+        }
+    })
+}
+
+fn constant_bound(value: &Constant) -> Result<OutputBound, ()> {
+    Ok(match value {
+        Constant::Literal(value) => literal_bound(value)?,
+        Constant::Array(values) => values
+            .iter()
+            .try_fold(OutputBound::default(), |bound, value| {
+                bound.add(constant_bound(value).ok()?)
+            })
+            .and_then(|bound| bound.with_constant(2 + values.len().saturating_sub(1)))
+            .ok_or(())?,
+        Constant::Object(fields) => fields
+            .iter()
+            .try_fold(OutputBound::default(), |bound, (key, value)| {
+                bound
+                    .add(constant_bound(value).ok()?)
+                    .and_then(|bound| bound.with_constant(json_string_bytes(key)?.checked_add(1)?))
+            })
+            .and_then(|bound| bound.with_constant(2 + fields.len().saturating_sub(1)))
+            .ok_or(())?,
+    })
+}
+
+fn literal_bound(value: &Literal) -> Result<OutputBound, ()> {
+    Ok(OutputBound {
+        factor: 0,
+        constant: match value {
+            Literal::Null => 4,
+            Literal::Bool(true) => 4,
+            Literal::Bool(false) => 5,
+            Literal::I64(value) => value.to_string().len(),
+            Literal::U64(value) => value.to_string().len(),
+            Literal::F64(value) => format!("{value:?}").len(),
+            Literal::String(value) => json_string_bytes(value).ok_or(())?,
+        },
     })
 }
 
@@ -365,21 +514,23 @@ fn json_string_bytes(value: &str) -> Option<usize> {
     })
 }
 
-fn function(name: &str) -> Option<(Function, usize)> {
+fn function(name: &str) -> Option<(Function, Arity)> {
     Some(match name {
-        "exists" => (Function::Exists, 1),
-        "missing" => (Function::Missing, 1),
-        "is_null" => (Function::IsNull, 1),
-        "is_boolean" => (Function::IsBoolean, 1),
-        "is_number" => (Function::IsNumber, 1),
-        "is_string" => (Function::IsString, 1),
-        "is_array" => (Function::IsArray, 1),
-        "is_object" => (Function::IsObject, 1),
-        "contains" => (Function::Contains, 2),
-        "starts_with" => (Function::StartsWith, 2),
-        "ends_with" => (Function::EndsWith, 2),
-        "length" => (Function::Length, 1),
-        "coalesce" => (Function::Coalesce, 2),
+        "exists" => (Function::Exists, Arity::Exactly(1)),
+        "missing" => (Function::Missing, Arity::Exactly(1)),
+        "is_null" => (Function::IsNull, Arity::Exactly(1)),
+        "is_boolean" => (Function::IsBoolean, Arity::Exactly(1)),
+        "is_number" => (Function::IsNumber, Arity::Exactly(1)),
+        "is_string" => (Function::IsString, Arity::Exactly(1)),
+        "is_array" => (Function::IsArray, Arity::Exactly(1)),
+        "is_object" => (Function::IsObject, Arity::Exactly(1)),
+        "contains" => (Function::Contains, Arity::Exactly(2)),
+        "starts_with" => (Function::StartsWith, Arity::Exactly(2)),
+        "ends_with" => (Function::EndsWith, Arity::Exactly(2)),
+        "length" => (Function::Length, Arity::Exactly(1)),
+        "coalesce" => (Function::Coalesce, Arity::AtLeast(2)),
+        "if" => (Function::If, Arity::Exactly(3)),
+        "in" => (Function::In, Arity::Exactly(2)),
         _ => return None,
     })
 }
@@ -394,6 +545,7 @@ mod tests {
             &[".customer.id == 1".to_owned()],
             &["exists(.customer.id)".to_owned()],
             Some("{id: .customer.id}"),
+            None,
             JsonRequirement::AsNeeded,
         )
         .unwrap();
@@ -403,21 +555,72 @@ mod tests {
 
     #[test]
     fn duplicate_object_keys_are_rejected() {
-        let error =
-            build_plan(&[], &[], Some("{id: 1, id: 2}"), JsonRequirement::AsNeeded).unwrap_err();
-        assert!(error.contains("duplicate projection key"));
-    }
-
-    #[test]
-    fn function_arity_is_checked_once_at_startup() {
         let error = build_plan(
-            &["exists(.a, .b)".to_owned()],
             &[],
+            &[],
+            Some("{id: 1, id: 2}"),
             None,
             JsonRequirement::AsNeeded,
         )
         .unwrap_err();
-        assert!(error.contains("expects 1 argument"));
+        assert!(error.contains("duplicate object key"));
+    }
+
+    #[test]
+    fn function_arity_is_checked_once_at_startup() {
+        for (expression, expected) in [
+            ("exists(.a, .b)", "expects 1 argument"),
+            ("if(true, 1)", "expects 3 arguments"),
+            ("in(1)", "expects 2 arguments"),
+            ("coalesce(.a)", "expects at least 2 arguments"),
+        ] {
+            let error = build_plan(
+                &[expression.to_owned()],
+                &[],
+                None,
+                None,
+                JsonRequirement::AsNeeded,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "{expression}: {error}");
+        }
+    }
+
+    #[test]
+    fn variables_are_constant_objects_and_references_require_them() {
+        build_plan(
+            &[],
+            &[],
+            Some("$vars.policy.cutoff"),
+            Some("{policy: {cutoff: 10, allowed: [\"open\", null]}}"),
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
+
+        let error =
+            build_plan(&[], &[], Some("1"), Some("[]"), JsonRequirement::AsNeeded).unwrap_err();
+        assert_eq!(
+            error,
+            "--vars expression at byte 0: must be a JSON-shaped object"
+        );
+
+        for (variables, projection, expected) in [
+            (None, Some("$vars.cutoff"), "$vars requires --vars"),
+            (
+                Some("{value: .input}"),
+                Some("1"),
+                "only JSON-shaped constants",
+            ),
+            (
+                Some("{value: 1, value: 2}"),
+                Some("1"),
+                "duplicate object key",
+            ),
+        ] {
+            let error =
+                build_plan(&[], &[], projection, variables, JsonRequirement::AsNeeded).unwrap_err();
+            assert!(error.contains(expected), "{variables:?}: {error}");
+        }
     }
 
     #[test]
@@ -426,6 +629,7 @@ mod tests {
             &[],
             &[],
             Some("[.value, .value]"),
+            None,
             JsonRequirement::AsNeeded,
         )
         .unwrap();
@@ -435,13 +639,30 @@ mod tests {
             &[],
             &[],
             Some("[.value, .value]"),
+            None,
             JsonRequirement::PreserveInvalid,
         )
         .unwrap();
         assert_eq!(preserving.payload_budget().bytes(100).unwrap(), 403);
 
-        let pass_through =
-            build_plan(&["true".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
+        let pass_through = build_plan(
+            &["true".to_owned()],
+            &[],
+            None,
+            None,
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
         assert_eq!(pass_through.payload_budget().bytes(100).unwrap(), 200);
+
+        let variable = build_plan(
+            &[],
+            &[],
+            Some("if(true, $vars.value, coalesce(.missing, \"fallback\"))"),
+            Some("{value: [1, 2]}"),
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
+        assert_eq!(variable.payload_budget().bytes(10).unwrap(), 30);
     }
 }

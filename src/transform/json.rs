@@ -3,7 +3,7 @@ use std::{cmp::Ordering, fmt, io::Write};
 use simd_json::{Buffers, Node, Tape, ValueType, prelude::*, tape::Value as TapeValue};
 
 use super::{
-    compile::{CompiledExpr, CompiledKind, Function, TransformPlan},
+    compile::{CompiledExpr, CompiledKind, Constant, Function, TransformPlan},
     syntax::{BinaryOp, Literal, PathSegment, Span},
 };
 
@@ -341,6 +341,7 @@ enum Value<'a> {
     Array(Vec<Value<'a>>),
     Object(Vec<(&'a str, Value<'a>)>),
     Source(TapeValue<'a, 'a>),
+    Constant(&'a Constant),
 }
 
 fn eval<'a>(
@@ -348,15 +349,11 @@ fn eval<'a>(
     slots: &[Option<TapeValue<'a, 'a>>],
 ) -> Result<Value<'a>, TransformError> {
     match &expression.kind {
-        CompiledKind::Literal(literal) => Ok(match literal {
-            Literal::Null => Value::Null,
-            Literal::Bool(value) => Value::Bool(*value),
-            Literal::I64(value) => Value::I64(*value),
-            Literal::U64(value) => Value::U64(*value),
-            Literal::F64(value) => Value::F64(*value),
-            Literal::String(value) => Value::String(value),
-        }),
+        CompiledKind::Literal(literal) => Ok(literal_value(literal)),
         CompiledKind::Slot(slot) => Ok(slots[*slot].map_or(Value::Missing, source_value)),
+        CompiledKind::Variable { root, path } => {
+            Ok(root.at(path).map_or(Value::Missing, constant_value))
+        }
         CompiledKind::Array(values) => {
             let mut array = Vec::with_capacity(values.len());
             for value in values {
@@ -428,6 +425,30 @@ fn call<'a>(
     slots: &[Option<TapeValue<'a, 'a>>],
     span: Span,
 ) -> Result<Value<'a>, TransformError> {
+    if function == Function::If {
+        return match eval(&arguments[0], slots)? {
+            Value::Bool(true) => eval(&arguments[1], slots),
+            Value::Bool(false) => eval(&arguments[2], slots),
+            _ => Err(evaluation_error(span, "if condition must be boolean")),
+        };
+    }
+    if function == Function::Coalesce {
+        for (index, argument) in arguments.iter().enumerate() {
+            let value = eval(argument, slots)?;
+            if index + 1 == arguments.len()
+                || !matches!(value_type(&value), Type::Missing | Type::Null)
+            {
+                return Ok(value);
+            }
+        }
+        unreachable!("coalesce arity is checked at compile time");
+    }
+    if function == Function::In {
+        let needle = eval(&arguments[0], slots)?;
+        let haystack = eval(&arguments[1], slots)?;
+        return in_array(&needle, &haystack, span).map(Value::Bool);
+    }
+
     let first = eval(&arguments[0], slots)?;
     match function {
         Function::Exists => Ok(Value::Bool(!matches!(first, Value::Missing))),
@@ -443,6 +464,11 @@ fn call<'a>(
             Value::String(value) => Ok(Value::U64(value.chars().count() as u64)),
             Value::Array(value) => Ok(Value::U64(value.len() as u64)),
             Value::Object(value) => Ok(Value::U64(value.len() as u64)),
+            Value::Constant(Constant::Array(value)) => Ok(Value::U64(value.len() as u64)),
+            Value::Constant(Constant::Object(value)) => Ok(Value::U64(value.len() as u64)),
+            Value::Constant(Constant::Literal(Literal::String(value))) => {
+                Ok(Value::U64(value.chars().count() as u64))
+            }
             Value::Source(value) if value.value_type() == ValueType::String => Ok(Value::U64(
                 value.as_str().expect("string tape value").chars().count() as u64,
             )),
@@ -457,13 +483,6 @@ fn call<'a>(
                 "length expects a string, array, or object",
             )),
         },
-        Function::Coalesce => {
-            if matches!(value_type(&first), Type::Missing | Type::Null) {
-                eval(&arguments[1], slots)
-            } else {
-                Ok(first)
-            }
-        }
         Function::Contains | Function::StartsWith | Function::EndsWith => {
             let second = eval(&arguments[1], slots)?;
             if matches!(first, Value::Missing) || matches!(second, Value::Missing) {
@@ -482,6 +501,48 @@ fn call<'a>(
                 _ => unreachable!(),
             }))
         }
+        Function::Coalesce | Function::If | Function::In => unreachable!(),
+    }
+}
+
+fn in_array(needle: &Value<'_>, haystack: &Value<'_>, span: Span) -> Result<bool, TransformError> {
+    if matches!(needle, Value::Missing) || matches!(haystack, Value::Missing) {
+        return Ok(false);
+    }
+    if matches!(value_type(needle), Type::Array | Type::Object) {
+        return Err(evaluation_error(span, "in supports only scalar values"));
+    }
+    match haystack {
+        Value::Array(values) => {
+            for value in values {
+                if equal(needle, value, span)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Value::Constant(Constant::Array(values)) => {
+            // ponytail: membership is linear; index constant arrays if large allowlists profile hot.
+            for value in values {
+                if equal(needle, &constant_value(value), span)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Value::Source(value) if value.value_type() == ValueType::Array => {
+            let values = value.as_array().expect("array tape value");
+            for value in values.iter() {
+                if equal(needle, &source_value(value), span)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Err(evaluation_error(
+            span,
+            "in expects an array as its second argument",
+        )),
     }
 }
 
@@ -505,6 +566,14 @@ fn value_type(value: &Value<'_>) -> Type {
         Value::String(_) => Type::String,
         Value::Array(_) => Type::Array,
         Value::Object(_) => Type::Object,
+        Value::Constant(value) => match value {
+            Constant::Literal(Literal::Null) => Type::Null,
+            Constant::Literal(Literal::Bool(_)) => Type::Bool,
+            Constant::Literal(Literal::I64(_) | Literal::U64(_) | Literal::F64(_)) => Type::Number,
+            Constant::Literal(Literal::String(_)) => Type::String,
+            Constant::Array(_) => Type::Array,
+            Constant::Object(_) => Type::Object,
+        },
         Value::Source(value) => match value.value_type() {
             ValueType::Null => Type::Null,
             ValueType::Bool => Type::Bool,
@@ -528,9 +597,28 @@ fn source_value<'a>(value: TapeValue<'a, 'a>) -> Value<'a> {
     }
 }
 
+fn literal_value(value: &Literal) -> Value<'_> {
+    match value {
+        Literal::Null => Value::Null,
+        Literal::Bool(value) => Value::Bool(*value),
+        Literal::I64(value) => Value::I64(*value),
+        Literal::U64(value) => Value::U64(*value),
+        Literal::F64(value) => Value::F64(*value),
+        Literal::String(value) => Value::String(value),
+    }
+}
+
+fn constant_value(value: &Constant) -> Value<'_> {
+    match value {
+        Constant::Literal(value) => literal_value(value),
+        Constant::Array(_) | Constant::Object(_) => Value::Constant(value),
+    }
+}
+
 fn as_string<'a>(value: &'a Value<'a>) -> Option<&'a str> {
     match value {
         Value::String(value) => Some(value),
+        Value::Constant(Constant::Literal(Literal::String(value))) => Some(value),
         Value::Source(value) => value.as_str(),
         _ => None,
     }
@@ -609,6 +697,9 @@ fn number(value: &Value<'_>) -> Option<Number> {
         Value::I64(value) => Number::I64(*value),
         Value::U64(value) => Number::U64(*value),
         Value::F64(value) => Number::F64(*value),
+        Value::Constant(Constant::Literal(Literal::I64(value))) => Number::I64(*value),
+        Value::Constant(Constant::Literal(Literal::U64(value))) => Number::U64(*value),
+        Value::Constant(Constant::Literal(Literal::F64(value))) => Number::F64(*value),
         Value::Source(value) if value.value_type() == ValueType::I64 => {
             Number::I64(value.as_i64().expect("signed tape value"))
         }
@@ -692,6 +783,7 @@ fn unsigned_float_order(integer: u64, float: f64) -> Option<Ordering> {
 fn bool_value(value: &Value<'_>) -> Option<bool> {
     match value {
         Value::Bool(value) => Some(*value),
+        Value::Constant(Constant::Literal(Literal::Bool(value))) => Some(*value),
         Value::Source(value) => value.as_bool(),
         _ => None,
     }
@@ -733,11 +825,46 @@ fn write_json(value: &Value<'_>, output: &mut Vec<u8>, span: Span) -> Result<(),
             }
             output.push(b'}');
         }
+        Value::Constant(value) => write_constant(value, output, span)?,
         Value::Source(value) => value
             .write(output)
             .map_err(|error| evaluation_error(span, format!("cannot serialize value: {error}")))?,
     }
     Ok(())
+}
+
+fn write_constant(
+    value: &Constant,
+    output: &mut Vec<u8>,
+    span: Span,
+) -> Result<(), TransformError> {
+    match value {
+        Constant::Literal(value) => write_json(&literal_value(value), output, span),
+        Constant::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_constant(value, output, span)?;
+            }
+            output.push(b']');
+            Ok(())
+        }
+        Constant::Object(fields) => {
+            output.push(b'{');
+            for (index, (key, value)) in fields.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_string(key, output);
+                output.push(b':');
+                write_constant(value, output, span)?;
+            }
+            output.push(b'}');
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn write_string(value: &str, output: &mut Vec<u8>) {
@@ -803,6 +930,16 @@ mod tests {
         projection: Option<&str>,
         input: Option<&[u8]>,
     ) -> Result<Action, TransformError> {
+        run_with_vars(drops, tombstones, projection, None, input)
+    }
+
+    fn run_with_vars(
+        drops: &[&str],
+        tombstones: &[&str],
+        projection: Option<&str>,
+        variables: Option<&str>,
+        input: Option<&[u8]>,
+    ) -> Result<Action, TransformError> {
         let plan = build_plan(
             &drops.iter().map(ToString::to_string).collect::<Vec<_>>(),
             &tombstones
@@ -810,6 +947,7 @@ mod tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             projection,
+            variables,
             JsonRequirement::AsNeeded,
         )
         .unwrap();
@@ -931,10 +1069,102 @@ mod tests {
     }
 
     #[test]
+    fn variables_project_nested_constants_and_follow_missing_semantics() {
+        let action = run_with_vars(
+            &[],
+            &[],
+            Some(
+                "{root: $vars, tenant: $vars.tenant, dotted: $vars[\"a.b\"], first: $vars.statuses[0], count: length($vars.statuses), array: is_array($vars.statuses), policy: $vars.policy, fallback: coalesce($vars.absent, \"default\")}",
+            ),
+            Some(
+                "{tenant: \"acme\", \"a.b\": 7, statuses: [\"open\", \"pending\"], policy: {cutoff: 10}}",
+            ),
+            Some(b"{}"),
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            Action::Project(
+                br#"{"root":{"tenant":"acme","a.b":7,"statuses":["open","pending"],"policy":{"cutoff":10}},"tenant":"acme","dotted":7,"first":"open","count":2,"array":true,"policy":{"cutoff":10},"fallback":"default"}"#
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn if_evaluates_only_the_selected_branch_and_requires_a_boolean() {
+        assert_eq!(
+            run(
+                &[],
+                &[],
+                Some("[if(true, 1, length(true)), if(false, length(true), 2)]"),
+                Some(b"{}"),
+            )
+            .unwrap(),
+            Action::Project(b"[1,2]".to_vec())
+        );
+        assert!(run(&[], &[], Some("if(1, 2, 3)"), Some(b"{}")).is_err());
+    }
+
+    #[test]
+    fn in_supports_scalar_membership_across_array_representations() {
+        assert_eq!(
+            run_with_vars(
+                &[
+                    "in(.status, $vars.statuses) and in(.large, $vars.numbers) and in(null, $vars.values) and in(\"x\", .tags) and in(2, [1, 2])",
+                ],
+                &[],
+                None,
+                Some(
+                    "{statuses: [\"open\", \"pending\"], numbers: [9007199254740993], values: [null, false]}",
+                ),
+                Some(
+                    br#"{"status":"open","large":9007199254740993,"tags":["x","y"]}"#,
+                ),
+            )
+            .unwrap(),
+            Action::Drop
+        );
+        assert_eq!(
+            run_with_vars(
+                &["in(.missing, $vars.values)"],
+                &[],
+                None,
+                Some("{values: [null]}"),
+                Some(b"{}"),
+            )
+            .unwrap(),
+            Action::PassThrough(b"{}".to_vec())
+        );
+        assert_eq!(
+            run(&["in([1], .missing)"], &[], None, Some(b"{}")).unwrap(),
+            Action::PassThrough(b"{}".to_vec())
+        );
+        assert!(run(&["in(1, 1)"], &[], None, Some(b"{}")).is_err());
+        assert!(run(&["in([1], [[1]])"], &[], None, Some(b"{}")).is_err());
+    }
+
+    #[test]
+    fn coalesce_accepts_multiple_fallbacks_and_short_circuits() {
+        assert_eq!(
+            run(
+                &[],
+                &[],
+                Some("[coalesce(.a, .b, .c, \"fallback\"), coalesce(\"first\", length(true), 3)]"),
+                Some(br#"{"a":null}"#),
+            )
+            .unwrap(),
+            Action::Project(br#"["fallback","first"]"#.to_vec())
+        );
+        assert!(run(&[], &[], Some("coalesce(.a, .b, .c)"), Some(b"{}")).is_err());
+    }
+
+    #[test]
     fn invalid_json_pass_preserves_exact_bytes() {
         let plan = build_plan(
             &["true".to_owned()],
             &[],
+            None,
             None,
             JsonRequirement::PreserveInvalid,
         )
@@ -954,7 +1184,14 @@ mod tests {
 
     #[test]
     fn worker_backend_reuses_normal_scratch_and_discards_oversized_scratch() {
-        let pass = build_plan(&["false".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
+        let pass = build_plan(
+            &["false".to_owned()],
+            &[],
+            None,
+            None,
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
         let mut backend = Backend::default();
         for input in [br#"{"value":"first"}"#.as_slice(), br#"{"value":2}"#] {
             let execution = backend
@@ -965,7 +1202,14 @@ mod tests {
         assert!(backend.parse_buffer.capacity() >= br#"{"value":"first"}"#.len());
         assert!(backend.tape.as_ref().unwrap().0.capacity() > 1);
 
-        let drop = build_plan(&["true".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
+        let drop = build_plan(
+            &["true".to_owned()],
+            &[],
+            None,
+            None,
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
         let mut oversized = vec![b' '; MAX_RETAINED_BUFFER_BYTES + 1];
         oversized.extend_from_slice(b"null");
         assert_eq!(
@@ -1048,7 +1292,8 @@ mod tests {
                 br#"{"value":[1,2,3]}"#.as_slice(),
             ),
         ] {
-            let plan = build_plan(&[], &[], Some(projection), JsonRequirement::AsNeeded).unwrap();
+            let plan =
+                build_plan(&[], &[], Some(projection), None, JsonRequirement::AsNeeded).unwrap();
             let budget = plan.payload_budget().bytes(input.len()).unwrap();
             let execution = execute_report(&plan, Some(input.to_vec()), FAIL).unwrap();
             let Action::Project(output) = execution.action else {
@@ -1081,8 +1326,14 @@ mod tests {
 
     #[test]
     fn error_policies_convert_invalid_json_and_evaluation_failures() {
-        let invalid =
-            build_plan(&["true".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
+        let invalid = build_plan(
+            &["true".to_owned()],
+            &[],
+            None,
+            None,
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
         for (policy, expected) in [
             (InvalidJsonPolicy::Drop, Action::Drop),
             (InvalidJsonPolicy::Tombstone, Action::Tombstone),
@@ -1103,6 +1354,7 @@ mod tests {
         let evaluation = build_plan(
             &["length(true) == 1".to_owned()],
             &[],
+            None,
             None,
             JsonRequirement::AsNeeded,
         )
@@ -1137,7 +1389,14 @@ mod tests {
 
     #[test]
     fn invalid_json_errors_report_coordinates_without_payload_content() {
-        let plan = build_plan(&["false".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
+        let plan = build_plan(
+            &["false".to_owned()],
+            &[],
+            None,
+            None,
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
         let error = execute(&plan, Some(b"secret".to_vec()), FAIL).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("at byte"), "{message}");
@@ -1146,7 +1405,14 @@ mod tests {
 
     #[test]
     fn excessive_json_nesting_uses_the_invalid_json_policy() {
-        let plan = build_plan(&["false".to_owned()], &[], None, JsonRequirement::AsNeeded).unwrap();
+        let plan = build_plan(
+            &["false".to_owned()],
+            &[],
+            None,
+            None,
+            JsonRequirement::AsNeeded,
+        )
+        .unwrap();
         let accepted = format!(
             "{}0{}",
             "[".repeat(MAX_JSON_DEPTH),

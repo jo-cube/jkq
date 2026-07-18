@@ -19,6 +19,7 @@ pub struct Expr {
 pub enum ExprKind {
     Literal(Literal),
     Path(Path),
+    Variable(Path),
     Array(Vec<Expr>),
     Object(Vec<ObjectField>),
     Unary(Box<Expr>),
@@ -122,6 +123,7 @@ struct Token {
 #[derive(Clone, Debug, PartialEq)]
 enum TokenKind {
     Dot,
+    Dollar,
     LeftBracket,
     RightBracket,
     LeftBrace,
@@ -191,7 +193,7 @@ fn validate_depth(
                 pending.push((left, depth + 1));
                 pending.push((right, depth + 1));
             }
-            ExprKind::Literal(_) | ExprKind::Path(_) => {}
+            ExprKind::Literal(_) | ExprKind::Path(_) | ExprKind::Variable(_) => {}
         }
     }
     Ok(())
@@ -223,6 +225,7 @@ fn lex(source: &str, category: &'static str) -> Result<Vec<Token>, ParseError> {
                 cursor += 1;
                 TokenKind::Dot
             }
+            b'$' => one(&mut cursor, TokenKind::Dollar),
             b'[' => one(&mut cursor, TokenKind::LeftBracket),
             b']' => one(&mut cursor, TokenKind::RightBracket),
             b'{' => one(&mut cursor, TokenKind::LeftBrace),
@@ -602,6 +605,7 @@ impl Parser<'_> {
             TokenKind::String(value) => self.literal(token.span, Literal::String(value)),
             TokenKind::Number(value) => self.number(token.span, &value),
             TokenKind::Dot => self.path(token.span.start),
+            TokenKind::Dollar => self.variable(token.span.start),
             TokenKind::Identifier(name) => self.call(token.span.start, name, depth),
             TokenKind::LeftParen => {
                 let mut expression = self.parse_bp(0, depth + 1)?;
@@ -621,7 +625,7 @@ impl Parser<'_> {
             _ => Err(ParseError::new(
                 self.category,
                 token.span,
-                "expected literal, path, function call, array, object, or parenthesized expression",
+                "expected literal, path, variable, function call, array, object, or parenthesized expression",
                 self.source,
             )),
         }
@@ -684,6 +688,36 @@ impl Parser<'_> {
             | TokenKind::End => {}
             _ => return Err(self.error_current("expected path field or end of root expression")),
         }
+        self.path_tail(&mut segments)?;
+        let end = self.tokens[self.cursor - 1].span.end;
+        Ok(Expr {
+            kind: ExprKind::Path(Path(segments)),
+            span: Span { start, end },
+            parenthesized: false,
+        })
+    }
+
+    fn variable(&mut self, start: usize) -> Result<Expr, ParseError> {
+        let root = self.take();
+        if !matches!(root.kind, TokenKind::Identifier(ref name) if name == "vars") {
+            return Err(ParseError::new(
+                self.category,
+                root.span,
+                "expected reserved variable root 'vars' after '$'",
+                self.source,
+            ));
+        }
+        let mut segments = Vec::new();
+        self.path_tail(&mut segments)?;
+        let end = self.tokens[self.cursor - 1].span.end;
+        Ok(Expr {
+            kind: ExprKind::Variable(Path(segments)),
+            span: Span { start, end },
+            parenthesized: false,
+        })
+    }
+
+    fn path_tail(&mut self, segments: &mut Vec<PathSegment>) -> Result<(), ParseError> {
         loop {
             match self.current().kind.clone() {
                 TokenKind::Dot => {
@@ -693,16 +727,11 @@ impl Parser<'_> {
                     };
                     segments.push(PathSegment::Field(field));
                 }
-                TokenKind::LeftBracket => self.bracket_segment(&mut segments)?,
+                TokenKind::LeftBracket => self.bracket_segment(segments)?,
                 _ => break,
             }
         }
-        let end = self.tokens[self.cursor - 1].span.end;
-        Ok(Expr {
-            kind: ExprKind::Path(Path(segments)),
-            span: Span { start, end },
-            parenthesized: false,
-        })
+        Ok(())
     }
 
     fn bracket_segment(&mut self, segments: &mut Vec<PathSegment>) -> Result<(), ParseError> {
@@ -887,6 +916,9 @@ mod tests {
             let error = parse(source, "predicate").unwrap_err();
             assert!(error.to_string().contains("byte"), "{source}: {error}");
         }
+
+        let error = parse("", "predicate").unwrap_err();
+        assert!(error.message.contains("variable"));
     }
 
     #[test]
@@ -912,5 +944,32 @@ mod tests {
         parse("(true == true) == true", "predicate").unwrap();
         parse("true == (true == true)", "predicate").unwrap();
         assert!(parse("true == true == true", "predicate").is_err());
+    }
+
+    #[test]
+    fn variable_paths_use_the_reserved_vars_root() {
+        for source in [
+            "$vars",
+            "$vars.cutoff",
+            "$vars.policy[\"a.b\"][0]",
+            "if(.amount >= $vars.cutoff, \"large\", \"small\")",
+        ] {
+            parse(source, "test").unwrap_or_else(|error| panic!("{source}: {error}"));
+        }
+    }
+
+    #[test]
+    fn malformed_variable_paths_report_positions() {
+        for (source, byte, message) in [
+            ("$", 1, "expected reserved variable root"),
+            ("$other", 1, "expected reserved variable root"),
+            ("$vars.", 6, "expected field name"),
+            ("$vars..field", 6, "expected field name"),
+            ("$vars[-1]", 6, "expected non-negative integer"),
+        ] {
+            let error = parse(source, "test").unwrap_err();
+            assert_eq!(error.span.start, byte, "{source}: {error}");
+            assert!(error.message.contains(message), "{source}: {error}");
+        }
     }
 }

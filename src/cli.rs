@@ -68,6 +68,9 @@ pub struct RawCli {
     /// Project each surviving record with this expression
     #[arg(long)]
     project: Option<String>,
+    /// JSON-shaped constant object available through $vars paths
+    #[arg(long, value_name = "OBJECT")]
+    vars: Option<String>,
     /// Kcat-style output format
     #[arg(short = 'f', long, conflicts_with = "json_envelope")]
     format: Option<String>,
@@ -269,6 +272,7 @@ impl RawCli {
             &self.drop_if,
             &self.tombstone_if,
             self.project.as_deref(),
+            self.vars.as_deref(),
             json_requirement,
         )?;
         let output = if self.json_envelope {
@@ -691,6 +695,57 @@ mod tests {
     }
 
     #[test]
+    fn cli_compiles_variables_if_in_and_variadic_coalesce_before_connecting() {
+        let identity = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-p",
+            "0",
+            "--vars",
+            "{unused: true}",
+        ])
+        .unwrap();
+        assert!(!identity.transform.capabilities.parses_json);
+
+        let config = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-p",
+            "0",
+            "--vars",
+            "{allowed: [\"open\", \"pending\"], cutoff: 10}",
+            "--drop-if",
+            "not in(.status, $vars.allowed)",
+            "--project",
+            "{tier: if(.amount >= $vars.cutoff, \"large\", \"small\"), value: coalesce(.a, .b, 0)}",
+            "--check",
+        ])
+        .unwrap();
+        assert!(config.check);
+        assert!(config.transform.capabilities.parses_json);
+
+        let error = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-p",
+            "0",
+            "--vars",
+            "{value: .record}",
+        ])
+        .unwrap_err();
+        assert!(error.contains("only JSON-shaped constants"));
+    }
+
+    #[test]
     fn runtime_owned_kafka_properties_are_rejected() {
         for property in [
             "enable.auto.commit=true",
@@ -724,5 +779,6 @@ mod tests {
         assert!(help.contains("Maximum admitted input records per partition"));
         assert!(help.contains("Validate local configuration and exit without connecting"));
         assert!(help.contains("Retained-byte budget; supports KiB, MiB, and GiB"));
+        assert!(help.contains("JSON-shaped constant object available through $vars paths"));
     }
 }
