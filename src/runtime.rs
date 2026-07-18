@@ -287,33 +287,54 @@ pub fn run_pipeline(
         } else {
             Dispatcher::Identity(completion_tx.clone())
         };
-        let poller = scope.spawn(move || {
-            poll_loop(
-                config,
-                input,
-                dispatcher,
-                release_rx,
-                poller_shutdown,
-                signals,
-                poller_stats,
-                started,
-                poller_failure,
-            )
-        });
+        let poller = match thread::Builder::new()
+            .name("jkq-kafka-poll".to_owned())
+            .spawn_scoped(scope, move || {
+                poll_loop(
+                    config,
+                    input,
+                    dispatcher,
+                    release_rx,
+                    poller_shutdown,
+                    signals,
+                    poller_stats,
+                    started,
+                    poller_failure,
+                )
+            }) {
+            Ok(poller) => poller,
+            Err(error) => {
+                thread_start_failure(&first_failure, &shutdown, "Kafka poll thread", error);
+                return None;
+            }
+        };
 
         let mut workers = Vec::with_capacity(if transforms_json { config.jobs } else { 0 });
         if transforms_json {
-            for _ in 0..config.jobs {
+            for index in 0..config.jobs {
                 let receiver = work_rx.clone();
                 let sender = completion_tx.clone();
                 let worker_stats = Arc::clone(&stats);
                 let worker_shutdown = Arc::clone(&shutdown);
                 let worker_failure = Arc::clone(&first_failure);
-                workers.push(scope.spawn(move || {
-                    guard_worker(worker_shutdown, worker_failure, || {
-                        worker_loop(config, receiver, sender, worker_stats);
-                    });
-                }));
+                match thread::Builder::new()
+                    .name(format!("jkq-worker-{index}"))
+                    .spawn_scoped(scope, move || {
+                        guard_worker(worker_shutdown, worker_failure, || {
+                            worker_loop(config, receiver, sender, worker_stats);
+                        });
+                    }) {
+                    Ok(worker) => workers.push(worker),
+                    Err(error) => {
+                        thread_start_failure(
+                            &first_failure,
+                            &shutdown,
+                            "compute worker thread",
+                            error,
+                        );
+                        break;
+                    }
+                }
             }
         }
         drop(work_rx);
@@ -532,6 +553,15 @@ fn poll_loop(
 fn runtime_failure(first: &OnceLock<RecordedFailure>, shutdown: &AtomicBool, message: String) {
     record_failure(first, &PipelineError::Runtime(message));
     shutdown.store(true, Ordering::SeqCst);
+}
+
+fn thread_start_failure(
+    first: &OnceLock<RecordedFailure>,
+    shutdown: &AtomicBool,
+    role: &str,
+    error: io::Error,
+) {
+    runtime_failure(first, shutdown, format!("cannot start {role}: {error}"));
 }
 
 fn guard_worker(
@@ -851,6 +881,28 @@ mod tests {
         let mut base = vec!["jkq", "-b", "unused", "-t", "events", "-p", "0"];
         base.extend_from_slice(arguments);
         RawCli::try_parse_from(base).unwrap().resolve().unwrap()
+    }
+
+    #[test]
+    fn thread_start_failure_records_the_error_and_requests_shutdown() {
+        let first = OnceLock::new();
+        let shutdown = AtomicBool::new(false);
+
+        thread_start_failure(
+            &first,
+            &shutdown,
+            "compute worker thread",
+            io::Error::other("resource limit"),
+        );
+
+        assert!(shutdown.load(Ordering::SeqCst));
+        let Some(RecordedFailure::Runtime(message)) = first.get() else {
+            panic!("expected a runtime failure");
+        };
+        assert_eq!(
+            message,
+            "cannot start compute worker thread: resource limit"
+        );
     }
 
     #[test]
