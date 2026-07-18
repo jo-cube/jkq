@@ -31,6 +31,31 @@ null  true  false  42  -7  12.5  "hello"
 A path that cannot be traversed produces `Missing`. Missing is an internal
 state, not JSON `null`.
 
+## Variables
+
+`--vars` supplies one immutable JSON-shaped object that is parsed at startup:
+
+```sh
+--vars '{tenant: "acme", policy: {cutoff: 1000}, statuses: ["open", "pending"]}'
+```
+
+Expressions access it through the reserved `$vars` root:
+
+```text
+$vars.tenant
+$vars.policy.cutoff
+$vars.statuses[0]
+$vars["non-identifier"]
+```
+
+Variable paths use the same field and index syntax and the same `Missing`
+semantics as input paths. The variables object may contain only nulls,
+booleans, numbers, strings, arrays, and objects. Duplicate keys, non-object
+roots, and record-dependent expressions are rejected at startup. Variables are
+constants: there is no assignment or per-record mutation. The object uses
+projection syntax, so identifier keys may be bare and other keys must be JSON
+strings.
+
 ## Operators
 
 From lowest to highest precedence:
@@ -73,11 +98,23 @@ requires two numbers or two strings.
 | `starts_with(string, prefix)` | case-sensitive prefix check |
 | `ends_with(string, suffix)` | case-sensitive suffix check |
 | `length(value)` | Unicode scalar count, array length, or object field count |
-| `coalesce(value, fallback)` | fallback when value is missing or null |
+| `coalesce(value, ..., fallback)` | first non-missing, non-null value; accepts at least two arguments |
+| `if(condition, when_true, when_false)` | selected branch; the other branch is not evaluated |
+| `in(value, array)` | scalar membership using the language's equality rules |
 
 Type checks return false for missing. String functions return false for missing
 arguments and error on other non-string arguments. `length(Missing)` produces
 Missing; unsupported scalar types are errors.
+
+`coalesce` evaluates arguments from left to right and stops at the first value
+that is neither missing nor null. Its final argument is returned as-is, so an
+all-missing call still produces Missing. `if` requires a boolean condition and
+evaluates only the selected branch.
+
+`in` returns false when the value or array is missing. Its second argument must
+otherwise be an array, and its first argument must be a scalar. Numeric
+membership uses the same exact cross-representation comparison as `==`. A
+scalar is null, a boolean, a number, or a string.
 
 ## Projections
 
@@ -96,7 +133,7 @@ Arrays and objects construct compact JSON:
 ```
 
 Object keys may be identifiers or JSON strings. Their expression order is
-preserved in output. Duplicate projection keys are rejected. A missing array
+preserved in output. Duplicate object keys are rejected. A missing array
 element, object value, or top-level projection result is an evaluation error;
 use `coalesce` when a default is intended.
 
@@ -137,6 +174,10 @@ more than 128 arrays or objects is treated as invalid JSON. Source objects with
 duplicate keys follow simd-json's effective lookup behavior and are not
 separately diagnosed.
 
+The variables object follows the expression nesting limit and is included in
+the compiled projection-size bound. It is never reparsed for individual input
+records.
+
 The language intentionally omits pipes, multiple results, assignments,
 reductions, sorting, grouping, joins, regular expressions, user functions,
 modules, and automatic omission of missing object fields.
@@ -149,7 +190,8 @@ or_expression   := and_expression { "or" and_expression }
 and_expression  := comparison { "and" comparison }
 comparison      := unary [ comparison_operator unary ]
 unary           := [ "not" ] primary
-primary         := literal | path | call | array | object | "(" expression ")"
+primary         := literal | path | variable | call | array | object | "(" expression ")"
+variable        := "$vars" { "." identifier | "[" (string | nonnegative_integer) "]" }
 call            := identifier "(" [ expression { "," expression } ] ")"
 array           := "[" [ expression { "," expression } ] "]"
 object          := "{" [ object_field { "," object_field } ] "}"

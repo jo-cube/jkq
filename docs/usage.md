@@ -62,10 +62,21 @@ Transform options are compiled before consumption:
 
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \
-  --drop-if '.tenant != "acme"' \
+  --vars '{tenant: "acme", cutoff: 1000, statuses: ["open", "pending"]}' \
+  --drop-if '.tenant != $vars.tenant or not in(.status, $vars.statuses)' \
   --tombstone-if '.deleted == true' \
-  --project '{id: .id, customer: .customer.id}'
+  --project '{
+    id: .id,
+    size: if(.amount >= $vars.cutoff, "large", "small"),
+    owner: coalesce(.owner.name, .owner.id, "unknown")
+  }'
 ```
+
+`--vars <object>` supplies one JSON-shaped constant object. Expressions access
+it through `$vars` paths such as `$vars.tenant`, `$vars.policy.cutoff`, and
+`$vars["non-identifier"]`. The object is parsed once during startup, may contain
+only literals, arrays, and objects, and is also validated by `--check`.
+Referencing `$vars` without `--vars` is a startup error.
 
 For each non-tombstone input, `jkq`:
 

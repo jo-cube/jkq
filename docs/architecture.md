@@ -86,6 +86,11 @@ paths, rejects expression nesting beyond 128 levels, and records whether JSON
 validation and original bytes are required. The backend uses simd-json's tape
 rather than an owned JSON tree and resolves only compiled paths.
 
+The optional `$vars` object is parsed once into immutable Rust constants during
+plan compilation. Variable paths borrow those constants during evaluation;
+they do not parse or allocate an object tree for each input record. Constant
+serialization is included in the projection output bound.
+
 Each worker owns its parser, tape, and scratch buffers, so evaluation needs no
 shared lock. Worker storage is reused across records and discarded after an
 input or tape allocation exceeds 8 MiB, preventing one exceptional record from
