@@ -2,6 +2,9 @@ use std::{collections::HashSet, fmt, sync::Arc};
 
 use super::syntax::{self, BinaryOp, Expr, ExprKind, Literal, Path, PathSegment, Span};
 
+// A finite f64 may serialize to 24 bytes even when its JSON token is only 3 bytes.
+const MAX_SOURCE_SERIALIZATION_FACTOR: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct TransformPlan {
     pub paths: Vec<Path>,
@@ -382,7 +385,7 @@ fn expression_bound(expression: &CompiledExpr) -> Result<OutputBound, ()> {
     Ok(match &expression.kind {
         CompiledKind::Literal(value) => literal_bound(value)?,
         CompiledKind::Slot(_) => OutputBound {
-            factor: 1,
+            factor: MAX_SOURCE_SERIALIZATION_FACTOR,
             constant: 0,
         },
         CompiledKind::Variable { root, path } => root
@@ -633,7 +636,7 @@ mod tests {
             JsonRequirement::AsNeeded,
         )
         .unwrap();
-        assert_eq!(projected.payload_budget().bytes(100).unwrap(), 303);
+        assert_eq!(projected.payload_budget().bytes(100).unwrap(), 1_703);
 
         let preserving = build_plan(
             &[],
@@ -643,7 +646,7 @@ mod tests {
             JsonRequirement::PreserveInvalid,
         )
         .unwrap();
-        assert_eq!(preserving.payload_budget().bytes(100).unwrap(), 403);
+        assert_eq!(preserving.payload_budget().bytes(100).unwrap(), 1_803);
 
         let pass_through = build_plan(
             &["true".to_owned()],
@@ -663,6 +666,6 @@ mod tests {
             JsonRequirement::AsNeeded,
         )
         .unwrap();
-        assert_eq!(variable.payload_budget().bytes(10).unwrap(), 30);
+        assert_eq!(variable.payload_budget().bytes(10).unwrap(), 100);
     }
 }

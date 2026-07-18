@@ -1285,6 +1285,7 @@ mod tests {
     #[test]
     fn compiled_payload_budget_covers_serialized_projections() {
         for (projection, input) in [
+            (".", b"1e15".as_slice()),
             (".value", br#"{"value":{"n":1e200,"s":"a\\nb"}}"#.as_slice()),
             ("[.value, .value]", br#"{"value":"repeated"}"#.as_slice()),
             (
