@@ -669,10 +669,10 @@ fn equal(left: &Value<'_>, right: &Value<'_>, span: Span) -> Result<bool, Transf
         return Ok(numeric_order(left, right) == Some(Ordering::Equal));
     }
     Ok(match (value_type(left), value_type(right)) {
-        (Type::Array | Type::Object, Type::Array | Type::Object) => {
+        (Type::Array | Type::Object, _) | (_, Type::Array | Type::Object) => {
             return Err(evaluation_error(
                 span,
-                "array and object equality is not supported",
+                "equality involving arrays or objects is not supported",
             ));
         }
         (Type::Null, Type::Null) => true,
@@ -1025,7 +1025,9 @@ mod tests {
     fn missing_equality_and_ordering_follow_the_language_contract() {
         assert_eq!(
             run(
-                &[".absent != 1 and not (.absent == 1) and not (.absent < 1)"],
+                &[
+                    ".absent != 1 and not (.absent == 1) and not (.absent == [1]) and not (.absent < 1)",
+                ],
                 &[],
                 None,
                 Some(b"{}"),
@@ -1033,6 +1035,16 @@ mod tests {
             .unwrap(),
             Action::Drop
         );
+    }
+
+    #[test]
+    fn equality_with_a_container_and_non_missing_value_errors() {
+        for expression in ["[1] == 1", "1 != {value: 1}", "in(1, [[1]])"] {
+            assert!(
+                run(&[expression], &[], None, Some(b"{}")).is_err(),
+                "{expression}"
+            );
+        }
     }
 
     #[test]

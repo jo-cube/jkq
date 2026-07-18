@@ -76,7 +76,8 @@ null, zero, empty strings, arrays, and objects are not booleans.
 Equality supports nulls, booleans, strings, and numbers. Numeric comparison
 works across signed, unsigned, and floating-point representations without first
 rounding every integer through `f64`. Different non-numeric types are unequal.
-Array and object equality is an evaluation error.
+Any equality comparison involving an array or object and a non-missing value is
+an evaluation error.
 
 `Missing == value` is false and `Missing != value` is true, including when both
 sides are missing. Ordering with a missing operand is false. Other ordering
