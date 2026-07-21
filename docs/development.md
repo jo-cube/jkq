@@ -10,7 +10,7 @@ src/main.rs              process entrypoint
 src/cli.rs               CLI and configuration
 src/app.rs               application assembly
 src/kafka.rs             direct Kafka input
-src/transform/           expression parser, compiler, and JSON backend
+src/transform/           startup JSONata plan and worker-local execution
 src/runtime.rs           bounded execution pipeline
 src/runtime/state.rs     admission and ordering state
 src/output.rs            formats and JSON envelopes
@@ -59,9 +59,11 @@ publication.
 
 Most tests live beside the code they cover:
 
-- lexer and parser tests freeze syntax and positioned errors;
-- compiler and evaluator tests freeze action precedence, missing/null
-  semantics, number behavior, depth limits, and error policies;
+- startup-plan tests freeze native JSONata parsing and strict `--vars`
+  validation;
+- transform tests freeze jkq's JSONata embedding contract: action precedence,
+  strict Boolean predicates, result serialization, state isolation, number
+  behavior, and error policies;
 - output tests use exact bytes for formatting, framing, headers, and envelopes;
 - runtime state tests deterministically exercise admission and partition
   frontiers;
@@ -86,10 +88,17 @@ When fixing a defect:
 Optimize the record path, not startup convenience. Preserve these properties:
 
 - exact source bytes for pass-through;
-- bounded queues and retained bytes;
+- bounded channels, admitted records, per-partition work, and owned source
+  bytes;
 - continued Kafka event polling during backpressure;
 - per-partition ordering unless `--unordered` is selected;
-- worker-local scratch reuse without unbounded retained capacity.
+- worker-local JSONata values and evaluator contexts without cross-record
+  state.
+
+Full JSONata can construct data-dependent intermediate and output values.
+`--max-inflight-bytes` does not bound those allocations, so performance smoke
+tests should include representative expressions and result sizes as well as
+source payloads.
 
 Use release builds and representative payloads for measurements. Record the
 hardware, compiler, command, input distribution, and median results. Do not add
@@ -101,16 +110,21 @@ question.
 The direct runtime dependencies are deliberately limited to:
 
 - `rdkafka`
-- `simd-json`
+- `jsonata-core`
 - `clap`
 - `crossbeam-channel`
 - `signal-hook`
 
-Before adding another, confirm that the standard library or an existing
-dependency is insufficient and that the new dependency removes meaningful
-risk or code. Do not add an async runtime, parser generator, jq engine, actor
-framework, or generic pipeline framework without a design change backed by a
-real requirement.
+`jsonata-core` is the sole expression engine and is used through its public
+`parser`, `evaluator`, and `value` APIs. Its default `simd` feature brings
+`simd-json` transitively; jkq does not depend on simd-json directly. Do not use
+jsonata-core's `_bench` module or other internal APIs.
+
+Before adding another dependency, confirm that the standard library or an
+existing dependency is insufficient and that the new dependency removes
+meaningful risk or code. Do not add an async runtime, parser generator, second
+expression engine, actor framework, or generic pipeline framework without an
+intentional architecture change.
 
 Dependabot checks Cargo and GitHub Actions dependencies weekly. Vulnerability
 alerts and security-only update pull requests also require the corresponding
@@ -124,7 +138,7 @@ Keep each fact in one place:
 |---|---|
 | root `README.md` | purpose, scope, quick start, build entrypoint |
 | `usage.md` | CLI workflows and output behavior |
-| `expression-language.md` | grammar and evaluation semantics |
+| `expression-language.md` | jkq's JSONata integration contract and deviations |
 | `architecture.md` | module boundaries, ownership, and invariants |
 | `development.md` | contributor workflow, tests, and dependencies |
 

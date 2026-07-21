@@ -1,56 +1,59 @@
 # Architecture
 
-`jkq` is a bounded, threaded pipeline around a directly assigned librdkafka
-consumer. The design optimizes the record path while keeping ownership,
-ordering, and shutdown visible.
+`jkq` is a threaded Kafka-to-JSONata pipeline around a directly assigned
+librdkafka consumer. The design keeps Kafka ownership, record actions,
+ordering, and shutdown visible while isolating jsonata-core's single-threaded
+runtime values inside compute workers.
 
 ```text
 CLI and Kafka properties
-→ compiled transform and output plans
+→ startup JSONata and output plans
 → direct assignment and offset resolution
-→ Kafka poller and admission control
-→ bounded JSON workers
+→ Kafka poller and source-byte admission control
+→ bounded JSONata workers
 → per-partition completion ordering
 → one output writer
 ```
 
-Plans that do not parse JSON skip the worker pool. The poller sends pass-through
-and tombstone completions directly to the writer.
+Plans that neither evaluate JSONata nor explicitly validate JSON bypass the
+worker pool. The poller sends pass-through and tombstone completions directly
+to the writer.
 
 ## Boundaries
 
 ```text
 src/main.rs                process exit behavior
-src/cli.rs                 parsing, validation, config, compiled plans
+src/cli.rs                 parsing, validation, config, startup plans
 src/app.rs                 process IO, signals, pipeline assembly
 src/kafka.rs               assignment, offsets, polling, owned records
-src/transform/syntax.rs    lexer and parser
-src/transform/compile.rs   path interning and execution plan
-src/transform/json.rs      simd-json backend and evaluator
+src/transform/mod.rs       startup JSONata source plan and validation
+src/transform/jsonata.rs   worker-local JSONata execution and actions
 src/runtime.rs             poller, workers, writer, shutdown, statistics
 src/runtime/state.rs       admission and completion-frontier state
 src/output.rs              compiled formats and JSON envelopes
 tests/process.rs           Unix process and signal behavior
 ```
 
-The modules are intentionally concrete. The JSON backend and output encoding
-are the only current replacement boundaries; the pipeline is not a generic
-framework.
+The transform modules call jsonata-core directly through its public parser,
+evaluator, context, and value APIs.
 
 ## Startup
 
 Before polling, `jkq`:
 
 1. parses and validates the CLI and librdkafka properties;
-2. parses and compiles all expressions;
-3. compiles the output format and its metadata requirements;
-4. creates the consumer and resolves partition starts and ends;
-5. assigns partitions directly;
-6. captures snapshot high watermarks when requested;
+2. parses every JSONata expression and validates the strict JSON `--vars`
+   object;
+3. stores only expression source and variable JSON in the shared transform
+   plan;
+4. compiles the output format and its metadata requirements;
+5. creates the consumer and resolves partition starts and ends;
+6. assigns partitions directly and captures snapshot high watermarks when
+   requested;
 7. installs the bounded pipeline.
 
-A startup failure cannot produce partial record output.
-`--check` exits after compiling the local plans and does not create a consumer.
+A startup failure cannot produce partial record output. `--check` exits after
+local plan validation and does not create a consumer.
 
 The Kafka adapter calls `assign`, never `subscribe`. Automatic commits and
 offset storage are disabled. The poller is the only thread that calls the
@@ -59,8 +62,8 @@ consumer, including pause and resume.
 ## Record Ownership
 
 librdkafka messages are borrowed. The poller copies the payload and only the
-metadata required by the compiled output plan, then releases the borrowed
-message. It never mutates librdkafka-owned memory.
+source metadata required by the compiled output plan, then releases the
+borrowed message. It never mutates librdkafka-owned memory.
 
 Each admitted input gets a dense local partition sequence. Kafka offsets remain
 source metadata; the local sequence drives completion ordering even when
@@ -77,42 +80,42 @@ Project(compact JSON bytes)
 
 Every admitted record produces one completion, including drops and fatal
 transform results. This lets the partition completion frontier advance and
-releases accounting exactly once.
+releases source-byte accounting exactly once.
 
-## JSON Execution
+## JSONata Execution
 
-The transform compiler parses expressions once, interns identical complete
-paths, rejects expression nesting beyond 128 levels, and records whether JSON
-validation and original bytes are required. The backend uses simd-json's tape
-rather than an owned JSON tree and resolves only compiled paths.
+The startup plan contains `String` expression sources and optional variable
+JSON, all safe to share across worker threads. Each worker parses its own
+JSONata ASTs and `$vars` value because jsonata-core values use `Rc` and are not
+`Send` or `Sync`.
 
-The optional `$vars` object is parsed once into immutable Rust constants during
-plan compilation. Variable paths borrow those constants during evaluation;
-they do not parse or allocate an object tree for each input record. Constant
-serialization is included in the projection output bound.
+For a non-tombstone input, the worker validates UTF-8 and parses the payload
+once with `JValue::from_json_str`. The same worker-local document is used for
+all drop predicates, tombstone predicates, and the optional projection.
+Original payload bytes remain untouched for an eventual pass action or the
+invalid-JSON `pass` policy.
 
-Each worker owns its parser, tape, and scratch buffers, so evaluation needs no
-shared lock. Worker storage is reused across records and discarded after an
-input or tape allocation exceeds 8 MiB, preventing one exceptional record from
-permanently growing every worker.
+jsonata-core's `Evaluator` retains its first parent/root value. jkq therefore
+does not reuse evaluators: it creates a fresh `Context` and `Evaluator` for
+every expression evaluation and binds the worker-local `$vars` value into that
+context. This prevents a root document, assignment, lambda, or other context
+state from leaking between expressions or input records.
 
-When pass-through remains possible, the source payload stays unchanged and a
-worker-local copy is parsed. When every successful record is projected and no
-error policy needs the original, the owned payload can be parsed in place.
-An identity transform bypasses parsing unless `--on-invalid-json` is supplied
-explicitly.
+Predicates run in command-line order and must return a Boolean. Projection
+results are checked recursively for `Undefined` and non-JSON internal values,
+then serialized through `JValue::to_json_string`. jsonata-core result sequences
+remain one value and therefore one jkq output record.
 
-The backend validates container ranges iteratively and rejects nesting beyond
-128 levels through the invalid-JSON policy. Projection serialization is
-recursive within that bound and moves its completed `Vec<u8>` to the writer.
+jsonata-core 2.2.7 does not expose its bytecode compiler as a stable production
+Rust API. Workers therefore use the public AST evaluator. jkq does not use the
+feature-gated internal `_bench` facade.
 
-The current plan performs independent tape lookups for distinct paths. A
-shared-prefix trie is deliberately absent until representative profiling shows
-it improves real workloads.
+Existing Kafka tombstones bypass all JSONata work. An identity transform also
+bypasses parsing unless `--on-invalid-json` was supplied explicitly.
 
 ## Ordering and Output
 
-JSON workers may process records from the same partition concurrently.
+JSONata workers may process records from the same partition concurrently.
 Completions enter a per-partition frontier:
 
 ```text
@@ -126,62 +129,72 @@ completion arrival order instead.
 
 One writer owns stdout. Formats and JSON envelopes stream directly to its
 buffer, avoiding byte interleaving and an additional record-sized staging
-buffer. Broken pipe is treated as normal pipeline termination.
+buffer. `%s`, `%S`, `%R`, envelopes, and action names operate on the
+post-transform action. Broken pipe is normal pipeline termination.
 
-## Backpressure
+## Backpressure and Memory Accounting
 
-Admission tracks global records, retained bytes, and records per partition.
-The retained-byte charge conservatively covers:
+Admission tracks global records, source bytes, and records per partition. The
+byte charge covers owned bytes copied from the source record:
 
-- the owned payload;
-- an original-preserving parse copy when required;
-- the maximum projected output implied by the expression;
-- copied keys, header names, and header values.
+- payload;
+- key, when required;
+- header names and header values, when required.
+
+The charge intentionally excludes jsonata-core's parsed value tree,
+evaluation intermediates, and projected output. Full JSONata can construct
+data-dependent values, so total evaluator and output memory cannot be bounded
+by a static expression compiler. Bounded channels, `--max-inflight-records`,
+`--max-inflight-per-partition`, and the owned source-byte admission budget
+still bound queued source work.
 
 Charges are released only after ordered write or drop. Slow output therefore
-propagates pressure back to Kafka, and the reorder buffer cannot grow beyond
-admission limits.
+propagates pressure back to Kafka, and the reorder buffer cannot hold more
+records than admission permits.
 
 Global pressure pauses all selected partitions. Per-partition record pressure
 pauses only that partition. Resume uses a 75% low-water threshold to avoid
 thrashing. The poller continues serving Kafka events while paused.
 
-Because a record's size is known only after polling, at most one owned record
-may wait outside admitted accounting. A record larger than the byte budget is
-admitted only when no other admitted bytes remain, preventing deadlock while
-keeping oversized work single-file.
+Because a source record's size is known only after polling, at most one owned
+record may wait outside admitted accounting. A source record larger than the
+byte budget is admitted only when no other admitted bytes remain, preventing
+deadlock while preserving the runs-alone behavior.
 
 ## Termination and Failure
 
 Fixed ranges use exclusive end offsets. Snapshot boundaries are captured once
 and never extended. Completion means that the poller has stopped admitting the
-range and every admitted sequence has crossed its frontier.
+range and every admitted partition sequence has crossed its frontier.
 
 Global counts stop all admission after the configured number of input records.
-Per-partition counts mark each partition complete independently after its limit;
-already admitted records still cross the normal completion frontier.
+Per-partition counts mark each partition complete independently after its
+limit; already admitted records still cross the normal completion frontier.
 
 The first fatal error wins. It triggers shared cancellation, closes the work
 path, and drains retained work. The ordered writer emits preceding in-order
 records, emits nothing after the first fatal result, and releases accounting
-for every completion. Worker and writer panics are converted to pipeline
-failures rather than leaving another stage blocked.
+for every completion. Worker and writer panics become pipeline failures rather
+than leaving another stage blocked.
 
 The first termination signal stops admission and drains. signal-hook arms the
-second signal for immediate process exit, which also handles a worker or stdout
-that cannot make progress.
+second signal for immediate process exit, which also handles a worker or
+stdout that cannot make progress.
 
 ## Invariants
 
 - One invocation consumes one topic and explicitly selected partitions.
+- JSONata is the only expression language.
 - Every non-tombstone input resolves to exactly one action.
 - One input never expands into multiple output records.
-- Existing tombstones bypass JSON and remain tombstones.
+- Existing tombstones bypass JSON and JSONata and remain tombstones.
 - Pass-through preserves exact source payload bytes.
 - Ordering is per partition, never global.
 - Count limits apply to admitted input, not emitted output.
 - Per-partition count limits apply independently to each selected partition.
 - Tombstones, empty payloads, and JSON `null` remain distinct.
-- Queues, admitted records, and retained bytes are bounded.
+- Channels, admitted record counts, per-partition records, and owned source
+  bytes are bounded; JSONata intermediates and projected output are not covered
+  by the byte budget.
 - stdout is record data; diagnostics and statistics use stderr.
 - Errors follow explicit policy and are never silently successful.

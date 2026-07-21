@@ -1,200 +1,116 @@
-# Expression Language
+# JSONata Integration
 
-`jkq` provides a restricted, jq-inspired language for predicates and
-projections. One expression evaluates against one JSON document and produces
-one value or one error; it never produces a stream of values.
+`jkq` uses native JSONata for every drop predicate, tombstone predicate, and
+projection. The [JSONata documentation](https://docs.jsonata.org/) defines the
+language, and [jsonata-js](https://github.com/jsonata-js/jsonata) is the
+semantic reference implementation.
 
-## Paths and Literals
+The runtime implementation is the public Rust API of
+[`jsonata-core`](https://github.com/txjmb/jsonata-core), currently version
+2.2.7. Expressions use JSONata syntax directly:
 
-Paths start at the input root:
-
-```text
-.
-.id
-.customer.id
-.items[0].sku
-.["customer-id"]
-.["a.b"]
+```sh
+--drop-if 'environment != "production"'
+--tombstone-if 'deleted = true'
+--project '{"id": id, "total": $sum(items.price)}'
 ```
 
-`.` selects the complete input document. Dot fields use identifiers. Bracket
-fields use JSON strings. Array indices are non-negative integers. There are no
-wildcards, slices, implicit iteration, or recursive descent.
+JSONata uses bare input paths such as `customer.id`, `=` for equality,
+`$`-prefixed built-ins, quoted object keys, and native conditionals, paths,
+sequences, functions, variables, and assignments.
 
-Supported literals are JSON null, booleans, strings, and practical signed,
-unsigned, and floating-point numbers:
+## Startup and Record Evaluation
+
+Every configured JSONata expression is parsed during CLI resolution. A parse
+failure is a command-line error and exits with status 2 before Kafka
+consumption. `--check` performs the same parsing and variable validation
+without creating a Kafka consumer.
+
+For each non-tombstone input record, `jkq` parses the payload into one
+jsonata-core value and reuses it while it:
+
+1. evaluates `--drop-if` expressions in command-line order, stopping at the
+   first Boolean `true`;
+2. evaluates `--tombstone-if` expressions in command-line order, stopping at
+   the first Boolean `true`;
+3. evaluates `--project`, when present;
+4. otherwise passes through the exact source payload bytes.
+
+Existing Kafka tombstones bypass JSON parsing and every expression. One input
+record always produces one action; a JSONata result sequence never expands
+into multiple jkq output records.
+
+## Action Predicates
+
+The top-level result of `--drop-if` and `--tombstone-if` must be the JSONata
+Boolean `true` or `false`. `Undefined`, null, numbers, strings, arrays,
+objects, functions, and regular expressions are evaluation errors governed by
+`--on-eval-error`.
+
+This strict embedding boundary applies only to the final action result. Native
+JSONata effective-Boolean rules still apply inside path filters, conditionals,
+`and`, `or`, `$boolean`, and other language constructs.
+
+## Projection Results
+
+A successful projection is serialized as compact JSON. JSONata result
+sequences with multiple values are serialized as one JSON array payload:
 
 ```text
-null  true  false  42  -7  12.5  "hello"
+items.price  ->  [2,3]
 ```
 
-A path that cannot be traversed produces `Missing`. Missing is an internal
-state, not JSON `null`.
+Top-level `Undefined` is an evaluation error. A function, regular expression,
+or any other non-JSON internal value is also an error, including when nested
+inside an array or object. jkq checks the value tree before serialization so
+jsonata-core cannot silently convert such values to null, an empty string, or
+another JSON-looking representation. A serialization failure is an evaluation
+error.
+
+Native JSONata sequence flattening, missing-value behavior, and object-property
+omission otherwise apply. A projected JSON `null` is the four-byte payload
+`null`; it is not a Kafka tombstone.
 
 ## Variables
 
-`--vars` supplies one immutable JSON-shaped object that is parsed at startup:
+`--vars` accepts exactly one strict JSON object:
 
 ```sh
---vars '{tenant: "acme", policy: {cutoff: 1000}, statuses: ["open", "pending"]}'
+--vars '{"tenant":"acme","cutoff":1000}'
 ```
 
-Expressions access it through the reserved `$vars` root:
+Invalid JSON and non-object roots fail during startup and `--check`.
+Expressions access the immutable object as `$vars`, for example
+`$vars.tenant` and `$vars.cutoff`.
 
-```text
-$vars.tenant
-$vars.policy.cutoff
-$vars.statuses[0]
-$vars["non-identifier"]
-```
+Each expression evaluation receives a clean JSONata context containing the
+same worker-local variable value. JSONata assignments are scoped normally
+within that expression, but evaluator state, assignments, the root document,
+and variable mutations do not carry into another expression or input record.
 
-Variable paths use the same field and index syntax and the same `Missing`
-semantics as input paths. The variables object may contain only nulls,
-booleans, numbers, strings, arrays, and objects. Duplicate keys, non-object
-roots, and record-dependent expressions are rejected at startup. Variables are
-constants: there is no assignment or per-record mutation. The object uses
-projection syntax, so identifier keys may be bare and other keys must be JSON
-strings.
+## Numbers
 
-## Operators
+jsonata-core uses JSONata and IEEE-754 `f64` number semantics. Integers outside
+the exactly representable range can lose precision while the payload is
+parsed. For example, projecting an input value of `9007199254740993` produces
+`9007199254740992`.
 
-From lowest to highest precedence:
+## Errors and Upstream Deviations
 
-1. `or`
-2. `and`
-3. `==`, `!=`, `<`, `<=`, `>`, `>=`
-4. unary `not`
-5. primary expressions
+Invalid UTF-8 or malformed JSON follows `--on-invalid-json`. JSONata runtime
+failures, strict predicate-result failures, `Undefined` projections, non-JSON
+results, and serialization failures follow `--on-eval-error`. Runtime errors
+identify the drop predicate, tombstone predicate, or projection and are
+wrapped with topic, partition, and offset by the pipeline. Diagnostics never
+include source payload contents.
 
-Comparisons cannot be chained. A comparison result may be compared when the
-nested comparison is explicitly parenthesized. Use parentheses when precedence
-is not obvious.
+jkq exposes useful jsonata-core parser and evaluator messages but does not
+invent byte positions that its public API does not reliably provide. When
+jsonata-core differs from jsonata-js, jkq reports and documents the dependency
+behavior directly.
 
-Boolean operators require booleans and short-circuit. There is no truthiness:
-null, zero, empty strings, arrays, and objects are not booleans.
-
-Equality supports nulls, booleans, strings, and numbers. Numeric comparison
-works across signed, unsigned, and floating-point representations without first
-rounding every integer through `f64`. Different non-numeric types are unequal.
-Any equality comparison involving an array or object and a non-missing value is
-an evaluation error.
-
-`Missing == value` is false and `Missing != value` is true, including when both
-sides are missing. Ordering with a missing operand is false. Other ordering
-requires two numbers or two strings.
-
-## Functions
-
-| Function | Behavior |
-|---|---|
-| `exists(value)` | true unless the value is missing; null exists |
-| `missing(value)` | true only for missing |
-| `is_null(value)` | JSON null check |
-| `is_boolean(value)` | boolean type check |
-| `is_number(value)` | numeric type check |
-| `is_string(value)` | string type check |
-| `is_array(value)` | array type check |
-| `is_object(value)` | object type check |
-| `contains(string, part)` | case-sensitive substring check |
-| `starts_with(string, prefix)` | case-sensitive prefix check |
-| `ends_with(string, suffix)` | case-sensitive suffix check |
-| `length(value)` | Unicode scalar count, array length, or object field count |
-| `coalesce(value, ..., fallback)` | first non-missing, non-null value; accepts at least two arguments |
-| `if(condition, when_true, when_false)` | selected branch; the other branch is not evaluated |
-| `in(value, array)` | scalar membership using the language's equality rules |
-
-Type checks return false for missing. String functions return false for missing
-arguments and error on other non-string arguments. `length(Missing)` produces
-Missing; unsupported scalar types are errors.
-
-`coalesce` evaluates arguments from left to right and stops at the first value
-that is neither missing nor null. Its final argument is returned as-is, so an
-all-missing call still produces Missing. `if` requires a boolean condition and
-evaluates only the selected branch.
-
-`in` returns false when the value or array is missing. Its second argument must
-otherwise be an array, and its first argument must be a scalar. Numeric
-membership uses the same exact cross-representation comparison as `==`. A
-scalar is null, a boolean, a number, or a string.
-
-## Projections
-
-Arrays and objects construct compact JSON:
-
-```text
-[.location.latitude, .location.longitude]
-```
-
-```text
-{
-  id: .id,
-  owner: coalesce(.owner.name, "unknown"),
-  active: .status == "active"
-}
-```
-
-Object keys may be identifiers or JSON strings. Their expression order is
-preserved in output. Duplicate object keys are rejected. A missing array
-element, object value, or top-level projection result is an evaluation error;
-use `coalesce` when a default is intended.
-
-A projection may return any JSON value, including a scalar or JSON `null`.
-Projected `null` is the four-byte payload `null`, not a Kafka tombstone.
-
-## Predicates and Record Actions
-
-`--drop-if` and `--tombstone-if` require a boolean result. Repeated predicates
-short-circuit in command-line order:
-
-```text
-drop predicates
-→ tombstone predicates
-→ projection, when present
-→ exact pass-through
-```
-
-Kafka tombstones bypass the expression program.
-
-Examples:
-
-```sh
---drop-if '.environment != "production"'
---drop-if 'missing(.id)'
---tombstone-if 'exists(.expires_at) and .expires_at <= 1720000000000'
---project '{id: .id, plan: coalesce(.plan, "unknown")}'
-```
-
-## Errors and Limits
-
-Parse errors include an expression category and byte position. Evaluation
-errors identify the failing expression and, while processing records, the
-topic, partition, and offset.
-
-Expressions nested more than 128 levels are rejected at startup. JSON nested
-more than 128 arrays or objects is treated as invalid JSON. Source objects with
-duplicate keys follow simd-json's effective lookup behavior and are not
-separately diagnosed.
-
-The variables object follows the expression nesting limit and is included in
-the compiled projection-size bound. It is never reparsed for individual input
-records.
-
-The language intentionally omits pipes, multiple results, assignments,
-reductions, sorting, grouping, joins, regular expressions, user functions,
-modules, and automatic omission of missing object fields.
-
-## Grammar
-
-```text
-expression      := or_expression
-or_expression   := and_expression { "or" and_expression }
-and_expression  := comparison { "and" comparison }
-comparison      := unary [ comparison_operator unary ]
-unary           := [ "not" ] primary
-primary         := literal | path | variable | call | array | object | "(" expression ")"
-variable        := "$vars" { "." identifier | "[" (string | nonnegative_integer) "]" }
-call            := identifier "(" [ expression { "," expression } ] ")"
-array           := "[" [ expression { "," expression } ] "]"
-object          := "{" [ object_field { "," object_field } ] "}"
-object_field    := (identifier | string) ":" expression
-```
+One known jsonata-core 2.2.7 deviation is that a regular-expression literal
+used directly as an object-constructor value, such as `{"value": /x/}`, is
+rejected during parsing, while jsonata-js 2.2.2 accepts that syntax. jkq reports
+the startup parse error. A top-level regular expression is parsed by
+jsonata-core, then rejected by jkq because it is not a JSON projection result.

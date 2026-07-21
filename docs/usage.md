@@ -62,21 +62,22 @@ Transform options are compiled before consumption:
 
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \
-  --vars '{tenant: "acme", cutoff: 1000, statuses: ["open", "pending"]}' \
-  --drop-if '.tenant != $vars.tenant or not in(.status, $vars.statuses)' \
-  --tombstone-if '.deleted == true' \
+  --vars '{"tenant":"acme","cutoff":1000,"statuses":["open","pending"]}' \
+  --drop-if 'tenant != $vars.tenant or $not(status in $vars.statuses)' \
+  --tombstone-if 'deleted = true' \
   --project '{
-    id: .id,
-    size: if(.amount >= $vars.cutoff, "large", "small"),
-    owner: coalesce(.owner.name, .owner.id, "unknown")
+    "id": id,
+    "size": amount >= $vars.cutoff ? "large" : "small",
+    "owner": owner.name ?? owner.id ?? "unknown"
   }'
 ```
 
-`--vars <object>` supplies one JSON-shaped constant object. Expressions access
-it through `$vars` paths such as `$vars.tenant`, `$vars.policy.cutoff`, and
-`$vars["non-identifier"]`. The object is parsed once during startup, may contain
-only literals, arrays, and objects, and is also validated by `--check`.
-Referencing `$vars` without `--vars` is a startup error.
+All expressions use native [JSONata](https://jsonata.org/) syntax and semantics.
+`--vars <object>` accepts one strict JSON object and binds it as `$vars` for
+every expression. Invalid JSON and non-object roots are startup errors and are
+also rejected by `--check`. Expressions access values through paths such as
+`$vars.tenant`, `$vars.policy.cutoff`, and `$vars["non-identifier"]`.
+Referencing `$vars` without supplying it evaluates as JSONata `Undefined`.
 
 For each non-tombstone input, `jkq`:
 
@@ -85,11 +86,17 @@ For each non-tombstone input, `jkq`:
 3. applies the optional `--project` expression;
 4. otherwise passes the exact source bytes through.
 
-Each predicate list stops at its first true result. An existing Kafka
-tombstone bypasses predicates and projection.
+Each predicate list stops at its first Boolean `true` result. The top-level
+result of an action predicate must be a JSONata Boolean; JSONata truthiness is
+not applied at this external boundary. An existing Kafka tombstone bypasses
+JSON parsing, predicates, and projection.
 
-See [expression-language.md](expression-language.md) for the supported
-language. It is jq-inspired but intentionally much smaller.
+Projection results are compact JSON. `Undefined`, functions, regular
+expressions, nested non-JSON values, and serialization failures are evaluation
+errors. A result sequence with multiple items is one JSON array payload, never
+multiple output records. See [expression-language.md](expression-language.md)
+for the complete jkq-to-JSONata integration contract and links to the language
+reference.
 
 ## Output
 
@@ -163,9 +170,13 @@ failures into an explicit action:
 | `--on-eval-error` | `fail`, `drop`, `tombstone` |
 | `--on-kafka-error` | `fail`, `continue` |
 
-`pass` preserves the original payload exactly. JSON nested more than 128
-arrays or objects is handled by the invalid-JSON policy. Fatal Kafka state
-errors remain fatal even when `--on-kafka-error continue` is selected.
+`pass` preserves the original payload exactly. Fatal Kafka state errors remain
+fatal even when `--on-kafka-error continue` is selected.
+
+JSONata parse errors are command-line errors. Runtime evaluation errors name
+the failing drop predicate, tombstone predicate, or projection. The pipeline
+adds topic, partition, and offset context without including source payload
+contents.
 
 When `--on-invalid-json` is omitted and no expression needs JSON, the identity
 path does not parse payloads. Supplying the option explicitly forces JSON
@@ -202,15 +213,21 @@ These limits bound admitted work:
 
 | Option | Default |
 |---|---:|
-| `--max-inflight-records` | `1024` |
+| `--max-inflight-records` | `8192` |
 | `--max-inflight-bytes` | `256MiB` |
-| `--max-inflight-per-partition` | `256` |
+| `--max-inflight-per-partition` | `8192` |
 
-Sizes accept bytes or `KiB`, `MiB`, and `GiB`. The byte charge conservatively
-covers owned input, required parsing copies, projected output, keys, and
-headers. A record larger than the byte budget may run alone. When limits are
-reached, `jkq` pauses affected partitions while continuing to serve Kafka
-events.
+Sizes accept bytes or `KiB`, `MiB`, and `GiB`. `--max-inflight-bytes` is an
+admission budget for owned source record bytes and copied source metadata: the
+payload, key, header names, and header values required by the output plan. It
+does not account for jsonata-core's parsed value tree, evaluation
+intermediates, or projected output. Full JSONata can construct data-dependent
+results, so those allocations are not statically bounded by this option.
+
+A source record larger than the byte budget may run alone. When admission
+limits are reached, `jkq` pauses affected partitions while continuing to serve
+Kafka events. Channels, admitted record counts, per-partition admission, and
+source-byte accounting remain bounded.
 
 ## Statistics, Signals, and Exit Status
 
