@@ -242,6 +242,19 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_offsets_fail_even_when_record_errors_continue() {
+        let fixture = Fixture::new("out-of-range-offset", 1);
+        fixture.produce(0, Some(b"0"), None, 0, None);
+        let config = fixture.config(&["-p", "0", "-o", "100", "--on-kafka-error", "continue"]);
+        let mut input = KafkaInput::prepare(&config).unwrap();
+
+        let error = (0..20)
+            .find_map(|_| input.poll().err())
+            .expect("out-of-range offset did not produce a Kafka error");
+        assert!(error.starts_with("Kafka offset error:"), "{error}");
+    }
+
+    #[test]
     fn count_counts_drops_and_eof_drains_the_partition() {
         let fixture = Fixture::new("count-eof", 1);
         for value in 0..3 {

@@ -290,6 +290,7 @@ impl RawCli {
             kafka_properties.insert(key.to_owned(), value.to_owned());
         }
         for key in [
+            "auto.offset.reset",
             "enable.auto.commit",
             "enable.auto.offset.store",
             "enable.partition.eof",
@@ -744,6 +745,7 @@ mod tests {
     #[test]
     fn runtime_owned_kafka_properties_are_rejected() {
         for property in [
+            "auto.offset.reset=latest",
             "enable.auto.commit=true",
             "enable.auto.offset.store=true",
             "enable.partition.eof=false",

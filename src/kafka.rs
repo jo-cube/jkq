@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, time::Duration};
 use rdkafka::{
     ClientConfig, Message,
     consumer::{BaseConsumer, Consumer},
-    error::KafkaError,
+    error::{KafkaError, RDKafkaErrorCode},
     message::{Headers, Timestamp as KafkaTimestamp},
     topic_partition_list::{Offset, TopicPartitionList},
 };
@@ -189,6 +189,9 @@ impl KafkaInput {
                 self.handle_eof(partition)?;
                 return Ok(PollEvent::Idle);
             }
+            Err(error) if error.rdkafka_error_code() == Some(RDKafkaErrorCode::AutoOffsetReset) => {
+                return Err(format!("Kafka offset error: {error}"));
+            }
             Err(error @ KafkaError::MessageConsumptionFatal(_)) => {
                 return Err(format!("fatal Kafka consumer error: {error}"));
             }
@@ -345,6 +348,7 @@ fn create_consumer(config: &RuntimeConfig) -> Result<BaseConsumer, String> {
         client.set("group.id", "jkq");
     }
     client
+        .set("auto.offset.reset", "error")
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("enable.partition.eof", "true");

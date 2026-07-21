@@ -36,6 +36,8 @@ The default start is `beginning`. `-o, --offset` accepts:
 | `e@1720000000000` | exclusive timestamp end |
 
 A timestamp with no matching record resolves to the current high watermark.
+An unavailable absolute offset is an error; `jkq` never silently resets it to
+the beginning or end of the partition.
 
 `--end-offset <offset>` sets an exclusive offset end for every selected
 partition. It cannot be combined with `e@...`.
@@ -170,8 +172,9 @@ failures into an explicit action:
 | `--on-eval-error` | `fail`, `drop`, `tombstone` |
 | `--on-kafka-error` | `fail`, `continue` |
 
-`pass` preserves the original payload exactly. Fatal Kafka state errors remain
-fatal even when `--on-kafka-error continue` is selected.
+`pass` preserves the original payload exactly. Fatal Kafka state errors and
+unavailable requested offsets remain fatal even when `--on-kafka-error
+continue` is selected.
 
 JSONata parse errors are command-line errors. Runtime evaluation errors name
 the failing drop predicate, tombstone predicate, or projection. The pipeline
@@ -193,6 +196,7 @@ value, including surrounding whitespace.
 `jkq` owns these properties and rejects attempts to set them:
 
 ```text
+auto.offset.reset
 enable.auto.commit
 enable.auto.offset.store
 enable.partition.eof
