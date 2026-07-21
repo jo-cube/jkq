@@ -1,0 +1,13 @@
+[package]
+name = "jkq"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+crossbeam-channel = "0.5.16"
+jsonata-core = "2.2.7"
+rdkafka = { version = "0.39.0", default-features = false, features = ["libz", "ssl-vendored"] }
+signal-hook = "0.4.4"
