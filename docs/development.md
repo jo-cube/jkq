@@ -50,10 +50,12 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ```
 
-CI runs the same checks. Tags matching `v*` run the release checks, build native
-Linux amd64, Linux arm64, and macOS arm64 archives, and attach each archive and
-its SHA-256 checksum to the GitHub release. There is no installer or crates.io
-publication.
+CI runs the same checks. A release tag must match the package version, such as
+`v0.1.0`. Release jobs build native Linux amd64, Linux arm64, and macOS arm64
+archives, execute each binary as a smoke test, and attach each archive and its
+SHA-256 checksum to the GitHub release. GNU binaries are built on Ubuntu 26.04;
+build locally when compatibility with an older glibc-based system is required.
+There is no installer or crates.io publication.
 
 ## Tests
 
