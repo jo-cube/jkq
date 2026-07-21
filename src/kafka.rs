@@ -160,10 +160,27 @@ impl KafkaInput {
     }
 
     pub fn poll(&mut self) -> Result<PollEvent, String> {
+        self.poll_with_timeout(POLL_TIMEOUT)
+    }
+
+    pub fn poll_nonblocking(&mut self) -> Result<PollEvent, String> {
+        self.poll_with_timeout(Duration::ZERO)
+    }
+
+    pub fn all_active_partitions_paused(&self) -> bool {
+        self.remaining_partitions > 0
+            && self
+                .partitions
+                .values()
+                .filter(|state| !state.done)
+                .all(|state| state.paused)
+    }
+
+    fn poll_with_timeout(&mut self, timeout: Duration) -> Result<PollEvent, String> {
         if self.remaining_partitions == 0 {
             return Ok(PollEvent::Done);
         }
-        let Some(result) = self.consumer.poll(POLL_TIMEOUT) else {
+        let Some(result) = self.consumer.poll(timeout) else {
             return Ok(PollEvent::Idle);
         };
         let message = match result {

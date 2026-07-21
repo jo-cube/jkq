@@ -68,6 +68,12 @@ impl Admission {
             || (self.total_bytes == 0 && bytes > self.limits.max_inflight_bytes)
     }
 
+    pub fn should_wait_for_capacity(&self) -> bool {
+        self.total_records >= self.limits.max_inflight_records
+            || self.total_bytes >= self.limits.max_inflight_bytes
+            || self.partitions.values().all(|state| state.limited)
+    }
+
     pub fn reserve(&mut self, partition: i32, bytes: usize) -> Result<u64, String> {
         if !self.can_reserve(partition, bytes) {
             return Err("record admitted without available capacity".to_owned());
@@ -327,6 +333,7 @@ mod tests {
                 .unwrap();
             admission.update_global_limit(false);
             assert_eq!(admission.global_limited, expected_limited);
+            assert_eq!(admission.should_wait_for_capacity(), expected_limited);
         }
         for _ in 0..2 {
             admission

@@ -430,11 +430,32 @@ fn poll_loop(
             pending = None;
             dispatcher.take();
         }
+        if !stopping && pending.is_none() && admission.should_wait_for_capacity() {
+            match release_rx.recv_timeout(CONTROL_POLL) {
+                Ok(release) => {
+                    if let Err(release_error) = admission.release(release) {
+                        runtime_failure(&first_failure, &shutdown, release_error);
+                    }
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    runtime_failure(
+                        &first_failure,
+                        &shutdown,
+                        "completion release channel closed early".to_owned(),
+                    );
+                    stopping = true;
+                    dispatcher.take();
+                }
+            }
+        }
         if let Err(pause_error) = admission.sync_pauses(&mut input, stopping, pending.is_some()) {
             runtime_failure(&first_failure, &shutdown, pause_error);
             stopping = true;
             dispatcher.take();
         }
+        let all_paused = input.all_active_partitions_paused();
         report_periodic(config, &stats, started, &mut next_stats);
 
         if stopping {
@@ -491,19 +512,41 @@ fn poll_loop(
                 }
             } else {
                 pending = Some(record);
-                match input.poll() {
-                    Ok(PollEvent::Record(_)) => {
-                        runtime_failure(
-                            &first_failure,
-                            &shutdown,
-                            "Kafka returned a record while all partitions were paused for byte backpressure"
-                                .to_owned(),
-                        );
+            }
+            if pending.is_none() {
+                continue;
+            }
+        }
+
+        if all_paused {
+            match release_rx.recv_timeout(CONTROL_POLL) {
+                Ok(release) => {
+                    if let Err(release_error) = admission.release(release) {
+                        runtime_failure(&first_failure, &shutdown, release_error);
                     }
-                    Ok(PollEvent::Done | PollEvent::Idle) => {}
-                    Err(poll_error) => {
-                        runtime_failure(&first_failure, &shutdown, poll_error);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    match input.poll_nonblocking() {
+                        Ok(PollEvent::Record(_)) => {
+                            runtime_failure(
+                                &first_failure,
+                                &shutdown,
+                                "Kafka returned a record while all partitions were paused for byte backpressure"
+                                    .to_owned(),
+                            );
+                        }
+                        Ok(PollEvent::Done | PollEvent::Idle) => {}
+                        Err(poll_error) => {
+                            runtime_failure(&first_failure, &shutdown, poll_error);
+                        }
                     }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    runtime_failure(
+                        &first_failure,
+                        &shutdown,
+                        "completion release channel closed early".to_owned(),
+                    );
                 }
             }
             continue;

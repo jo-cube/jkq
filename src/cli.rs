@@ -16,9 +16,9 @@ use crate::{
     },
 };
 
-const DEFAULT_MAX_INFLIGHT_RECORDS: usize = 1_024;
+const DEFAULT_MAX_INFLIGHT_RECORDS: usize = 8_192;
 const DEFAULT_MAX_INFLIGHT_BYTES: &str = "256MiB";
-const DEFAULT_MAX_INFLIGHT_PER_PARTITION: usize = 256;
+const DEFAULT_MAX_INFLIGHT_PER_PARTITION: usize = 8_192;
 const MAX_SELECTED_PARTITIONS: usize = 100_000;
 
 #[derive(Debug, Parser)]
