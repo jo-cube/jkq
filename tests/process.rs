@@ -119,11 +119,11 @@ fn check_validates_locally_without_connecting() {
             "-p",
             "0-2",
             "--drop-if",
-            "not is_object(.) or not in(.status, $vars.allowed)",
+            "$not(status in $vars.allowed)",
             "--vars",
-            "{allowed: [\"open\"], fallback: \"unknown\"}",
+            r#"{"allowed":["open"],"fallback":"unknown"}"#,
             "--project",
-            "{status: if(.status == \"open\", .status, $vars.fallback), value: coalesce(.a, .b, null)}",
+            r#"{"status": status = "open" ? status : $vars.fallback, "value": a ?? b ?? null}"#,
             "-f",
             "%a:%s\\n",
             "--check",
@@ -137,6 +137,31 @@ fn check_validates_locally_without_connecting() {
     assert!(output.status.success(), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn check_rejects_jsonata_and_variables_without_connecting() {
+    for arguments in [
+        vec!["--drop-if", "environment == \"production\""],
+        vec!["--vars", "{tenant: \"acme\"}"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_jkq"))
+            .args([
+                "-b",
+                "unreachable.invalid:9092",
+                "-t",
+                "events",
+                "-p",
+                "0",
+                "--check",
+            ])
+            .args(arguments)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
 }
 
 #[test]

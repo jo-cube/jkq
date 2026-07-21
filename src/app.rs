@@ -319,4 +319,25 @@ mod tests {
             b"0:{\"value\":0}\n1:{\"value\":1}\n2:{\"value\":2}\n"
         );
     }
+
+    #[test]
+    fn jsonata_projection_runs_through_the_mock_kafka_pipeline() {
+        let fixture = Fixture::new("jsonata-pipeline", 1);
+        fixture.produce(0, Some(b"{}"), None, 0, None);
+        let config = fixture.config(&[
+            "-p",
+            "0",
+            "--snapshot",
+            "--max-inflight-bytes",
+            "2",
+            "--project",
+            "$pad(\"\", 1024, \"x\")",
+            "-f",
+            "%a:%S\n",
+        ]);
+
+        let mut output = Vec::new();
+        run_with_writer(&config, &mut output).unwrap();
+        assert_eq!(output, b"project:1026\n");
+    }
 }

@@ -23,7 +23,7 @@ use crate::{
     cli::{OutputPlan, RuntimeConfig},
     kafka::{KafkaInput, OwnedRecord, PollEvent},
     output::{self, EmittedAction, Header, OutputRecord, Payload, Timestamp},
-    transform::json::{self, Action, ExecutionIssue, TransformError},
+    transform::jsonata::{self, Action, ExecutionIssue, TransformError},
 };
 
 mod state;
@@ -657,7 +657,7 @@ fn worker_loop(
     completion_tx: Sender<Completion>,
     stats: Arc<Stats>,
 ) {
-    let mut backend = json::Backend::default();
+    let worker = jsonata::Worker::new(&config.transform);
     for work in work_rx {
         let WorkItem { sequence, record } = work;
         let OwnedRecord {
@@ -671,7 +671,7 @@ fn worker_loop(
         } = record;
         let source_tombstone = payload.is_none();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            backend.execute_report(&config.transform, payload, config.errors)
+            worker.execute_report(payload, config.errors)
         }));
         let outcome = match result {
             Ok(Ok(execution)) => {

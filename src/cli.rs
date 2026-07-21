@@ -11,8 +11,8 @@ use clap::{Parser, ValueEnum};
 use crate::{
     output::{CompiledFormat, OutputRequirements},
     transform::{
-        compile::{JsonRequirement, TransformPlan, build_plan},
-        json::{ErrorPolicies, EvaluationPolicy, InvalidJsonPolicy},
+        TransformPlan, build_plan,
+        jsonata::{ErrorPolicies, EvaluationPolicy, InvalidJsonPolicy},
     },
 };
 
@@ -24,7 +24,7 @@ const MAX_SELECTED_PARTITIONS: usize = 100_000;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Consume explicitly assigned Kafka partitions and transform JSON records"
+    about = "Run JSONata over records from explicitly assigned Kafka partitions"
 )]
 pub struct RawCli {
     /// Comma-separated bootstrap broker list
@@ -59,16 +59,16 @@ pub struct RawCli {
     /// Capture startup high watermarks as fixed exclusive ends
     #[arg(long)]
     snapshot: bool,
-    /// Drop records matching this predicate; repeatable
+    /// Drop records when this JSONata predicate returns true; repeatable
     #[arg(long)]
     drop_if: Vec<String>,
-    /// Tombstone records matching this predicate; repeatable
+    /// Tombstone records when this JSONata predicate returns true; repeatable
     #[arg(long)]
     tombstone_if: Vec<String>,
-    /// Project each surviving record with this expression
+    /// Project each surviving record with this JSONata expression
     #[arg(long)]
     project: Option<String>,
-    /// JSON-shaped constant object available through $vars paths
+    /// Strict JSON object available as $vars
     #[arg(long, value_name = "OBJECT")]
     vars: Option<String>,
     /// Kcat-style output format
@@ -98,7 +98,7 @@ pub struct RawCli {
     /// Maximum admitted records awaiting ordered drain
     #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_RECORDS)]
     max_inflight_records: usize,
-    /// Retained-byte budget; supports KiB, MiB, and GiB
+    /// Owned source-byte admission budget; supports KiB, MiB, and GiB
     #[arg(long, default_value = DEFAULT_MAX_INFLIGHT_BYTES, value_parser = parse_size)]
     max_inflight_bytes: usize,
     /// Maximum admitted records per partition
@@ -107,7 +107,7 @@ pub struct RawCli {
     /// Policy for malformed non-tombstone payloads
     #[arg(long, value_enum)]
     on_invalid_json: Option<RawInvalidJsonPolicy>,
-    /// Policy for predicate or projection failures
+    /// Policy for JSONata predicate or projection failures
     #[arg(long, value_enum, default_value_t = RawEvaluationPolicy::Fail)]
     on_eval_error: RawEvaluationPolicy,
     /// Policy for recoverable Kafka record errors
@@ -252,11 +252,7 @@ impl RawCli {
             explicit_end
         };
 
-        let json_requirement = match self.on_invalid_json {
-            None => JsonRequirement::AsNeeded,
-            Some(RawInvalidJsonPolicy::Pass) => JsonRequirement::PreserveInvalid,
-            Some(_) => JsonRequirement::Validate,
-        };
+        let force_json_validation = self.on_invalid_json.is_some();
         let invalid_json = match self.on_invalid_json.unwrap_or(RawInvalidJsonPolicy::Fail) {
             RawInvalidJsonPolicy::Fail => InvalidJsonPolicy::Fail,
             RawInvalidJsonPolicy::Drop => InvalidJsonPolicy::Drop,
@@ -273,7 +269,7 @@ impl RawCli {
             &self.tombstone_if,
             self.project.as_deref(),
             self.vars.as_deref(),
-            json_requirement,
+            force_json_validation,
         )?;
         let output = if self.json_envelope {
             OutputPlan::Envelope
@@ -695,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_compiles_variables_if_in_and_variadic_coalesce_before_connecting() {
+    fn cli_validates_jsonata_and_strict_variables_before_connecting() {
         let identity = resolve(&[
             "jkq",
             "-b",
@@ -705,7 +701,7 @@ mod tests {
             "-p",
             "0",
             "--vars",
-            "{unused: true}",
+            r#"{"unused":true}"#,
         ])
         .unwrap();
         assert!(!identity.transform.capabilities.parses_json);
@@ -719,11 +715,11 @@ mod tests {
             "-p",
             "0",
             "--vars",
-            "{allowed: [\"open\", \"pending\"], cutoff: 10}",
+            r#"{"allowed":["open","pending"],"cutoff":10}"#,
             "--drop-if",
-            "not in(.status, $vars.allowed)",
+            "$not(status in $vars.allowed)",
             "--project",
-            "{tier: if(.amount >= $vars.cutoff, \"large\", \"small\"), value: coalesce(.a, .b, 0)}",
+            r#"{"tier": amount >= $vars.cutoff ? "large" : "small", "value": a ?? b ?? 0}"#,
             "--check",
         ])
         .unwrap();
@@ -739,10 +735,10 @@ mod tests {
             "-p",
             "0",
             "--vars",
-            "{value: .record}",
+            "{value: record}",
         ])
         .unwrap_err();
-        assert!(error.contains("only JSON-shaped constants"));
+        assert!(error.contains("--vars must be a valid JSON object"));
     }
 
     #[test]
@@ -778,7 +774,7 @@ mod tests {
         assert!(help.contains("Partitions to consume, for example 0,2,4-7"));
         assert!(help.contains("Maximum admitted input records per partition"));
         assert!(help.contains("Validate local configuration and exit without connecting"));
-        assert!(help.contains("Retained-byte budget; supports KiB, MiB, and GiB"));
-        assert!(help.contains("JSON-shaped constant object available through $vars paths"));
+        assert!(help.contains("Owned source-byte admission budget; supports KiB, MiB, and GiB"));
+        assert!(help.contains("Strict JSON object available as $vars"));
     }
 }

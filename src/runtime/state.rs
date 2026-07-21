@@ -224,7 +224,7 @@ impl Orderer {
 
 #[cfg(test)]
 mod tests {
-    use crate::{output::Timestamp, transform::json::Action};
+    use crate::{output::Timestamp, transform::jsonata::Action};
 
     use super::*;
     use crate::runtime::{CompletionOutcome, SourceRecord};
