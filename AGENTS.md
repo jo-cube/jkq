@@ -7,7 +7,7 @@ This repository contains a small, high-throughput Rust command-line consumer for
 The product combines:
 
 - direct Kafka partition consumption;
-- a deliberately restricted JSON predicate and projection language;
+- native JSONata predicates and projections powered by `jsonata-core`;
 - explicit record actions: drop, tombstone, pass through, and project;
 - kcat-style record formatting;
 - bounded parallel execution with per-partition output ordering.
@@ -52,7 +52,7 @@ When code and documentation disagree, determine whether the code is wrong or the
 - Keep comments uncommon. Use them for invariants, non-obvious safety constraints, protocol compatibility, and performance-sensitive reasoning.
 - Do not narrate straightforward code.
 - Let tests and documentation explain behavior.
-- Avoid speculative generalization. Introduce traits only around real replacement boundaries, such as the JSON backend and output encoding.
+- Avoid speculative generalization. Do not wrap JSONata in a backend trait or factory.
 - Avoid clones in the hot path unless the ownership transfer would otherwise be less clear or less efficient.
 - Reuse worker-local buffers where practical.
 - Make integer conversions checked when values can cross API or platform boundaries.
@@ -70,7 +70,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 Expected initial runtime dependencies are limited to:
 
 - `rdkafka`
-- `simd-json`
+- `jsonata-core`
 - `clap`
 - `crossbeam-channel`
 - `signal-hook`
@@ -105,10 +105,14 @@ These invariants must remain true unless the owning behavior or architecture doc
 - A tombstone is distinct from an empty byte payload and JSON text `null`.
 - `%S` reports `-1` for a tombstone and `0` for an empty payload.
 - `%R` writes signed `-1` as a four-byte big-endian length for a tombstone.
-- Queues and retained bytes are bounded.
+- All predicates and projections use native JSONata.
+- Channels, admitted record counts, per-partition work, and owned source record bytes are bounded.
+- `--max-inflight-bytes` accounts for owned source payload, key, header names, and header values; it does not cover jsonata-core's parsed tree, evaluation intermediates, or projected output.
 - Backpressure may pause partitions, but the consumer must continue serving Kafka events.
 - Snapshot termination is based on captured exclusive high-watermark offsets.
-- The JSON implementation is behind a narrow backend boundary; the first backend uses `simd-json`.
+- Shared transform plans contain only thread-safe JSONata expression source and variable JSON; ASTs, values, contexts, and evaluators are worker-local.
+- Each Kafka payload is parsed into jsonata-core's value representation at most once per record and reused across predicates and projection.
+- Evaluator state, assignments, variables, and root context never leak between records.
 - The default runtime uses dedicated threads and bounded channels rather than an async runtime.
 - Errors are governed by explicit policy and never silently converted into successful output.
 
@@ -120,8 +124,8 @@ Each test should establish one identifiable contract, invariant, edge case, comp
 
 Use the cheapest suitable layer:
 
-- lexer and parser unit tests for syntax;
-- evaluator tests for expression semantics;
+- startup-plan tests for JSONata parsing and strict variable validation;
+- transform tests for jkq's JSONata integration semantics;
 - formatter golden tests for byte-exact output;
 - ordering and backpressure tests for concurrency invariants;
 - integration tests for process behavior;
@@ -195,7 +199,7 @@ A change is complete only when:
 - public documentation is updated;
 - no avoidable dependency or abstraction was introduced;
 - stdout remains data-only;
-- memory remains bounded under slow output and large records;
+- channels, admitted records, per-partition work, and owned source-byte accounting remain bounded under slow output and large source records;
 - partition ordering remains correct unless unordered mode was explicitly selected;
 - performance-sensitive changes include benchmark evidence or a clear non-regression rationale.
 
