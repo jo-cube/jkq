@@ -670,6 +670,39 @@ mod tests {
     }
 
     #[test]
+    fn ssl_authentication_properties_are_passed_through() {
+        let config = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-p",
+            "0",
+            "-X",
+            "security.protocol=SSL",
+            "-X",
+            "ssl.ca.location=/certs/ca.pem",
+            "-X",
+            "ssl.certificate.location=/certs/client.pem",
+            "-X",
+            "ssl.key.location=/certs/client.key",
+        ])
+        .unwrap();
+
+        assert_eq!(config.kafka_properties["security.protocol"], "SSL");
+        assert_eq!(config.kafka_properties["ssl.ca.location"], "/certs/ca.pem");
+        assert_eq!(
+            config.kafka_properties["ssl.certificate.location"],
+            "/certs/client.pem"
+        );
+        assert_eq!(
+            config.kafka_properties["ssl.key.location"],
+            "/certs/client.key"
+        );
+    }
+
+    #[test]
     fn explicit_invalid_json_policy_forces_validation_on_the_identity_path() {
         let default = resolve(&["jkq", "-b", "x", "-t", "t", "-p", "0"]).unwrap();
         assert!(!default.transform.capabilities.parses_json);

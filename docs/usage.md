@@ -204,6 +204,25 @@ enable.auto.offset.store
 enable.partition.eof
 ```
 
+TLS client authentication uses the standard librdkafka property names, so the
+same connection settings used with kcat can be supplied in a configuration
+file:
+
+```properties
+security.protocol=SSL
+ssl.ca.location=/path/to/ca.pem
+ssl.certificate.location=/path/to/client.pem
+ssl.key.location=/path/to/client.key
+```
+
+```sh
+jkq -F kafka.properties -t events -p 0 --snapshot
+```
+
+The official build includes TLS support through vendored OpenSSL. Additional
+TLS properties can be passed through with `-F` or `-X` unless listed as owned
+above.
+
 There is no implicit configuration-file discovery.
 
 ## Parallelism and Memory
