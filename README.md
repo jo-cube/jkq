@@ -13,7 +13,7 @@ jkq -b localhost:9092 -t events -p 0 --snapshot \
   -f '%p\t%o\t%R%s\n'
 ```
 
-One input record produces one of four actions:
+A successfully processed input record produces one of four actions:
 
 - **drop**: write nothing;
 - **tombstone**: retain the source metadata with a null Kafka payload;

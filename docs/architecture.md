@@ -185,7 +185,8 @@ stdout that cannot make progress.
 
 - One invocation consumes one topic and explicitly selected partitions.
 - JSONata is the only expression language.
-- Every non-tombstone input resolves to exactly one action.
+- Every successfully transformed non-tombstone input resolves to exactly one
+  action.
 - One input never expands into multiple output records.
 - Existing tombstones bypass JSON and JSONata and remain tombstones.
 - Pass-through preserves exact source payload bytes.

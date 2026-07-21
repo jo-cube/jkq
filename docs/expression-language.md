@@ -36,9 +36,9 @@ jsonata-core value and reuses it while it:
 3. evaluates `--project`, when present;
 4. otherwise passes through the exact source payload bytes.
 
-Existing Kafka tombstones bypass JSON parsing and every expression. One input
-record always produces one action; a JSONata result sequence never expands
-into multiple jkq output records.
+Existing Kafka tombstones bypass JSON parsing and every expression. A
+successfully evaluated input record produces one action; a JSONata result
+sequence never expands into multiple jkq output records.
 
 ## Action Predicates
 
@@ -101,8 +101,10 @@ Invalid UTF-8 or malformed JSON follows `--on-invalid-json`. JSONata runtime
 failures, strict predicate-result failures, `Undefined` projections, non-JSON
 results, and serialization failures follow `--on-eval-error`. Runtime errors
 identify the drop predicate, tombstone predicate, or projection and are
-wrapped with topic, partition, and offset by the pipeline. Diagnostics never
-include source payload contents.
+wrapped with topic, partition, and offset by the pipeline. `jkq` does not
+automatically add source payload contents to diagnostics. Native messages
+deliberately produced by JSONata expressions, including `$error()` and
+`$assert()` messages, are preserved and may contain record data.
 
 jkq exposes useful jsonata-core parser and evaluator messages but does not
 invent byte positions that its public API does not reliably provide. When

@@ -178,8 +178,10 @@ continue` is selected.
 
 JSONata parse errors are command-line errors. Runtime evaluation errors name
 the failing drop predicate, tombstone predicate, or projection. The pipeline
-adds topic, partition, and offset context without including source payload
-contents.
+adds topic, partition, and offset context. `jkq` does not automatically add
+source payload contents, but native messages deliberately produced by JSONata
+expressions, such as `$error()` and `$assert()` messages, are preserved and may
+contain record data.
 
 When `--on-invalid-json` is omitted and no expression needs JSON, the identity
 path does not parse payloads. Supplying the option explicitly forces JSON
