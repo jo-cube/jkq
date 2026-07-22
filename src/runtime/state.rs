@@ -230,7 +230,10 @@ impl Orderer {
 
 #[cfg(test)]
 mod tests {
-    use crate::{output::Timestamp, transform::jsonata::Action};
+    use crate::{
+        output::Timestamp,
+        transform::jsonata::{Action, PassPayload},
+    };
 
     use super::*;
     use crate::runtime::{CompletionOutcome, SourceRecord};
@@ -265,7 +268,12 @@ mod tests {
         assert!(ready.is_empty());
         orderer
             .insert(
-                completion(0, 0, 1, Action::PassThrough(b"a".to_vec())),
+                completion(
+                    0,
+                    0,
+                    1,
+                    Action::PassThrough(PassPayload::Exact(b"a".to_vec())),
+                ),
                 &mut ready,
             )
             .unwrap();
@@ -276,7 +284,12 @@ mod tests {
         ready.clear();
         orderer
             .insert(
-                completion(1, 0, 1, Action::PassThrough(b"b".to_vec())),
+                completion(
+                    1,
+                    0,
+                    1,
+                    Action::PassThrough(PassPayload::Exact(b"b".to_vec())),
+                ),
                 &mut ready,
             )
             .unwrap();

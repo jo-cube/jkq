@@ -51,6 +51,27 @@ pub struct Timestamp {
 pub enum Payload<'a> {
     Tombstone,
     Bytes(&'a [u8]),
+    Json {
+        bytes: &'a [u8],
+        source_length: usize,
+    },
+}
+
+impl<'a> Payload<'a> {
+    fn bytes(self) -> Option<&'a [u8]> {
+        match self {
+            Self::Tombstone => None,
+            Self::Bytes(bytes) | Self::Json { bytes, .. } => Some(bytes),
+        }
+    }
+
+    fn length(self) -> Option<usize> {
+        match self {
+            Self::Tombstone => None,
+            Self::Bytes(bytes) => Some(bytes.len()),
+            Self::Json { source_length, .. } => Some(source_length),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,8 +202,8 @@ impl CompiledFormat {
         record: &OutputRecord<'_>,
         output: &mut impl Write,
     ) -> io::Result<usize> {
-        if let Payload::Bytes(bytes) = record.payload
-            && bytes.len() > i32::MAX as usize
+        if let Some(length) = record.payload.length()
+            && length > i32::MAX as usize
             && self
                 .0
                 .iter()
@@ -190,7 +211,7 @@ impl CompiledFormat {
         {
             return Err(io::Error::other(FormatError(format!(
                 "payload length {} exceeds %R signed 32-bit limit",
-                bytes.len()
+                length
             ))));
         }
         let mut written = 0;
@@ -203,21 +224,18 @@ impl CompiledFormat {
                 }
                 FormatToken::KeyLength => write_optional_length(output, record.key, &mut written)?,
                 FormatToken::Payload => {
-                    if let Payload::Bytes(bytes) = record.payload {
+                    if let Some(bytes) = record.payload.bytes() {
                         write_bytes(output, bytes, &mut written)?;
                     }
                 }
-                FormatToken::PayloadLength => match record.payload {
-                    Payload::Tombstone => write_decimal(output, -1, &mut written)?,
-                    Payload::Bytes(bytes) => write_decimal(output, bytes.len(), &mut written)?,
+                FormatToken::PayloadLength => match record.payload.length() {
+                    Some(length) => write_decimal(output, length, &mut written)?,
+                    None => write_decimal(output, -1, &mut written)?,
                 },
                 FormatToken::PayloadLengthBinary => {
-                    let length = match record.payload {
-                        Payload::Tombstone => -1,
-                        Payload::Bytes(bytes) => {
-                            i32::try_from(bytes.len()).expect("%R payload length was prevalidated")
-                        }
-                    };
+                    let length = record.payload.length().map_or(-1, |length| {
+                        i32::try_from(length).expect("%R payload length was prevalidated")
+                    });
                     write_bytes(output, &length.to_be_bytes(), &mut written)?;
                 }
                 FormatToken::Topic => write_bytes(output, record.topic.as_bytes(), &mut written)?,
@@ -362,9 +380,32 @@ pub fn write_envelope(record: &OutputRecord<'_>, output: &mut impl Write) -> io:
     match record.payload {
         Payload::Tombstone => write_bytes_fields(output, "payload", None, &mut written)?,
         Payload::Bytes(bytes) => write_bytes_fields(output, "payload", Some(bytes), &mut written)?,
+        Payload::Json {
+            bytes,
+            source_length,
+        } => write_json_fields(output, "payload", bytes, source_length, &mut written)?,
     }
     write_bytes(output, b"}\n", &mut written)?;
     Ok(written)
+}
+
+fn write_json_fields(
+    output: &mut impl Write,
+    name: &str,
+    value: &[u8],
+    source_length: usize,
+    written: &mut usize,
+) -> io::Result<()> {
+    write_bytes(output, b",\"", written)?;
+    write_bytes(output, name.as_bytes(), written)?;
+    write_bytes(output, b"\":", written)?;
+    write_bytes(output, value, written)?;
+    write_bytes(output, b",\"", written)?;
+    write_bytes(output, name.as_bytes(), written)?;
+    write_bytes(output, b"Encoding\":\"json\",\"", written)?;
+    write_bytes(output, name.as_bytes(), written)?;
+    write_bytes(output, b"Length\":", written)?;
+    write_decimal(output, source_length, written)
 }
 
 fn write_bytes_fields(
@@ -589,6 +630,26 @@ mod tests {
         assert_eq!(
             render_envelope(&record),
             br#"{"topic":"events","partition":3,"offset":42,"timestamp":null,"timestampType":null,"key":"/w==","keyEncoding":"base64","keyLength":1,"headers":[{"name":"trace","value":"/w==","valueEncoding":"base64","valueLength":1}],"action":"tombstone","payload":null,"payloadEncoding":null,"payloadLength":-1}
+"#
+        );
+    }
+
+    #[test]
+    fn envelope_embeds_json_payload_without_escaping_it() {
+        let record = OutputRecord {
+            action: EmittedAction::Project,
+            ..record(
+                None,
+                Payload::Json {
+                    bytes: br#"{"id":1}"#,
+                    source_length: 12,
+                },
+            )
+        };
+
+        assert_eq!(
+            render_envelope(&record),
+            br#"{"topic":"events","partition":3,"offset":42,"timestamp":null,"timestampType":null,"key":null,"keyEncoding":null,"keyLength":-1,"headers":[],"action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":12}
 "#
         );
     }

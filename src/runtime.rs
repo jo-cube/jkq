@@ -23,7 +23,7 @@ use crate::{
     cli::{OutputPlan, RuntimeConfig},
     kafka::{KafkaInput, OwnedRecord, PollEvent},
     output::{self, EmittedAction, Header, OutputRecord, Payload, Timestamp},
-    transform::jsonata::{self, Action, ExecutionIssue, TransformError},
+    transform::jsonata::{self, Action, ExecutionIssue, PassPayload, TransformError},
 };
 
 mod state;
@@ -663,7 +663,7 @@ fn admit(
             } = record;
             let source_tombstone = payload.is_none();
             let action = match payload {
-                Some(bytes) => Action::PassThrough(bytes),
+                Some(bytes) => Action::PassThrough(PassPayload::Exact(bytes)),
                 None => Action::Tombstone,
             };
             stats.transformed(&action, None, source_tombstone);
@@ -700,7 +700,7 @@ fn worker_loop(
     completion_tx: Sender<Completion>,
     stats: Arc<Stats>,
 ) {
-    let worker = jsonata::Worker::new(&config.transform);
+    let worker = jsonata::Worker::new(&config.transform, config.output.embeds_json());
     for work in work_rx {
         let WorkItem { sequence, record } = work;
         let OwnedRecord {
@@ -864,10 +864,40 @@ fn write_action(
     action: &Action,
     stats: &Stats,
 ) -> io::Result<()> {
+    let embeds_json = config.output.embeds_json();
     let (payload, emitted_action) = match action {
         Action::Drop => return Ok(()),
         Action::Tombstone => (Payload::Tombstone, EmittedAction::Tombstone),
-        Action::PassThrough(bytes) => (Payload::Bytes(bytes), EmittedAction::PassThrough),
+        Action::PassThrough(PassPayload::Exact(_)) if embeds_json => {
+            return Err(io::Error::other(
+                "JSON-value envelope received a non-JSON pass-through payload",
+            ));
+        }
+        Action::PassThrough(PassPayload::Exact(bytes)) => {
+            (Payload::Bytes(bytes), EmittedAction::PassThrough)
+        }
+        Action::PassThrough(PassPayload::Json {
+            bytes,
+            source_length,
+        }) if embeds_json => (
+            Payload::Json {
+                bytes,
+                source_length: *source_length,
+            },
+            EmittedAction::PassThrough,
+        ),
+        Action::PassThrough(PassPayload::Json { .. }) => {
+            return Err(io::Error::other(
+                "JSON pass-through payload requires a JSON-value envelope",
+            ));
+        }
+        Action::Project(bytes) if embeds_json => (
+            Payload::Json {
+                bytes,
+                source_length: bytes.len(),
+            },
+            EmittedAction::Project,
+        ),
         Action::Project(bytes) => (Payload::Bytes(bytes), EmittedAction::Project),
     };
     let output_record = OutputRecord {
@@ -882,7 +912,7 @@ fn write_action(
     };
     let output_bytes = match &config.output {
         OutputPlan::Format(format) => format.write_to(&output_record, writer)?,
-        OutputPlan::Envelope => output::write_envelope(&output_record, writer)?,
+        OutputPlan::Envelope(_) => output::write_envelope(&output_record, writer)?,
     };
     if config.unbuffered {
         writer.flush()?;
@@ -918,6 +948,10 @@ mod tests {
         let mut completion = completion(partition, sequence, bytes, Action::Drop);
         completion.outcome = CompletionOutcome::Fatal("fatal transform".to_owned());
         completion
+    }
+
+    fn pass(bytes: &[u8]) -> Action {
+        Action::PassThrough(PassPayload::Exact(bytes.to_vec()))
     }
 
     fn config(arguments: &[&str]) -> RuntimeConfig {
@@ -980,7 +1014,8 @@ mod tests {
         assert_eq!(completion.sequence, 0);
         assert!(matches!(
             completion.outcome,
-            CompletionOutcome::Action(Action::PassThrough(ref bytes)) if bytes == b"exact"
+            CompletionOutcome::Action(Action::PassThrough(PassPayload::Exact(ref bytes)))
+                if bytes == b"exact"
         ));
     }
 
@@ -990,6 +1025,39 @@ mod tests {
         stats.emitted(10);
         assert!(stats.report(Duration::ZERO).starts_with("admitted=0 "));
         assert!(stats.report(Duration::ZERO).contains("output_bytes=0 "));
+    }
+
+    #[test]
+    fn json_value_envelope_embeds_projected_payload() {
+        let config = config(&[
+            "-J",
+            "--envelope-payload",
+            "value",
+            "--project",
+            r#"{"id":id}"#,
+        ]);
+        let source = SourceRecord {
+            partition: 0,
+            offset: 7,
+            timestamp: None,
+            key: None,
+            headers: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        write_action(
+            &config,
+            &mut output,
+            &source,
+            &Action::Project(br#"{"id":1}"#.to_vec()),
+            &Stats::default(),
+        )
+        .unwrap();
+
+        assert!(output.ends_with(
+            br#""action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":8}
+"#
+        ));
     }
 
     #[test]
@@ -1003,9 +1071,7 @@ mod tests {
         completion_tx
             .send(completion(0, 1, 2, Action::Drop))
             .unwrap();
-        completion_tx
-            .send(completion(0, 0, 1, Action::PassThrough(b"a".to_vec())))
-            .unwrap();
+        completion_tx.send(completion(0, 0, 1, pass(b"a"))).unwrap();
         drop(completion_tx);
 
         let mut output = Vec::new();
@@ -1037,13 +1103,9 @@ mod tests {
         let config = config(&["--drop-if", "false"]);
         let (completion_tx, completion_rx) = bounded(3);
         let (release_tx, release_rx) = bounded(3);
-        completion_tx
-            .send(completion(0, 2, 3, Action::PassThrough(b"c".to_vec())))
-            .unwrap();
+        completion_tx.send(completion(0, 2, 3, pass(b"c"))).unwrap();
         completion_tx.send(fatal_completion(0, 1, 2)).unwrap();
-        completion_tx
-            .send(completion(0, 0, 1, Action::PassThrough(b"a".to_vec())))
-            .unwrap();
+        completion_tx.send(completion(0, 0, 1, pass(b"a"))).unwrap();
         drop(completion_tx);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1085,12 +1147,8 @@ mod tests {
         let config = config(&["--unordered", "-f", "%o\\n"]);
         let (completion_tx, completion_rx) = bounded(2);
         let (release_tx, release_rx) = bounded(2);
-        completion_tx
-            .send(completion(0, 1, 1, Action::PassThrough(b"b".to_vec())))
-            .unwrap();
-        completion_tx
-            .send(completion(0, 0, 1, Action::PassThrough(b"a".to_vec())))
-            .unwrap();
+        completion_tx.send(completion(0, 1, 1, pass(b"b"))).unwrap();
+        completion_tx.send(completion(0, 0, 1, pass(b"a"))).unwrap();
         drop(completion_tx);
 
         let mut output = Vec::new();
