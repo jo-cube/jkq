@@ -76,17 +76,20 @@ jkq -b localhost:9092 -t events -p 0 --snapshot \
 
 All expressions use native [JSONata](https://jsonata.org/) syntax and semantics.
 `--vars <object>` accepts one strict JSON object and binds it as `$vars` for
-every expression. Invalid JSON and non-object roots are startup errors and are
-also rejected by `--check`. Expressions access values through paths such as
-`$vars.tenant`, `$vars.policy.cutoff`, and `$vars["non-identifier"]`.
-Referencing `$vars` without supplying it evaluates as JSONata `Undefined`.
+every expression. `--vars-file <path>` reads the same object from a UTF-8 file;
+the two options are mutually exclusive. File errors, invalid JSON, and
+non-object roots are startup errors and are also rejected by `--check`.
+Expressions access values through paths such as `$vars.tenant`,
+`$vars.policy.cutoff`, and `$vars["non-identifier"]`. Referencing `$vars`
+without supplying it evaluates as JSONata `Undefined`.
 
 For each non-tombstone input, `jkq`:
 
 1. evaluates repeated `--drop-if` predicates in command-line order;
 2. evaluates repeated `--tombstone-if` predicates in command-line order;
 3. applies the optional `--project` expression;
-4. otherwise passes the exact source bytes through.
+4. otherwise passes the source payload through, preserving its exact bytes
+   unless `--envelope-payload value` is selected.
 
 Each predicate list stops at its first Boolean `true` result. The top-level
 result of an action predicate must be a JSONata Boolean; JSONata truthiness is
@@ -147,11 +150,30 @@ emitted record and cannot be combined with `-f`:
 {"topic":"events","partition":0,"offset":42,"timestamp":null,"timestampType":null,"key":"key","keyEncoding":"utf8","keyLength":3,"headers":[],"action":"project","payload":"{\"id\":1}","payloadEncoding":"utf8","payloadLength":8}
 ```
 
-Keys, header values, and payloads are strings rather than embedded JSON.
-Valid UTF-8 uses encoding `"utf8"`; other bytes use RFC 4648 base64 and
+By default, keys, header values, and payloads are strings rather than embedded
+JSON. Valid UTF-8 uses encoding `"utf8"`; other bytes use RFC 4648 base64 and
 encoding `"base64"`. Null uses a JSON null value, null encoding, and length
 `-1`. This keeps pass-through bytes exact and represents invalid JSON handled
 with the `pass` policy without changing the schema.
+
+`--envelope-payload value` embeds the post-transform payload as a JSON value:
+
+```json
+{"topic":"events","partition":0,"offset":42,"timestamp":null,"timestampType":null,"key":"key","keyEncoding":"utf8","keyLength":3,"headers":[],"action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":8}
+```
+
+A projected payload reuses the compact JSON already produced by JSONata. A
+pass-through payload is parsed once by the worker and serialized compactly, so
+whitespace and number spelling may change and a multiline input still produces
+one envelope line. For a pass action, `payloadLength` remains the source payload
+byte length; for a project action, it is the compact projected byte length. The
+source text `null` and a projected JSON `null` have payload `null`, encoding
+`"json"`, and length `4`; a tombstone has payload `null`, null encoding, and
+length `-1`.
+
+JSON-value envelopes force JSON validation even when no expressions are used.
+They cannot be combined with `--on-invalid-json pass`, because every emitted
+non-tombstone payload must retain the JSON-value schema.
 
 Available timestamp types are `"createTime"` and `"logAppendTime"`. Envelope
 headers contain `name`, `value`, `valueEncoding`, and `valueLength` in source
@@ -172,7 +194,8 @@ failures into an explicit action:
 | `--on-eval-error` | `fail`, `drop`, `tombstone` |
 | `--on-kafka-error` | `fail`, `continue` |
 
-`pass` preserves the original payload exactly. Fatal Kafka state errors and
+`pass` preserves the original payload exactly. It cannot be selected for
+invalid JSON with `--envelope-payload value`. Fatal Kafka state errors and
 unavailable requested offsets remain fatal even when `--on-kafka-error
 continue` is selected.
 
@@ -253,6 +276,145 @@ A source record larger than the byte budget may run alone. When admission
 limits are reached, `jkq` pauses affected partitions while continuing to serve
 Kafka events. Channels, admitted record counts, per-partition admission, and
 source-byte accounting remain bounded.
+
+## High-throughput Patterns
+
+High-throughput runs benefit most from keeping the work per input record
+predictable. Build with `--release`, test against representative records, and
+change one setting at a time rather than assuming that more workers or larger
+buffers will help.
+
+### Use objects for large membership sets
+
+JSONata defines [`in`](https://docs.jsonata.org/comparison-operators) as array
+inclusion, which tests values in the right-hand array. For policy sets that may
+grow to thousands of entries, encode each set as an object and use the standard
+[`$lookup`](https://docs.jsonata.org/object-functions) function to look up the
+concatenated key.
+
+For example, `policy.json` can contain:
+
+```json
+{
+  "whitelist": {
+    "acme:123": true,
+    "acme:456": true
+  },
+  "blacklist": {
+    "blocked:999": true
+  }
+}
+```
+
+This predicate computes the key once, tombstones blacklisted records, lets the
+whitelist override the blacklist, and passes records in neither set:
+
+```sh
+jkq -F kafka.properties -t events -p 0-31 --snapshot \
+  --vars-file policy.json \
+  --tombstone-if '(
+    $key := tenant & ":" & account;
+    ($lookup($vars.blacklist, $key) = true) and
+      $not($lookup($vars.whitelist, $key) = true)
+  )' \
+  -f '%K\t%k%R%s'
+```
+
+The `true` values make membership explicit: a present key compares equal to
+`true`, while a missing key does not. Change the Boolean expression when the
+sets use different precedence. For example, to pass only whitelisted records
+that are not blacklisted, use:
+
+```jsonata
+$not($lookup($vars.whitelist, $key) = true) or
+  ($lookup($vars.blacklist, $key) = true)
+```
+
+Keep related policy in one expression when it shares derived values such as
+`$key`. Separate repeated predicates remain useful when an early, cheap
+predicate commonly matches and avoids later work. The JSONata
+[`&` operator](https://docs.jsonata.org/other-operators) converts non-string
+operands to strings; include separators or other disambiguation when different
+attribute combinations could otherwise produce the same key.
+
+The variables object is parsed once per worker rather than once per record.
+Each worker holds its own copy, so account for the set size when increasing
+`--jobs`.
+
+### Preserve bytes and emit only required metadata
+
+When predicates choose between pass and tombstone, omit `--project` unless the
+payload must change. Passing preserves the exact source payload and avoids
+projection serialization.
+
+The example format above is compact and stream-decodable: `%K\t` writes a
+decimal key length followed by a tab, `%k` writes that many key bytes, and
+`%R%s` writes a signed four-byte payload length followed by the payload. A
+payload length of `-1` represents a tombstone. Choose a different format when
+the downstream protocol has its own framing.
+
+Avoid `--unbuffered` on throughput-oriented runs. JSON envelopes are useful
+when their self-describing metadata is required; a focused `-f` format avoids
+encoding fields the downstream consumer does not use. JSON-value envelopes
+also compactly serialize pass-through payloads, so use that mode when the
+downstream consumer benefits from a typed JSON field.
+
+### Scale with partitions, then tune workers
+
+The default worker count leaves one CPU for Kafka polling and one for output.
+Measure nearby `--jobs` values with representative payloads and expressions;
+additional workers can increase contention after polling or output becomes the
+bottleneck.
+
+Keep the default per-partition ordering when later records update earlier
+records. Use `--unordered` only when completion order is acceptable. If one
+invocation reaches its polling or output limit and the topic has enough
+partitions, run independent invocations over disjoint partition sets:
+
+```sh
+jkq -F kafka.properties -t events -p 0-15 --snapshot \
+  -f '%R%s' > shard-0.bin &
+jkq -F kafka.properties -t events -p 16-31 --snapshot \
+  -f '%R%s' > shard-1.bin &
+wait
+```
+
+This preserves ordering within every partition; `jkq` never provides global
+ordering across partitions. Adjust the in-flight limits only when measurements
+show worker starvation or excessive retained memory.
+
+### Validate a bounded slice first
+
+Use the same expressions, variables, output format, and Kafka properties that
+the full run will use. `--check` validates them without connecting to Kafka.
+Then process a bounded sample before starting the complete range:
+
+```sh
+policy='(
+  $key := tenant & ":" & account;
+  ($lookup($vars.blacklist, $key) = true) and
+    $not($lookup($vars.whitelist, $key) = true)
+)'
+
+jkq -F kafka.properties -t events -p 0-31 \
+  --count-per-partition 100000 \
+  --vars-file policy.json \
+  --tombstone-if "$policy" \
+  --stats-interval 10s \
+  -f '%K\t%k%R%s' > sample.bin
+```
+
+Check the action counts, output framing, memory use, and downstream behavior.
+Statistics add per-record bookkeeping, so compare with them disabled when
+measuring maximum throughput.
+
+For Kafka client tuning, use librdkafka's authoritative
+[configuration reference](https://github.com/confluentinc/librdkafka/blob/v2.12.1/CONFIGURATION.md)
+and [statistics reference](https://github.com/confluentinc/librdkafka/blob/v2.12.1/STATISTICS.md)
+for the version currently bundled by jkq.
+Pass measured configuration changes through `-F` or `-X`; avoid copying a
+generic tuning profile without validating it against the brokers and payloads
+used by the run.
 
 ## Statistics, Signals, and Exit Status
 

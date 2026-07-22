@@ -34,7 +34,8 @@ jsonata-core value and reuses it while it:
 2. evaluates `--tombstone-if` expressions in command-line order, stopping at
    the first Boolean `true`;
 3. evaluates `--project`, when present;
-4. otherwise passes through the exact source payload bytes.
+4. otherwise passes through the source payload, preserving its exact bytes
+   unless `--envelope-payload value` requests compact JSON serialization.
 
 Existing Kafka tombstones bypass JSON parsing and every expression. A
 successfully evaluated input record produces one action; a JSONata result
@@ -79,8 +80,15 @@ omission otherwise apply. A projected JSON `null` is the four-byte payload
 --vars '{"tenant":"acme","cutoff":1000}'
 ```
 
-Invalid JSON and non-object roots fail during startup and `--check`.
-Expressions access the immutable object as `$vars`, for example
+`--vars-file` reads the same object from a UTF-8 file and is mutually exclusive
+with `--vars`:
+
+```sh
+--vars-file variables.json
+```
+
+File errors, invalid JSON, and non-object roots fail during startup and
+`--check`. Expressions access the immutable object as `$vars`, for example
 `$vars.tenant` and `$vars.cutoff`.
 
 Each expression evaluation receives a clean JSONata context containing the

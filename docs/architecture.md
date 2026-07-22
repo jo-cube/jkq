@@ -42,8 +42,8 @@ evaluator, context, and value APIs.
 Before polling, `jkq`:
 
 1. parses and validates the CLI and librdkafka properties;
-2. parses every JSONata expression and validates the strict JSON `--vars`
-   object;
+2. reads an optional `--vars-file`, parses every JSONata expression, and
+   validates the strict JSON `$vars` object;
 3. stores only expression source and variable JSON in the shared transform
    plan;
 4. compiles the output format and its metadata requirements;
@@ -74,7 +74,7 @@ An action is separate from its output representation:
 ```text
 Drop
 Tombstone
-PassThrough(original bytes)
+PassThrough(exact source bytes | compact JSON bytes plus source length)
 Project(compact JSON bytes)
 ```
 
@@ -93,7 +93,10 @@ For a non-tombstone input, the worker validates UTF-8 and parses the payload
 once with `JValue::from_json_str`. The same worker-local document is used for
 all drop predicates, tombstone predicates, and the optional projection.
 Original payload bytes remain untouched for an eventual pass action or the
-invalid-JSON `pass` policy.
+invalid-JSON `pass` policy. With `--envelope-payload value`, a surviving pass
+instead serializes the existing parsed document once, retains the source byte
+length for envelope metadata, and releases the source buffer. The writer never
+parses payload JSON.
 
 jsonata-core's `Evaluator` retains its first parent/root value. jkq therefore
 does not reuse evaluators: it creates a fresh `Context` and `Evaluator` for
@@ -111,7 +114,8 @@ Rust API. Workers therefore use the public AST evaluator. jkq does not use the
 feature-gated internal `_bench` facade.
 
 Existing Kafka tombstones bypass all JSONata work. An identity transform also
-bypasses parsing unless `--on-invalid-json` was supplied explicitly.
+bypasses parsing unless `--on-invalid-json` was supplied explicitly or a
+JSON-value envelope was requested.
 
 ## Ordering and Output
 
@@ -131,6 +135,8 @@ One writer owns stdout. Formats and JSON envelopes stream directly to its
 buffer, avoiding byte interleaving and an additional record-sized staging
 buffer. `%s`, `%S`, `%R`, envelopes, and action names operate on the
 post-transform action. Broken pipe is normal pipeline termination.
+For a JSON-value envelope, the writer inserts compact JSON bytes produced by
+the worker or projection and labels them with `payloadEncoding: "json"`.
 
 ## Backpressure and Memory Accounting
 
@@ -142,11 +148,11 @@ byte charge covers owned bytes copied from the source record:
 - header names and header values, when required.
 
 The charge intentionally excludes jsonata-core's parsed value tree,
-evaluation intermediates, and projected output. Full JSONata can construct
-data-dependent values, so total evaluator and output memory cannot be bounded
-by a static expression compiler. Bounded channels, `--max-inflight-records`,
-`--max-inflight-per-partition`, and the owned source-byte admission budget
-still bound queued source work.
+evaluation intermediates, projected output, and compact pass output for a
+JSON-value envelope. Full JSONata can construct data-dependent values, so total
+evaluator and output memory cannot be bounded by a static expression compiler.
+Bounded channels, `--max-inflight-records`, `--max-inflight-per-partition`, and
+the owned source-byte admission budget still bound queued source work.
 
 Charges are released only after ordered write or drop. Slow output therefore
 propagates pressure back to Kafka, and the reorder buffer cannot hold more
@@ -189,13 +195,14 @@ stdout that cannot make progress.
   action.
 - One input never expands into multiple output records.
 - Existing tombstones bypass JSON and JSONata and remain tombstones.
-- Pass-through preserves exact source payload bytes.
+- Pass-through preserves exact source payload bytes unless the user explicitly
+  requests a JSON-value envelope.
 - Ordering is per partition, never global.
 - Count limits apply to admitted input, not emitted output.
 - Per-partition count limits apply independently to each selected partition.
 - Tombstones, empty payloads, and JSON `null` remain distinct.
 - Channels, admitted record counts, per-partition records, and owned source
-  bytes are bounded; JSONata intermediates and projected output are not covered
-  by the byte budget.
+  bytes are bounded; JSONata intermediates, projected output, and compact
+  JSON-value envelope output are not covered by the byte budget.
 - stdout is record data; diagnostics and statistics use stderr.
 - Errors follow explicit policy and are never silently successful.

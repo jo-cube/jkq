@@ -25,9 +25,9 @@ pub fn build_plan(
 ) -> Result<TransformPlan, String> {
     if let Some(source) = variables {
         let value = JValue::from_json_str(source)
-            .map_err(|error| format!("--vars must be a valid JSON object: {error}"))?;
+            .map_err(|error| format!("$vars input must be a valid JSON object: {error}"))?;
         if !value.is_object() {
-            return Err("--vars must be a JSON object".to_owned());
+            return Err("$vars input must be a JSON object".to_owned());
         }
     }
 

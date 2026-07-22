@@ -71,12 +71,18 @@ pub struct RawCli {
     /// Strict JSON object available as $vars
     #[arg(long, value_name = "OBJECT")]
     vars: Option<String>,
+    /// Read the strict JSON object available as $vars from a file
+    #[arg(long, value_name = "PATH", conflicts_with = "vars")]
+    vars_file: Option<PathBuf>,
     /// Kcat-style output format
     #[arg(short = 'f', long, conflicts_with = "json_envelope")]
     format: Option<String>,
     /// Emit one JSON envelope per output record
     #[arg(short = 'J', long, conflicts_with = "format")]
     json_envelope: bool,
+    /// Representation used for the envelope payload
+    #[arg(long, value_enum, requires = "json_envelope")]
+    envelope_payload: Option<EnvelopePayload>,
     /// Flush stdout after every output record
     #[arg(short = 'u', long)]
     unbuffered: bool,
@@ -145,6 +151,12 @@ pub enum KafkaErrorPolicy {
     Continue,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum EnvelopePayload {
+    String,
+    Value,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartPosition {
     Beginning,
@@ -171,7 +183,7 @@ pub struct RuntimeLimits {
 #[derive(Debug)]
 pub enum OutputPlan {
     Format(CompiledFormat),
-    Envelope,
+    Envelope(EnvelopePayload),
 }
 
 #[derive(Debug)]
@@ -202,12 +214,16 @@ impl OutputPlan {
     pub fn requirements(&self) -> OutputRequirements {
         match self {
             Self::Format(format) => format.requirements(),
-            Self::Envelope => OutputRequirements {
+            Self::Envelope(_) => OutputRequirements {
                 key: true,
                 headers: true,
                 timestamp: true,
             },
         }
+    }
+
+    pub fn embeds_json(&self) -> bool {
+        matches!(self, Self::Envelope(EnvelopePayload::Value))
     }
 }
 
@@ -252,7 +268,17 @@ impl RawCli {
             explicit_end
         };
 
-        let force_json_validation = self.on_invalid_json.is_some();
+        let envelope_payload = self.envelope_payload.unwrap_or(EnvelopePayload::String);
+        if envelope_payload == EnvelopePayload::Value
+            && self.on_invalid_json == Some(RawInvalidJsonPolicy::Pass)
+        {
+            return Err(
+                "--envelope-payload value cannot be combined with --on-invalid-json pass"
+                    .to_owned(),
+            );
+        }
+        let force_json_validation =
+            self.on_invalid_json.is_some() || envelope_payload == EnvelopePayload::Value;
         let invalid_json = match self.on_invalid_json.unwrap_or(RawInvalidJsonPolicy::Fail) {
             RawInvalidJsonPolicy::Fail => InvalidJsonPolicy::Fail,
             RawInvalidJsonPolicy::Drop => InvalidJsonPolicy::Drop,
@@ -264,15 +290,23 @@ impl RawCli {
             RawEvaluationPolicy::Drop => EvaluationPolicy::Drop,
             RawEvaluationPolicy::Tombstone => EvaluationPolicy::Tombstone,
         };
+        let file_variables = self
+            .vars_file
+            .as_ref()
+            .map(|path| {
+                fs::read_to_string(path)
+                    .map_err(|error| format!("cannot read --vars-file {}: {error}", path.display()))
+            })
+            .transpose()?;
         let transform = build_plan(
             &self.drop_if,
             &self.tombstone_if,
             self.project.as_deref(),
-            self.vars.as_deref(),
+            file_variables.as_deref().or(self.vars.as_deref()),
             force_json_validation,
         )?;
         let output = if self.json_envelope {
-            OutputPlan::Envelope
+            OutputPlan::Envelope(envelope_payload)
         } else {
             OutputPlan::Format(
                 CompiledFormat::compile(self.format.as_deref().unwrap_or("%s\\n"))
@@ -638,6 +672,44 @@ mod tests {
                 "--max-inflight-bytes",
                 "0",
             ],
+            vec![
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                "-p",
+                "0",
+                "--vars",
+                "{}",
+                "--vars-file",
+                "vars.json",
+            ],
+            vec![
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                "-p",
+                "0",
+                "--envelope-payload",
+                "value",
+            ],
+            vec![
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                "-p",
+                "0",
+                "-J",
+                "--envelope-payload",
+                "value",
+                "--on-invalid-json",
+                "pass",
+            ],
             vec!["jkq", "-b", "x", "-t", "t", "-p", "0", "-f", "%z"],
         ] {
             assert!(resolve(&arguments).is_err(), "{arguments:?}");
@@ -725,6 +797,35 @@ mod tests {
     }
 
     #[test]
+    fn json_value_envelope_forces_validation_without_changing_the_default() {
+        let default = resolve(&["jkq", "-b", "x", "-t", "t", "-p", "0", "-J"]).unwrap();
+        assert!(!default.transform.capabilities.parses_json);
+        assert!(matches!(
+            default.output,
+            OutputPlan::Envelope(EnvelopePayload::String)
+        ));
+
+        let value = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-p",
+            "0",
+            "-J",
+            "--envelope-payload",
+            "value",
+        ])
+        .unwrap();
+        assert!(value.transform.capabilities.parses_json);
+        assert!(matches!(
+            value.output,
+            OutputPlan::Envelope(EnvelopePayload::Value)
+        ));
+    }
+
+    #[test]
     fn cli_validates_jsonata_and_strict_variables_before_connecting() {
         let identity = resolve(&[
             "jkq",
@@ -772,7 +873,51 @@ mod tests {
             "{value: record}",
         ])
         .unwrap_err();
-        assert!(error.contains("--vars must be a valid JSON object"));
+        assert!(error.contains("$vars input must be a valid JSON object"));
+    }
+
+    #[test]
+    fn vars_file_uses_the_existing_variable_plan() {
+        let path = std::env::temp_dir().join(format!("jkq-vars-{}.json", std::process::id()));
+        let path_text = path.to_string_lossy().into_owned();
+        let source = r#"{"tenant":"acme","cutoff":10}"#;
+
+        fs::write(&path, source).unwrap();
+        let valid = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-p",
+            "0",
+            "--vars-file",
+            &path_text,
+            "--project",
+            "$vars.tenant",
+            "--check",
+        ]);
+        fs::write(&path, "[]").unwrap();
+        let invalid = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-p",
+            "0",
+            "--vars-file",
+            &path_text,
+        ]);
+        fs::remove_file(path).unwrap();
+
+        let config = valid.unwrap();
+        assert_eq!(config.transform.variables.as_deref(), Some(source));
+        assert!(
+            invalid
+                .unwrap_err()
+                .contains("$vars input must be a JSON object")
+        );
     }
 
     #[test]
@@ -811,5 +956,7 @@ mod tests {
         assert!(help.contains("Validate local configuration and exit without connecting"));
         assert!(help.contains("Owned source-byte admission budget; supports KiB, MiB, and GiB"));
         assert!(help.contains("Strict JSON object available as $vars"));
+        assert!(help.contains("Read the strict JSON object available as $vars from a file"));
+        assert!(help.contains("Representation used for the envelope payload"));
     }
 }

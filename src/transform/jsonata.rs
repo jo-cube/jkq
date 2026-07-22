@@ -34,8 +34,17 @@ pub struct ErrorPolicies {
 pub enum Action {
     Drop,
     Tombstone,
-    PassThrough(Vec<u8>),
+    PassThrough(PassPayload),
     Project(Vec<u8>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PassPayload {
+    Exact(Vec<u8>),
+    Json {
+        bytes: Vec<u8>,
+        source_length: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +80,7 @@ impl std::error::Error for TransformError {}
 
 pub(crate) struct Worker {
     parses_json: bool,
+    embeds_json: bool,
     drops: Vec<AstNode>,
     tombstones: Vec<AstNode>,
     projection: Option<AstNode>,
@@ -78,9 +88,10 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
-    pub fn new(plan: &TransformPlan) -> Self {
+    pub fn new(plan: &TransformPlan, embeds_json: bool) -> Self {
         Self {
             parses_json: plan.capabilities.parses_json,
+            embeds_json,
             drops: plan.drops.iter().map(|source| parsed(source)).collect(),
             tombstones: plan
                 .tombstones
@@ -107,7 +118,7 @@ impl Worker {
         };
         if !self.parses_json {
             return Ok(Execution {
-                action: Action::PassThrough(payload),
+                action: Action::PassThrough(PassPayload::Exact(payload)),
                 issue: None,
             });
         }
@@ -156,7 +167,20 @@ impl Worker {
             }
         }
         let Some(expression) = &self.projection else {
-            return Ok(Action::PassThrough(original));
+            if !self.embeds_json {
+                return Ok(Action::PassThrough(PassPayload::Exact(original)));
+            }
+            let source_length = original.len();
+            // Strict parsing already limits this tree to JSON variants; avoid a second full walk.
+            return document
+                .to_json_string()
+                .map(|json| {
+                    Action::PassThrough(PassPayload::Json {
+                        bytes: json.into_bytes(),
+                        source_length,
+                    })
+                })
+                .map_err(|error| evaluation_error("envelope payload", None, error.to_string()));
         };
 
         let value = self
@@ -224,7 +248,7 @@ fn invalid_json(
             issue: Some(ExecutionIssue::InvalidJson),
         }),
         InvalidJsonPolicy::Pass => Ok(Execution {
-            action: Action::PassThrough(original),
+            action: Action::PassThrough(PassPayload::Exact(original)),
             issue: Some(ExecutionIssue::InvalidJson),
         }),
     }
@@ -275,7 +299,7 @@ fn execute(
     payload: Option<Vec<u8>>,
     policies: ErrorPolicies,
 ) -> Result<Action, TransformError> {
-    Worker::new(plan)
+    Worker::new(plan, false)
         .execute_report(payload, policies)
         .map(|execution| execution.action)
 }
@@ -353,7 +377,24 @@ mod tests {
         let passed = plan(&[], &[], None, None, false);
         assert_eq!(
             run(&passed, Some(b"{ \"a\" : 1 }")).unwrap(),
-            Action::PassThrough(b"{ \"a\" : 1 }".to_vec())
+            Action::PassThrough(PassPayload::Exact(b"{ \"a\" : 1 }".to_vec()))
+        );
+    }
+
+    #[test]
+    fn json_value_pass_compacts_payload_and_retains_source_length() {
+        let transform = plan(&[], &[], None, None, true);
+        let source = b"{\n  \"a\": 1\n}";
+        let execution = Worker::new(&transform, true)
+            .execute_report(Some(source.to_vec()), FAIL)
+            .unwrap();
+
+        assert_eq!(
+            execution.action,
+            Action::PassThrough(PassPayload::Json {
+                bytes: br#"{"a":1}"#.to_vec(),
+                source_length: source.len(),
+            })
         );
     }
 
@@ -409,10 +450,10 @@ mod tests {
             (InvalidJsonPolicy::Tombstone, Action::Tombstone),
             (
                 InvalidJsonPolicy::Pass,
-                Action::PassThrough(invalid.clone()),
+                Action::PassThrough(PassPayload::Exact(invalid.clone())),
             ),
         ] {
-            let result = Worker::new(&transform)
+            let result = Worker::new(&transform, false)
                 .execute_report(
                     Some(invalid.clone()),
                     ErrorPolicies {
@@ -435,7 +476,7 @@ mod tests {
                 (EvaluationPolicy::Drop, Action::Drop),
                 (EvaluationPolicy::Tombstone, Action::Tombstone),
             ] {
-                let result = Worker::new(&transform)
+                let result = Worker::new(&transform, false)
                     .execute_report(
                         Some(b"{}".to_vec()),
                         ErrorPolicies {
@@ -489,7 +530,7 @@ mod tests {
         let passed = plan(&[], &[], None, None, false);
         assert_eq!(
             run(&passed, Some(b"")).unwrap(),
-            Action::PassThrough(Vec::new())
+            Action::PassThrough(PassPayload::Exact(Vec::new()))
         );
         assert_eq!(run(&passed, None).unwrap(), Action::Tombstone);
     }
@@ -539,7 +580,7 @@ mod tests {
     #[test]
     fn evaluator_root_and_assignments_do_not_leak_between_records() {
         let transform = plan(&[], &[], Some("($seen := id; $seen)"), None, false);
-        let worker = Worker::new(&transform);
+        let worker = Worker::new(&transform, false);
         for (input, expected) in [
             (br#"{"id":1}"#.as_slice(), b"1".as_slice()),
             (br#"{"id":2}"#.as_slice(), b"2".as_slice()),
