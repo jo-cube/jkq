@@ -2,7 +2,14 @@
 
 `jkq` consumes one Kafka topic through direct partition assignment, transforms
 JSON values, and writes record data to stdout. Run `jkq --help` for the complete
-option list.
+option list and `jkq --version` for the build version.
+
+Jump to [assignment and ranges](#assignment-and-ranges),
+[transforms](#transforms), [output](#output), [error policies](#error-policies),
+[Kafka configuration](#kafka-configuration),
+[parallelism and memory](#parallelism-and-memory),
+[high-throughput patterns](#high-throughput-patterns), or
+[statistics, signals, and exit status](#statistics-signals-and-exit-status).
 
 `--check` validates the complete local invocation and exits without creating a
 Kafka consumer. It checks required arguments, option combinations, partition
@@ -11,18 +18,20 @@ test broker reachability or ask librdkafka to validate property values.
 
 ## Assignment and Ranges
 
-A broker list, topic, and at least one partition are required:
+Brokers, a topic (`-t, --topic`), and at least one partition
+(`-p, --partition`) are required. Supply brokers with `-b, --brokers`, through
+`bootstrap.servers` in `-F`, or with `-X`:
 
 ```sh
 jkq -b localhost:9092 -t events -p 0,2,4-7 -p 9
 ```
 
-`-p` accepts comma-separated partitions and inclusive ascending ranges, and is
-repeatable. Selection order is preserved but does not create a cross-partition
-output order. Duplicate, descending, negative, and empty selections are
-rejected. A selection may expand to at most 100,000 partitions. `jkq` does not
-join a consumer group or commit offsets; a configured `group.id` is only passed
-to librdkafka.
+`-p, --partition` accepts comma-separated partitions and inclusive ascending
+ranges, and is repeatable. Selection order is preserved but does not create a
+cross-partition output order. Duplicate, descending, negative, and empty
+selections are rejected. A selection may expand to at most 100,000 partitions.
+`jkq` does not join a consumer group or commit offsets; a configured `group.id`
+is only passed to librdkafka.
 
 The default start is `beginning`. `-o, --offset` accepts:
 
@@ -252,7 +261,7 @@ There is no implicit configuration-file discovery.
 
 `-j, --jobs` controls JSON compute workers. The default is available CPU
 parallelism minus two, with a minimum of one. Identity transforms bypass the
-worker pool.
+worker pool. Values must be between 1 and 1024.
 
 Output remains ordered within each partition. `--unordered` emits transformed
 records as workers complete and removes that guarantee.
@@ -271,6 +280,9 @@ payload, key, header names, and header values required by the output plan. It
 does not account for jsonata-core's parsed value tree, evaluation
 intermediates, or projected output. Full JSONata can construct data-dependent
 results, so those allocations are not statically bounded by this option.
+
+All three limits must be positive. `--max-inflight-per-partition` cannot exceed
+`--max-inflight-records`.
 
 A source record larger than the byte budget may run alone. When admission
 limits are reached, `jkq` pauses affected partitions while continuing to serve
