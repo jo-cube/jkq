@@ -39,7 +39,30 @@ Use `jkq` to:
 administration suite, service, or general stream-processing framework. It
 consumes one topic per invocation through direct partition assignment.
 
-## Build
+## Install
+
+Install the latest release to `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jo-cube/jkq/main/scripts/install.sh | sh
+```
+
+Install to a custom directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jo-cube/jkq/main/scripts/install.sh | sh -s -- "$HOME/bin"
+```
+
+Install a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jo-cube/jkq/main/scripts/install.sh | VERSION=v0.2.0 sh
+```
+
+Release archives are verified with SHA-256 checksums. Published platforms are
+Linux amd64, Linux arm64, and macOS arm64.
+
+## Build from Source
 
 Install stable Rust and the native tools required to build bundled librdkafka
 and OpenSSL, then run:
@@ -51,8 +74,7 @@ cargo build --release --locked
 On Unix, this normally requires a C compiler, `make`, Perl, and `pkg-config`.
 The executable is written to `target/release/jkq`.
 
-Tagged GitHub releases provide binary archives and SHA-256 checksums for Linux
-amd64, Linux arm64, and macOS arm64. There is no installer.
+Other platforms can build from source.
 
 ## Quick Use
 

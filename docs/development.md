@@ -15,9 +15,11 @@ src/runtime.rs           bounded execution pipeline
 src/runtime/state.rs     admission and ordering state
 src/output.rs            formats and JSON envelopes
 tests/process.rs         Unix process tests
+tests/install.sh         release installer integration test
 .github/workflows/ci.yml source checks on Linux
 .github/workflows/release.yml tagged release archives and checksums
 .github/dependabot.yml weekly dependency update checks
+scripts/install.sh       checksum-verifying release installer
 ```
 
 [architecture.md](architecture.md) explains ownership and data flow.
@@ -45,6 +47,7 @@ make check
 This runs:
 
 ```sh
+sh tests/install.sh
 cargo fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
@@ -55,7 +58,8 @@ CI runs the same checks. A release tag must match the package version, such as
 archives, execute each binary as a smoke test, and attach each archive and its
 SHA-256 checksum to the GitHub release. GNU binaries are built on Ubuntu 26.04;
 build locally when compatibility with an older glibc-based system is required.
-There is no installer or crates.io publication.
+`scripts/install.sh` installs supported release binaries after verifying their
+published checksums. There is no crates.io publication.
 
 ## Tests
 
@@ -72,6 +76,7 @@ Most tests live beside the code they cover:
 - app tests use librdkafka's mock cluster for assignment, ranges, tombstones,
   metadata, snapshots, and oversized records;
 - `tests/process.rs` covers broken pipes and signal behavior on Unix.
+- `tests/install.sh` verifies release URL selection, checksums, and installation.
 
 Prefer the cheapest layer that establishes the behavior. Concurrency tests
 should control event order with channels or explicit state rather than timing.
