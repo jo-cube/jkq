@@ -76,10 +76,12 @@ jkq -b localhost:9092 -t events -p 0 --snapshot \
 
 All expressions use native [JSONata](https://jsonata.org/) syntax and semantics.
 `--vars <object>` accepts one strict JSON object and binds it as `$vars` for
-every expression. Invalid JSON and non-object roots are startup errors and are
-also rejected by `--check`. Expressions access values through paths such as
-`$vars.tenant`, `$vars.policy.cutoff`, and `$vars["non-identifier"]`.
-Referencing `$vars` without supplying it evaluates as JSONata `Undefined`.
+every expression. `--vars-file <path>` reads the same object from a UTF-8 file;
+the two options are mutually exclusive. File errors, invalid JSON, and
+non-object roots are startup errors and are also rejected by `--check`.
+Expressions access values through paths such as `$vars.tenant`,
+`$vars.policy.cutoff`, and `$vars["non-identifier"]`. Referencing `$vars`
+without supplying it evaluates as JSONata `Undefined`.
 
 For each non-tombstone input, `jkq`:
 

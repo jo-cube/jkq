@@ -71,6 +71,9 @@ pub struct RawCli {
     /// Strict JSON object available as $vars
     #[arg(long, value_name = "OBJECT")]
     vars: Option<String>,
+    /// Read the strict JSON object available as $vars from a file
+    #[arg(long, value_name = "PATH", conflicts_with = "vars")]
+    vars_file: Option<PathBuf>,
     /// Kcat-style output format
     #[arg(short = 'f', long, conflicts_with = "json_envelope")]
     format: Option<String>,
@@ -264,11 +267,19 @@ impl RawCli {
             RawEvaluationPolicy::Drop => EvaluationPolicy::Drop,
             RawEvaluationPolicy::Tombstone => EvaluationPolicy::Tombstone,
         };
+        let file_variables = self
+            .vars_file
+            .as_ref()
+            .map(|path| {
+                fs::read_to_string(path)
+                    .map_err(|error| format!("cannot read --vars-file {}: {error}", path.display()))
+            })
+            .transpose()?;
         let transform = build_plan(
             &self.drop_if,
             &self.tombstone_if,
             self.project.as_deref(),
-            self.vars.as_deref(),
+            file_variables.as_deref().or(self.vars.as_deref()),
             force_json_validation,
         )?;
         let output = if self.json_envelope {
@@ -638,6 +649,19 @@ mod tests {
                 "--max-inflight-bytes",
                 "0",
             ],
+            vec![
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                "-p",
+                "0",
+                "--vars",
+                "{}",
+                "--vars-file",
+                "vars.json",
+            ],
             vec!["jkq", "-b", "x", "-t", "t", "-p", "0", "-f", "%z"],
         ] {
             assert!(resolve(&arguments).is_err(), "{arguments:?}");
@@ -772,7 +796,51 @@ mod tests {
             "{value: record}",
         ])
         .unwrap_err();
-        assert!(error.contains("--vars must be a valid JSON object"));
+        assert!(error.contains("$vars input must be a valid JSON object"));
+    }
+
+    #[test]
+    fn vars_file_uses_the_existing_variable_plan() {
+        let path = std::env::temp_dir().join(format!("jkq-vars-{}.json", std::process::id()));
+        let path_text = path.to_string_lossy().into_owned();
+        let source = r#"{"tenant":"acme","cutoff":10}"#;
+
+        fs::write(&path, source).unwrap();
+        let valid = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-p",
+            "0",
+            "--vars-file",
+            &path_text,
+            "--project",
+            "$vars.tenant",
+            "--check",
+        ]);
+        fs::write(&path, "[]").unwrap();
+        let invalid = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-p",
+            "0",
+            "--vars-file",
+            &path_text,
+        ]);
+        fs::remove_file(path).unwrap();
+
+        let config = valid.unwrap();
+        assert_eq!(config.transform.variables.as_deref(), Some(source));
+        assert!(
+            invalid
+                .unwrap_err()
+                .contains("$vars input must be a JSON object")
+        );
     }
 
     #[test]
@@ -811,5 +879,6 @@ mod tests {
         assert!(help.contains("Validate local configuration and exit without connecting"));
         assert!(help.contains("Owned source-byte admission budget; supports KiB, MiB, and GiB"));
         assert!(help.contains("Strict JSON object available as $vars"));
+        assert!(help.contains("Read the strict JSON object available as $vars from a file"));
     }
 }

@@ -42,8 +42,8 @@ evaluator, context, and value APIs.
 Before polling, `jkq`:
 
 1. parses and validates the CLI and librdkafka properties;
-2. parses every JSONata expression and validates the strict JSON `--vars`
-   object;
+2. reads an optional `--vars-file`, parses every JSONata expression, and
+   validates the strict JSON `$vars` object;
 3. stores only expression source and variable JSON in the shared transform
    plan;
 4. compiles the output format and its metadata requirements;

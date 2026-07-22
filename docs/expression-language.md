@@ -79,8 +79,15 @@ omission otherwise apply. A projected JSON `null` is the four-byte payload
 --vars '{"tenant":"acme","cutoff":1000}'
 ```
 
-Invalid JSON and non-object roots fail during startup and `--check`.
-Expressions access the immutable object as `$vars`, for example
+`--vars-file` reads the same object from a UTF-8 file and is mutually exclusive
+with `--vars`:
+
+```sh
+--vars-file variables.json
+```
+
+File errors, invalid JSON, and non-object roots fail during startup and
+`--check`. Expressions access the immutable object as `$vars`, for example
 `$vars.tenant` and `$vars.cutoff`.
 
 Each expression evaluation receives a clean JSONata context containing the
