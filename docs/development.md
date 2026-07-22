@@ -53,13 +53,17 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ```
 
-CI runs the same checks. A release tag must match the package version, such as
-`v0.1.0`. Release jobs build native Linux amd64, Linux arm64, and macOS arm64
-archives, execute each binary as a smoke test, and attach each archive and its
-SHA-256 checksum to the GitHub release. GNU binaries are built on Ubuntu 26.04;
-build locally when compatibility with an older glibc-based system is required.
-`scripts/install.sh` installs supported release binaries after verifying their
-published checksums. There is no crates.io publication.
+CI runs the same checks.
+
+## Release Packaging
+
+A release tag must match the package version with a `v` prefix. Release jobs
+build native Linux amd64, Linux arm64, and macOS arm64 archives, execute each
+binary as a smoke test, and attach each archive and its SHA-256 checksum to the
+GitHub release. GNU binaries are built on Ubuntu 26.04; build locally when
+compatibility with an older glibc-based system is required. `scripts/install.sh`
+installs supported release binaries after verifying their published checksums.
+There is no crates.io publication.
 
 ## Tests
 
@@ -75,7 +79,7 @@ Most tests live beside the code they cover:
   frontiers;
 - app tests use librdkafka's mock cluster for assignment, ranges, tombstones,
   metadata, snapshots, and oversized records;
-- `tests/process.rs` covers broken pipes and signal behavior on Unix.
+- `tests/process.rs` covers broken pipes and signal behavior on Unix;
 - `tests/install.sh` verifies release URL selection, checksums, and installation.
 
 Prefer the cheapest layer that establishes the behavior. Concurrency tests
@@ -144,11 +148,11 @@ Keep each fact in one place:
 
 | Document | Owns |
 |---|---|
-| root `README.md` | purpose, scope, quick start, build entrypoint |
+| root `README.md` | purpose, scope, installation, build, and quick start |
 | `usage.md` | CLI workflows and output behavior |
 | `expression-language.md` | jkq's JSONata integration contract and deviations |
 | `architecture.md` | module boundaries, ownership, and invariants |
-| `development.md` | contributor workflow, tests, and dependencies |
+| `development.md` | contributor workflow, tests, dependencies, and releases |
 
 Update the owning document when observable behavior or an architectural
 invariant changes. Prefer examples and current facts over roadmaps, historical

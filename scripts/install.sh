@@ -18,7 +18,7 @@ Arguments:
   destination Optional install directory (default: ${INSTALL_DIR})
 
 Environment:
-  VERSION            Release tag to install, for example: v0.2.0 (default: latest)
+  VERSION            Release tag to install (default: latest)
   INSTALL_DIR        Destination directory (default: ~/.local/bin)
   GITHUB_REPOSITORY  GitHub repo in owner/name form (default: jo-cube/jkq)
 EOF
