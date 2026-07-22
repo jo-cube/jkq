@@ -256,6 +256,143 @@ limits are reached, `jkq` pauses affected partitions while continuing to serve
 Kafka events. Channels, admitted record counts, per-partition admission, and
 source-byte accounting remain bounded.
 
+## High-throughput Patterns
+
+High-throughput runs benefit most from keeping the work per input record
+predictable. Build with `--release`, test against representative records, and
+change one setting at a time rather than assuming that more workers or larger
+buffers will help.
+
+### Use objects for large membership sets
+
+JSONata defines [`in`](https://docs.jsonata.org/comparison-operators) as array
+inclusion, which tests values in the right-hand array. For policy sets that may
+grow to thousands of entries, encode each set as an object and use the standard
+[`$lookup`](https://docs.jsonata.org/object-functions) function to look up the
+concatenated key.
+
+For example, `policy.json` can contain:
+
+```json
+{
+  "whitelist": {
+    "acme:123": true,
+    "acme:456": true
+  },
+  "blacklist": {
+    "blocked:999": true
+  }
+}
+```
+
+This predicate computes the key once, tombstones blacklisted records, lets the
+whitelist override the blacklist, and passes records in neither set:
+
+```sh
+jkq -F kafka.properties -t events -p 0-31 --snapshot \
+  --vars-file policy.json \
+  --tombstone-if '(
+    $key := tenant & ":" & account;
+    ($lookup($vars.blacklist, $key) = true) and
+      $not($lookup($vars.whitelist, $key) = true)
+  )' \
+  -f '%K\t%k%R%s'
+```
+
+The `true` values make membership explicit: a present key compares equal to
+`true`, while a missing key does not. Change the Boolean expression when the
+sets use different precedence. For example, to pass only whitelisted records
+that are not blacklisted, use:
+
+```jsonata
+$not($lookup($vars.whitelist, $key) = true) or
+  ($lookup($vars.blacklist, $key) = true)
+```
+
+Keep related policy in one expression when it shares derived values such as
+`$key`. Separate repeated predicates remain useful when an early, cheap
+predicate commonly matches and avoids later work. The JSONata
+[`&` operator](https://docs.jsonata.org/other-operators) converts non-string
+operands to strings; include separators or other disambiguation when different
+attribute combinations could otherwise produce the same key.
+
+The variables object is parsed once per worker rather than once per record.
+Each worker holds its own copy, so account for the set size when increasing
+`--jobs`.
+
+### Preserve bytes and emit only required metadata
+
+When predicates choose between pass and tombstone, omit `--project` unless the
+payload must change. Passing preserves the exact source payload and avoids
+projection serialization.
+
+The example format above is compact and stream-decodable: `%K\t` writes a
+decimal key length followed by a tab, `%k` writes that many key bytes, and
+`%R%s` writes a signed four-byte payload length followed by the payload. A
+payload length of `-1` represents a tombstone. Choose a different format when
+the downstream protocol has its own framing.
+
+Avoid `--unbuffered` on throughput-oriented runs. JSON envelopes are useful
+when their self-describing metadata is required; a focused `-f` format avoids
+encoding fields the downstream consumer does not use.
+
+### Scale with partitions, then tune workers
+
+The default worker count leaves one CPU for Kafka polling and one for output.
+Measure nearby `--jobs` values with representative payloads and expressions;
+additional workers can increase contention after polling or output becomes the
+bottleneck.
+
+Keep the default per-partition ordering when later records update earlier
+records. Use `--unordered` only when completion order is acceptable. If one
+invocation reaches its polling or output limit and the topic has enough
+partitions, run independent invocations over disjoint partition sets:
+
+```sh
+jkq -F kafka.properties -t events -p 0-15 --snapshot \
+  -f '%R%s' > shard-0.bin &
+jkq -F kafka.properties -t events -p 16-31 --snapshot \
+  -f '%R%s' > shard-1.bin &
+wait
+```
+
+This preserves ordering within every partition; `jkq` never provides global
+ordering across partitions. Adjust the in-flight limits only when measurements
+show worker starvation or excessive retained memory.
+
+### Validate a bounded slice first
+
+Use the same expressions, variables, output format, and Kafka properties that
+the full run will use. `--check` validates them without connecting to Kafka.
+Then process a bounded sample before starting the complete range:
+
+```sh
+policy='(
+  $key := tenant & ":" & account;
+  ($lookup($vars.blacklist, $key) = true) and
+    $not($lookup($vars.whitelist, $key) = true)
+)'
+
+jkq -F kafka.properties -t events -p 0-31 \
+  --count-per-partition 100000 \
+  --vars-file policy.json \
+  --tombstone-if "$policy" \
+  --stats-interval 10s \
+  -f '%K\t%k%R%s' > sample.bin
+```
+
+Check the action counts, output framing, memory use, and downstream behavior.
+Statistics add per-record bookkeeping, so compare with them disabled when
+measuring maximum throughput.
+
+For Kafka client tuning, use librdkafka's authoritative
+[configuration reference](https://github.com/confluentinc/librdkafka/blob/v2.12.1/CONFIGURATION.md)
+and [statistics reference](https://github.com/confluentinc/librdkafka/blob/v2.12.1/STATISTICS.md)
+for the version currently bundled by jkq.
+Pass measured configuration changes through `-F` or `-X`; avoid copying a
+generic tuning profile without validating it against the brokers and payloads
+used by the run.
+
 ## Statistics, Signals, and Exit Status
 
 `--stats` writes a final report to stderr. `--stats-interval` also writes

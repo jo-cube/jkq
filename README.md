@@ -91,6 +91,8 @@ payloads may contain newlines or arbitrary bytes.
 
 - [Usage](docs/usage.md): offsets, transforms, output, errors, and runtime
   controls.
+- [High-throughput patterns](docs/usage.md#high-throughput-patterns): large
+  policy sets, output framing, partition scaling, and bounded validation.
 - [JSONata integration](docs/expression-language.md): jkq's predicate,
   projection, variables, result, and error contracts.
 - [Architecture](docs/architecture.md): data flow, ownership, ordering, and
