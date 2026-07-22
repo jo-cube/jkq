@@ -17,7 +17,8 @@ A successfully processed input record produces one of four actions:
 
 - **drop**: write nothing;
 - **tombstone**: retain the source metadata with a null Kafka payload;
-- **pass**: preserve the exact source value bytes;
+- **pass**: preserve the exact source value bytes unless a JSON-value envelope
+  is requested;
 - **project**: write compact JSON produced by JSONata.
 
 Kafka tombstones bypass JSON parsing and JSONata evaluation and remain
@@ -83,6 +84,9 @@ envelopes:
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot -J
 ```
+
+Add `--envelope-payload value` to embed the post-transform payload as JSON
+instead of a JSON string.
 
 The default output is `%s\n`. Use `%R%s` or another explicit frame when
 payloads may contain newlines or arbitrary bytes.

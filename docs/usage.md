@@ -88,7 +88,8 @@ For each non-tombstone input, `jkq`:
 1. evaluates repeated `--drop-if` predicates in command-line order;
 2. evaluates repeated `--tombstone-if` predicates in command-line order;
 3. applies the optional `--project` expression;
-4. otherwise passes the exact source bytes through.
+4. otherwise passes the source payload through, preserving its exact bytes
+   unless `--envelope-payload value` is selected.
 
 Each predicate list stops at its first Boolean `true` result. The top-level
 result of an action predicate must be a JSONata Boolean; JSONata truthiness is
@@ -149,11 +150,30 @@ emitted record and cannot be combined with `-f`:
 {"topic":"events","partition":0,"offset":42,"timestamp":null,"timestampType":null,"key":"key","keyEncoding":"utf8","keyLength":3,"headers":[],"action":"project","payload":"{\"id\":1}","payloadEncoding":"utf8","payloadLength":8}
 ```
 
-Keys, header values, and payloads are strings rather than embedded JSON.
-Valid UTF-8 uses encoding `"utf8"`; other bytes use RFC 4648 base64 and
+By default, keys, header values, and payloads are strings rather than embedded
+JSON. Valid UTF-8 uses encoding `"utf8"`; other bytes use RFC 4648 base64 and
 encoding `"base64"`. Null uses a JSON null value, null encoding, and length
 `-1`. This keeps pass-through bytes exact and represents invalid JSON handled
 with the `pass` policy without changing the schema.
+
+`--envelope-payload value` embeds the post-transform payload as a JSON value:
+
+```json
+{"topic":"events","partition":0,"offset":42,"timestamp":null,"timestampType":null,"key":"key","keyEncoding":"utf8","keyLength":3,"headers":[],"action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":8}
+```
+
+A projected payload reuses the compact JSON already produced by JSONata. A
+pass-through payload is parsed once by the worker and serialized compactly, so
+whitespace and number spelling may change and a multiline input still produces
+one envelope line. For a pass action, `payloadLength` remains the source payload
+byte length; for a project action, it is the compact projected byte length. The
+source text `null` and a projected JSON `null` have payload `null`, encoding
+`"json"`, and length `4`; a tombstone has payload `null`, null encoding, and
+length `-1`.
+
+JSON-value envelopes force JSON validation even when no expressions are used.
+They cannot be combined with `--on-invalid-json pass`, because every emitted
+non-tombstone payload must retain the JSON-value schema.
 
 Available timestamp types are `"createTime"` and `"logAppendTime"`. Envelope
 headers contain `name`, `value`, `valueEncoding`, and `valueLength` in source
@@ -174,7 +194,8 @@ failures into an explicit action:
 | `--on-eval-error` | `fail`, `drop`, `tombstone` |
 | `--on-kafka-error` | `fail`, `continue` |
 
-`pass` preserves the original payload exactly. Fatal Kafka state errors and
+`pass` preserves the original payload exactly. It cannot be selected for
+invalid JSON with `--envelope-payload value`. Fatal Kafka state errors and
 unavailable requested offsets remain fatal even when `--on-kafka-error
 continue` is selected.
 
@@ -334,7 +355,9 @@ the downstream protocol has its own framing.
 
 Avoid `--unbuffered` on throughput-oriented runs. JSON envelopes are useful
 when their self-describing metadata is required; a focused `-f` format avoids
-encoding fields the downstream consumer does not use.
+encoding fields the downstream consumer does not use. JSON-value envelopes
+also compactly serialize pass-through payloads, so use that mode when the
+downstream consumer benefits from a typed JSON field.
 
 ### Scale with partitions, then tune workers
 

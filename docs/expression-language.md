@@ -34,7 +34,8 @@ jsonata-core value and reuses it while it:
 2. evaluates `--tombstone-if` expressions in command-line order, stopping at
    the first Boolean `true`;
 3. evaluates `--project`, when present;
-4. otherwise passes through the exact source payload bytes.
+4. otherwise passes through the source payload, preserving its exact bytes
+   unless `--envelope-payload value` requests compact JSON serialization.
 
 Existing Kafka tombstones bypass JSON parsing and every expression. A
 successfully evaluated input record produces one action; a JSONata result

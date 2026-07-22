@@ -89,7 +89,8 @@ When fixing a defect:
 
 Optimize the record path, not startup convenience. Preserve these properties:
 
-- exact source bytes for pass-through;
+- exact source bytes for pass-through unless JSON-value envelope serialization
+  was explicitly selected;
 - bounded channels, admitted records, per-partition work, and owned source
   bytes;
 - continued Kafka event polling during backpressure;
