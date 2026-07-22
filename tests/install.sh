@@ -51,14 +51,14 @@ PATH="$TMP_DIR/mock-bin:$PATH" \
 	FIXTURES="$TMP_DIR/fixtures" \
 	CURL_LOG="$TMP_DIR/curl.log" \
 	INSTALL_DIR="$TMP_DIR/install" \
-	VERSION='v0.2.0' \
+	VERSION='v9.9.9' \
 	sh "$ROOT/scripts/install.sh" >/dev/null
 
 test "$("$TMP_DIR/install/jkq")" = 'jkq fixture'
 test "$(sed -n '1p' "$TMP_DIR/curl.log")" = \
-	'https://github.com/jo-cube/jkq/releases/download/v0.2.0/jkq_linux_amd64.tar.gz'
+	'https://github.com/jo-cube/jkq/releases/download/v9.9.9/jkq_linux_amd64.tar.gz'
 test "$(sed -n '2p' "$TMP_DIR/curl.log")" = \
-	'https://github.com/jo-cube/jkq/releases/download/v0.2.0/jkq_linux_amd64.tar.gz.sha256'
+	'https://github.com/jo-cube/jkq/releases/download/v9.9.9/jkq_linux_amd64.tar.gz.sha256'
 
 printf '%064d  jkq_linux_amd64.tar.gz\n' 0 > \
 	"$TMP_DIR/fixtures/jkq_linux_amd64.tar.gz.sha256"
