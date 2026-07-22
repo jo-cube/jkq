@@ -56,11 +56,14 @@ curl -fsSL https://raw.githubusercontent.com/jo-cube/jkq/main/scripts/install.sh
 Install a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jo-cube/jkq/main/scripts/install.sh | VERSION=v0.2.0 sh
+curl -fsSL https://raw.githubusercontent.com/jo-cube/jkq/main/scripts/install.sh | VERSION=v0.3.0 sh
 ```
 
-Release archives are verified with SHA-256 checksums. Published platforms are
-Linux amd64, Linux arm64, and macOS arm64.
+Release archives are verified with SHA-256 checksums. Published platforms:
+
+- `linux/amd64`
+- `linux/arm64`
+- `darwin/arm64`
 
 ## Build from Source
 
