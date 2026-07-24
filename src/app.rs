@@ -207,6 +207,47 @@ mod tests {
     }
 
     #[test]
+    fn omitted_partition_selects_all_topic_partitions() {
+        let fixture = Fixture::new("all-partitions", 2);
+        fixture.produce(0, Some(b"zero"), None, 0, None);
+        fixture.produce(1, Some(b"one"), None, 0, None);
+        let config = fixture.config(&["--snapshot", "-f", "%p:%s\n"]);
+
+        let mut output = Vec::new();
+        run_with_writer(&config, &mut output).unwrap();
+        let mut lines = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        lines.sort_unstable();
+
+        assert_eq!(lines, [b"0:zero".as_slice(), b"1:one".as_slice()]);
+    }
+
+    #[test]
+    fn zstd_compressed_records_are_consumed() {
+        let fixture = Fixture::new("zstd", 1);
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", &fixture.brokers)
+            .set("compression.codec", "zstd")
+            .create()
+            .unwrap();
+        producer
+            .send(BaseRecord::<(), [u8]>::to(fixture.topic).payload(br#"{"value":"compressed"}"#))
+            .map_err(|(error, _record)| error)
+            .unwrap();
+        producer.flush(Duration::from_secs(5)).unwrap();
+
+        let config = fixture.config(&["-p", "0", "--snapshot"]);
+        let input = KafkaInput::prepare(&config).unwrap();
+        let mut output = Vec::new();
+        let mut signals = SignalControl::install().unwrap();
+        consume(&config, input, &mut output, &mut signals).unwrap();
+
+        assert_eq!(output, b"{\"value\":\"compressed\"}\n");
+    }
+
+    #[test]
     fn absolute_and_relative_offsets_are_exclusive() {
         let fixture = Fixture::new("offset-ranges", 1);
         for (value, timestamp) in [100, 200, 300, 400].into_iter().enumerate() {
