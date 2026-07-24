@@ -9,7 +9,7 @@ use rdkafka::{
 };
 
 use crate::{
-    cli::{EndPosition, KafkaErrorPolicy, RuntimeConfig, StartPosition},
+    cli::{EndPosition, KafkaErrorPolicy, MAX_ASSIGNED_PARTITIONS, RuntimeConfig, StartPosition},
     output::{Header, OutputRequirements, Timestamp, TimestampType},
 };
 
@@ -54,41 +54,60 @@ pub struct KafkaInput {
 impl KafkaInput {
     pub fn prepare(config: &RuntimeConfig) -> Result<Self, String> {
         let consumer = create_consumer(config)?;
-        let watermarks = fetch_watermarks(&consumer, &config.topic, &config.partitions)?;
+        let partitions = match &config.partitions {
+            Some(partitions) => partitions.clone(),
+            None => fetch_topic_partitions(&consumer, &config.topic)?,
+        };
+        let watermarks = watermarks_required(&config.start, config.end.as_ref())
+            .then(|| fetch_watermarks(&consumer, &config.topic, &partitions))
+            .transpose()?;
         let timestamp_starts = match config.start {
             StartPosition::TimestampMillis(timestamp) => Some(offsets_for_timestamp(
                 &consumer,
                 &config.topic,
-                &config.partitions,
+                &partitions,
                 timestamp,
-                &watermarks,
+                watermarks
+                    .as_ref()
+                    .expect("timestamp starts require watermarks"),
             )?),
             _ => None,
         };
-        let starts = config
-            .partitions
+        let starts = partitions
             .iter()
             .map(|partition| {
-                let (low, high) = watermarks[partition];
                 let start = match config.start {
-                    StartPosition::Beginning => low,
-                    StartPosition::End => high,
-                    StartPosition::Absolute(offset) => offset,
-                    StartPosition::RelativeToEnd(distance) => high
-                        .saturating_sub(i64::try_from(distance).unwrap_or(i64::MAX))
-                        .max(low),
-                    StartPosition::TimestampMillis(_) => timestamp_starts
-                        .as_ref()
-                        .expect("timestamp starts were resolved")[partition],
+                    StartPosition::Beginning => {
+                        watermarks.as_ref().map_or(Offset::Beginning, |watermarks| {
+                            Offset::Offset(watermarks[partition].0)
+                        })
+                    }
+                    StartPosition::End => Offset::Offset(
+                        watermarks.as_ref().expect("end requires watermarks")[partition].1,
+                    ),
+                    StartPosition::Absolute(offset) => Offset::Offset(offset),
+                    StartPosition::RelativeToEnd(distance) => {
+                        let (low, high) = watermarks
+                            .as_ref()
+                            .expect("relative start requires watermarks")[partition];
+                        Offset::Offset(
+                            high.saturating_sub(i64::try_from(distance).unwrap_or(i64::MAX))
+                                .max(low),
+                        )
+                    }
+                    StartPosition::TimestampMillis(_) => Offset::Offset(
+                        timestamp_starts
+                            .as_ref()
+                            .expect("timestamp starts were resolved")[partition],
+                    ),
                 };
                 (*partition, start)
             })
             .collect::<BTreeMap<_, _>>();
 
-        let mut fixed_ends = match config.end {
+        let fixed_ends = match config.end {
             Some(EndPosition::ExclusiveOffset(offset)) => Some(
-                config
-                    .partitions
+                partitions
                     .iter()
                     .map(|partition| (*partition, offset))
                     .collect(),
@@ -96,41 +115,46 @@ impl KafkaInput {
             Some(EndPosition::TimestampMillis(timestamp)) => Some(offsets_for_timestamp(
                 &consumer,
                 &config.topic,
-                &config.partitions,
+                &partitions,
                 timestamp,
-                &watermarks,
+                watermarks
+                    .as_ref()
+                    .expect("timestamp ends require watermarks"),
             )?),
-            Some(EndPosition::Snapshot) => None,
+            Some(EndPosition::Snapshot) => Some(
+                watermarks
+                    .as_ref()
+                    .expect("snapshot requires watermarks")
+                    .iter()
+                    .map(|(partition, (_, high))| (*partition, *high))
+                    .collect(),
+            ),
             None => None,
         };
 
-        let mut assignment = TopicPartitionList::with_capacity(config.partitions.len());
-        for partition in &config.partitions {
+        let mut assignment = TopicPartitionList::with_capacity(partitions.len());
+        for partition in &partitions {
             let start = starts[partition];
             assignment
-                .add_partition_offset(&config.topic, *partition, Offset::Offset(start))
+                .add_partition_offset(&config.topic, *partition, start)
                 .map_err(|error| assignment_error(&config.topic, *partition, error))?;
         }
         consumer
             .assign(&assignment)
             .map_err(|error| format!("cannot assign topic {}: {error}", config.topic))?;
-        if config.end == Some(EndPosition::Snapshot) {
-            fixed_ends = Some(
-                fetch_watermarks(&consumer, &config.topic, &config.partitions)?
-                    .into_iter()
-                    .map(|(partition, (_, high))| (partition, high))
-                    .collect(),
-            );
-        }
         let partitions = starts
             .into_iter()
             .map(|(partition, start)| {
                 let end_exclusive = fixed_ends.as_ref().map(|boundaries| boundaries[&partition]);
+                let done = match (start, end_exclusive) {
+                    (Offset::Offset(start), Some(end)) => start >= end,
+                    _ => false,
+                };
                 (
                     partition,
                     PartitionState {
                         end_exclusive,
-                        done: end_exclusive.is_some_and(|end| start >= end),
+                        done,
                         paused: false,
                     },
                 )
@@ -157,6 +181,10 @@ impl KafkaInput {
             input.set_paused(partition, true)?;
         }
         Ok(input)
+    }
+
+    pub(crate) fn assigned_partitions(&self) -> Vec<i32> {
+        self.partitions.keys().copied().collect()
     }
 
     pub fn poll(&mut self) -> Result<PollEvent, String> {
@@ -380,6 +408,49 @@ fn fetch_watermarks(
         .collect()
 }
 
+fn watermarks_required(start: &StartPosition, end: Option<&EndPosition>) -> bool {
+    match start {
+        StartPosition::Beginning => end.is_some(),
+        StartPosition::End
+        | StartPosition::RelativeToEnd(_)
+        | StartPosition::TimestampMillis(_) => true,
+        StartPosition::Absolute(_) => {
+            matches!(
+                end,
+                Some(EndPosition::TimestampMillis(_) | EndPosition::Snapshot)
+            )
+        }
+    }
+}
+
+fn fetch_topic_partitions(consumer: &BaseConsumer, topic: &str) -> Result<Vec<i32>, String> {
+    let metadata = consumer
+        .fetch_metadata(Some(topic), METADATA_TIMEOUT)
+        .map_err(|error| format!("cannot fetch metadata for topic {topic}: {error}"))?;
+    let metadata = metadata
+        .topics()
+        .iter()
+        .find(|metadata| metadata.name() == topic)
+        .ok_or_else(|| format!("metadata response did not include topic {topic}"))?;
+    if let Some(error) = metadata.error() {
+        let error = RDKafkaErrorCode::from(error);
+        return Err(format!("cannot fetch metadata for topic {topic}: {error}"));
+    }
+    if metadata.partitions().is_empty() {
+        return Err(format!("topic {topic} has no partitions"));
+    }
+    if metadata.partitions().len() > MAX_ASSIGNED_PARTITIONS {
+        return Err(format!(
+            "topic {topic} has more than the {MAX_ASSIGNED_PARTITIONS} partition limit"
+        ));
+    }
+    Ok(metadata
+        .partitions()
+        .iter()
+        .map(|partition| partition.id())
+        .collect())
+}
+
 fn offsets_for_timestamp(
     consumer: &BaseConsumer,
     topic: &str,
@@ -465,6 +536,43 @@ mod tests {
             timestamp_offset(Offset::Offset(3), 7, "t", 0, 10).unwrap(),
             3
         );
+    }
+
+    #[test]
+    fn only_ranges_that_need_watermarks_request_them() {
+        for (start, end, expected) in [
+            (StartPosition::Beginning, None, false),
+            (StartPosition::Absolute(3), None, false),
+            (
+                StartPosition::Absolute(3),
+                Some(EndPosition::ExclusiveOffset(7)),
+                false,
+            ),
+            (
+                StartPosition::Beginning,
+                Some(EndPosition::ExclusiveOffset(7)),
+                true,
+            ),
+            (StartPosition::End, None, true),
+            (StartPosition::RelativeToEnd(3), None, true),
+            (StartPosition::TimestampMillis(3), None, true),
+            (
+                StartPosition::Absolute(3),
+                Some(EndPosition::TimestampMillis(7)),
+                true,
+            ),
+            (
+                StartPosition::Absolute(3),
+                Some(EndPosition::Snapshot),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                watermarks_required(&start, end.as_ref()),
+                expected,
+                "{start:?} {end:?}"
+            );
+        }
     }
 
     #[test]

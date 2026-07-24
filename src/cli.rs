@@ -19,12 +19,12 @@ use crate::{
 const DEFAULT_MAX_INFLIGHT_RECORDS: usize = 8_192;
 const DEFAULT_MAX_INFLIGHT_BYTES: &str = "256MiB";
 const DEFAULT_MAX_INFLIGHT_PER_PARTITION: usize = 8_192;
-const MAX_SELECTED_PARTITIONS: usize = 100_000;
+pub(crate) const MAX_ASSIGNED_PARTITIONS: usize = 100_000;
 
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Run JSONata over records from explicitly assigned Kafka partitions"
+    about = "Run JSONata over records from directly assigned Kafka partitions"
 )]
 pub struct RawCli {
     /// Comma-separated bootstrap broker list
@@ -33,18 +33,13 @@ pub struct RawCli {
     /// Kafka topic to consume
     #[arg(short = 't', long)]
     topic: String,
-    /// Partitions to consume, for example 0,2,4-7; repeatable
-    #[arg(
-        short = 'p',
-        long = "partition",
-        required = true,
-        allow_negative_numbers = true
-    )]
+    /// Partitions to consume; defaults to all topic partitions
+    #[arg(short = 'p', long = "partition", allow_negative_numbers = true)]
     partitions: Vec<String>,
     /// Start position or s@/e@ timestamp boundary
     #[arg(short = 'o', long = "offset", allow_hyphen_values = true)]
     offsets: Vec<String>,
-    /// Exclusive end offset for every selected partition
+    /// Exclusive end offset for every assigned partition
     #[arg(long, allow_hyphen_values = true)]
     end_offset: Option<i64>,
     /// Maximum admitted input records
@@ -189,7 +184,7 @@ pub enum OutputPlan {
 #[derive(Debug)]
 pub struct RuntimeConfig {
     pub topic: String,
-    pub partitions: Vec<i32>,
+    pub partitions: Option<Vec<i32>>,
     pub start: StartPosition,
     pub end: Option<EndPosition>,
     pub count_limit: Option<u64>,
@@ -232,7 +227,11 @@ impl RawCli {
         if self.topic.is_empty() {
             return Err("topic must not be empty".to_owned());
         }
-        let partitions = parse_partitions(&self.partitions)?;
+        let partitions = if self.partitions.is_empty() {
+            None
+        } else {
+            Some(parse_partitions(&self.partitions)?)
+        };
         if self.count == Some(0) {
             return Err("count must be positive".to_owned());
         }
@@ -412,10 +411,10 @@ fn parse_partitions(values: &[String]) -> Result<Vec<i32>, String> {
             if partitions
                 .len()
                 .checked_add(count)
-                .is_none_or(|total| total > MAX_SELECTED_PARTITIONS)
+                .is_none_or(|total| total > MAX_ASSIGNED_PARTITIONS)
             {
                 return Err(format!(
-                    "partition selection expands beyond the {MAX_SELECTED_PARTITIONS} partition limit"
+                    "partition selection expands beyond the {MAX_ASSIGNED_PARTITIONS} partition limit"
                 ));
             }
             for partition in start..=end {
@@ -597,6 +596,12 @@ mod tests {
     }
 
     #[test]
+    fn cli_defaults_to_all_partitions() {
+        let all = resolve(&["jkq", "-b", "localhost", "-t", "events"]).unwrap();
+        assert_eq!(all.partitions, None);
+    }
+
+    #[test]
     fn cli_expands_partition_lists_and_ranges() {
         let config = resolve(&[
             "jkq",
@@ -610,7 +615,7 @@ mod tests {
             "8",
         ])
         .unwrap();
-        assert_eq!(config.partitions, [0, 2, 4, 5, 6, 8]);
+        assert_eq!(config.partitions.as_deref(), Some(&[0, 2, 4, 5, 6, 8][..]));
 
         for selection in ["2-1", "0,,1", "0-2,2", "0-100000"] {
             let error =
@@ -951,7 +956,7 @@ mod tests {
     #[test]
     fn help_describes_assignment_and_runtime_limits() {
         let help = RawCli::command().render_long_help().to_string();
-        assert!(help.contains("Partitions to consume, for example 0,2,4-7"));
+        assert!(help.contains("Partitions to consume; defaults to all topic partitions"));
         assert!(help.contains("Maximum admitted input records per partition"));
         assert!(help.contains("Validate local configuration and exit without connecting"));
         assert!(help.contains("Owned source-byte admission budget; supports KiB, MiB, and GiB"));
