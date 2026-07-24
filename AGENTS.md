@@ -93,7 +93,7 @@ Do not add both overlapping libraries for the same concern without benchmark or 
 These invariants must remain true unless the owning behavior or architecture document is deliberately revised:
 
 - Consumption uses direct partition assignment only.
-- One invocation consumes one topic and one or more explicitly selected partitions.
+- One invocation consumes one topic and directly assigns either explicitly selected partitions or every partition discovered at startup.
 - Existing Kafka tombstones bypass JSON parsing and remain tombstones by default.
 - Every non-tombstone input produces exactly one action: drop, tombstone, pass through, or project.
 - One input record never expands into multiple output records.
@@ -187,6 +187,10 @@ cargo test --all-targets --all-features
 ```
 
 Also run Kafka integration tests and performance smoke tests when the change affects consumption, offsets, ordering, backpressure, JSON execution, or formatting.
+
+Before preparing a release, update the package version in `Cargo.toml`,
+regenerate `Cargo.lock`, and follow the release checklist in
+`docs/development.md` before creating the version tag.
 
 ## Definition of Done
 

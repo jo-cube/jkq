@@ -1,10 +1,10 @@
 # jkq
 
-`jkq` is a Kafka JSONata runner. It consumes explicitly selected Kafka
-partitions, evaluates native [JSONata](https://jsonata.org/) over JSON record
-values, and writes record data to stdout. It is built for shell pipelines that
-need Kafka metadata, predictable ordering, and JSON query or transformation
-without a JavaScript runtime.
+`jkq` is a Kafka JSONata runner. It directly assigns Kafka partitions,
+evaluates native [JSONata](https://jsonata.org/) over JSON record values, and
+writes record data to stdout. It is built for shell pipelines that need Kafka
+metadata, predictable ordering, and JSON query or transformation without a
+JavaScript runtime.
 
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \
@@ -74,17 +74,20 @@ and OpenSSL, then run:
 cargo build --release --locked
 ```
 
-On Unix, this normally requires a C compiler, `make`, Perl, and `pkg-config`.
-The executable is written to `target/release/jkq`.
+On Unix, this normally requires a C compiler, `make`, Perl, `pkg-config`, and
+libclang. The executable is written to `target/release/jkq`.
+
+The bundled Kafka client supports gzip, Snappy, LZ4, and Zstandard-compressed
+record batches.
 
 Other platforms can build from source.
 
 ## Quick Use
 
-Consume a fixed snapshot of two explicitly selected partitions:
+Consume a fixed snapshot of every current topic partition:
 
 ```sh
-jkq -b localhost:9092 -t events -p 0-1 --snapshot
+jkq -b localhost:9092 -t events --snapshot
 ```
 
 Turn logical deletions into Kafka tombstones while preserving the key:

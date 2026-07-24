@@ -29,8 +29,8 @@ the observable behavior contracts.
 ## Prerequisites
 
 The repository follows stable Rust through `rust-toolchain.toml`. Building the
-bundled librdkafka and vendored OpenSSL normally requires a C compiler, `make`,
-Perl, and `pkg-config` on Unix.
+bundled librdkafka, Zstandard, and vendored OpenSSL normally requires a C
+compiler, `make`, Perl, `pkg-config`, and libclang on Unix.
 
 Build a release binary with:
 
@@ -56,6 +56,14 @@ cargo test --locked --all-targets --all-features
 CI runs the same checks.
 
 ## Release Packaging
+
+Before creating a release tag:
+
+1. update `[package].version` in `Cargo.toml`;
+2. regenerate `Cargo.lock` and verify the `jkq` package entry has the same
+   version;
+3. run the complete repository checks;
+4. commit the version change before creating the matching `v<version>` tag.
 
 A release tag must match the package version with a `v` prefix. Release jobs
 build native Linux amd64, Linux arm64, and macOS arm64 archives, execute each

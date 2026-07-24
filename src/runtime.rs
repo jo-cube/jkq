@@ -397,7 +397,8 @@ fn poll_loop(
     started: Instant,
     first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> Option<i32> {
-    let mut admission = Admission::new(&config.partitions, config.limits);
+    let partitions = input.assigned_partitions();
+    let mut admission = Admission::new(&partitions, config.limits);
     let mut dispatcher = Some(dispatcher);
     let mut pending: Option<OwnedRecord> = None;
     let mut stopping = false;
