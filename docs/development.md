@@ -57,6 +57,14 @@ CI runs the same checks.
 
 ## Release Packaging
 
+Before creating a release tag:
+
+1. update `[package].version` in `Cargo.toml`;
+2. regenerate `Cargo.lock` and verify the `jkq` package entry has the same
+   version;
+3. run the complete repository checks;
+4. commit the version change before creating the matching `v<version>` tag.
+
 A release tag must match the package version with a `v` prefix. Release jobs
 build native Linux amd64, Linux arm64, and macOS arm64 archives, execute each
 binary as a smoke test, and attach each archive and its SHA-256 checksum to the

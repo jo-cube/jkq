@@ -188,6 +188,10 @@ cargo test --all-targets --all-features
 
 Also run Kafka integration tests and performance smoke tests when the change affects consumption, offsets, ordering, backpressure, JSON execution, or formatting.
 
+Before preparing a release, update the package version in `Cargo.toml`,
+regenerate `Cargo.lock`, and follow the release checklist in
+`docs/development.md` before creating the version tag.
+
 ## Definition of Done
 
 A change is complete only when:
