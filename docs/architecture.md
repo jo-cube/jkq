@@ -8,7 +8,7 @@ runtime values inside compute workers.
 ```text
 CLI and Kafka properties
 → startup JSONata and output plans
-→ direct assignment and offset resolution
+→ partition discovery, direct assignment, and offset resolution
 → Kafka poller and source-byte admission control
 → bounded JSONata workers
 → per-partition completion ordering
@@ -47,17 +47,21 @@ Before polling, `jkq`:
 3. stores only expression source and variable JSON in the shared transform
    plan;
 4. compiles the output format and its metadata requirements;
-5. creates the consumer and resolves partition starts and ends;
-6. assigns partitions directly and captures snapshot high watermarks when
-   requested;
-7. installs the bounded pipeline.
+5. creates the consumer and discovers all topic partitions when none were
+   selected;
+6. fetches watermarks only for ranges that need them, resolves partition
+   starts and ends, and captures snapshot highs in that same watermark pass;
+7. assigns partitions directly;
+8. installs the bounded pipeline.
 
 A startup failure cannot produce partial record output. `--check` exits after
 local plan validation and does not create a consumer.
 
 The Kafka adapter calls `assign`, never `subscribe`. Automatic commits and
 offset storage are disabled. The poller is the only thread that calls the
-consumer, including pause and resume.
+consumer, including pause and resume. Automatic partition discovery is a
+startup snapshot; partitions added later are not assigned to the running
+process.
 
 ## Record Ownership
 
@@ -158,7 +162,7 @@ Charges are released only after ordered write or drop. Slow output therefore
 propagates pressure back to Kafka, and the reorder buffer cannot hold more
 records than admission permits.
 
-Global pressure pauses all selected partitions. Per-partition record pressure
+Global pressure pauses all assigned partitions. Per-partition record pressure
 pauses only that partition. Resume uses a 75% low-water threshold to avoid
 thrashing. The poller continues serving Kafka events while paused.
 
@@ -189,7 +193,8 @@ stdout that cannot make progress.
 
 ## Invariants
 
-- One invocation consumes one topic and explicitly selected partitions.
+- One invocation consumes one topic and directly assigns either explicitly
+  selected partitions or every partition discovered at startup.
 - JSONata is the only expression language.
 - Every successfully transformed non-tombstone input resolves to exactly one
   action.
@@ -199,7 +204,7 @@ stdout that cannot make progress.
   requests a JSON-value envelope.
 - Ordering is per partition, never global.
 - Count limits apply to admitted input, not emitted output.
-- Per-partition count limits apply independently to each selected partition.
+- Per-partition count limits apply independently to each assigned partition.
 - Tombstones, empty payloads, and JSON `null` remain distinct.
 - Channels, admitted record counts, per-partition records, and owned source
   bytes are bounded; JSONata intermediates, projected output, and compact

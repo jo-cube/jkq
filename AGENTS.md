@@ -93,7 +93,7 @@ Do not add both overlapping libraries for the same concern without benchmark or 
 These invariants must remain true unless the owning behavior or architecture document is deliberately revised:
 
 - Consumption uses direct partition assignment only.
-- One invocation consumes one topic and one or more explicitly selected partitions.
+- One invocation consumes one topic and directly assigns either explicitly selected partitions or every partition discovered at startup.
 - Existing Kafka tombstones bypass JSON parsing and remain tombstones by default.
 - Every non-tombstone input produces exactly one action: drop, tombstone, pass through, or project.
 - One input record never expands into multiple output records.

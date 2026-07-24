@@ -18,20 +18,21 @@ test broker reachability or ask librdkafka to validate property values.
 
 ## Assignment and Ranges
 
-Brokers, a topic (`-t, --topic`), and at least one partition
-(`-p, --partition`) are required. Supply brokers with `-b, --brokers`, through
-`bootstrap.servers` in `-F`, or with `-X`:
+Brokers and a topic (`-t, --topic`) are required. Supply brokers with `-b,
+--brokers`, through `bootstrap.servers` in `-F`, or with `-X`:
 
 ```sh
-jkq -b localhost:9092 -t events -p 0,2,4-7 -p 9
+jkq -b localhost:9092 -t events
 ```
 
-`-p, --partition` accepts comma-separated partitions and inclusive ascending
-ranges, and is repeatable. Selection order is preserved but does not create a
-cross-partition output order. Duplicate, descending, negative, and empty
-selections are rejected. A selection may expand to at most 100,000 partitions.
-`jkq` does not join a consumer group or commit offsets; a configured `group.id`
-is only passed to librdkafka.
+Without `-p, --partition`, jkq discovers and directly assigns every current
+topic partition at startup. Partitions added later are not picked up by the
+running process. Use `-p 0,2,4-7 -p 9` to select a subset; the option accepts
+comma-separated partitions and inclusive ascending ranges, and is repeatable.
+Selection order is preserved but does not create a cross-partition output
+order. Duplicate, descending, negative, and empty selections are rejected. At
+most 100,000 partitions may be assigned. `jkq` does not join a consumer group
+or commit offsets; a configured `group.id` is only passed to librdkafka.
 
 The default start is `beginning`. `-o, --offset` accepts:
 
@@ -48,7 +49,7 @@ A timestamp with no matching record resolves to the current high watermark.
 An unavailable absolute offset is an error; `jkq` never silently resets it to
 the beginning or end of the partition.
 
-`--end-offset <offset>` sets an exclusive offset end for every selected
+`--end-offset <offset>` sets an exclusive offset end for every assigned
 partition. It cannot be combined with `e@...`.
 
 Termination controls:
@@ -65,7 +66,7 @@ Termination controls:
 - An explicit end or snapshot implies `--exit-at-end`.
 
 `--snapshot` cannot be combined with an explicit end. All start and end
-positions apply to every selected partition.
+positions apply to every assigned partition.
 
 ## Transforms
 

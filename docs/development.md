@@ -29,8 +29,8 @@ the observable behavior contracts.
 ## Prerequisites
 
 The repository follows stable Rust through `rust-toolchain.toml`. Building the
-bundled librdkafka and vendored OpenSSL normally requires a C compiler, `make`,
-Perl, and `pkg-config` on Unix.
+bundled librdkafka, Zstandard, and vendored OpenSSL normally requires a C
+compiler, `make`, Perl, `pkg-config`, and libclang on Unix.
 
 Build a release binary with:
 
