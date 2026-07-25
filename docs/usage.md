@@ -36,7 +36,7 @@ or commit offsets; a configured `group.id` is only passed to librdkafka.
 
 `--consumers <n>` distributes the selected partitions round-robin across up to
 `n` directly assigned Kafka consumers. The default is one, values must be
-between 1 and 1024, and jkq never creates more consumers than assigned
+between 1 and 128, and jkq never creates more consumers than assigned
 partitions. Each partition remains owned by one consumer for the complete run.
 
 The default start is `beginning`. `-o, --offset` accepts:

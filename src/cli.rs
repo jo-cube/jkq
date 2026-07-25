@@ -19,7 +19,7 @@ use crate::{
 const DEFAULT_MAX_INFLIGHT_RECORDS: usize = 8_192;
 const DEFAULT_MAX_INFLIGHT_BYTES: &str = "256MiB";
 const DEFAULT_MAX_INFLIGHT_PER_PARTITION: usize = 8_192;
-const MAX_CONSUMERS: usize = 1_024;
+const MAX_CONSUMERS: usize = 128;
 pub(crate) const MAX_ASSIGNED_PARTITIONS: usize = 100_000;
 
 #[derive(Debug, Parser)]
@@ -670,7 +670,7 @@ mod tests {
             vec!["jkq", "-b", "x", "-t", "t", "-p", "-1"],
             vec!["jkq", "-b", "x", "-t", "t", "-p", "0", "-c", "0"],
             vec!["jkq", "-b", "x", "-t", "t", "--consumers", "0"],
-            vec!["jkq", "-b", "x", "-t", "t", "--consumers", "1025"],
+            vec!["jkq", "-b", "x", "-t", "t", "--consumers", "129"],
             vec![
                 "jkq",
                 "-b",
