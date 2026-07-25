@@ -167,13 +167,12 @@ source record:
 - key, when required;
 - header names and header values, when required.
 
-The charge intentionally excludes jsonata-core's parsed value tree,
-evaluation intermediates, projected output, and compact pass output for a
-JSON-value envelope. Full JSONata can construct data-dependent values, so total
-evaluator and output memory cannot be bounded by a static expression compiler.
-Bounded channels, `--max-inflight-records`, `--max-inflight-per-partition`, and
-the owned source-byte admission budget still bound queued source work.
-Batches do not admit records ahead of those limits.
+The charge intentionally excludes the parsed value tree, evaluation
+intermediates, projected output, and compact pass output for a JSON-value
+envelope. Those allocations depend on the input and expressions. Bounded
+channels, `--max-inflight-records`, `--max-inflight-per-partition`, and the
+owned source-byte admission budget bound queued source work. Batches do not
+admit records ahead of those limits.
 
 Charges are released only after ordered write or drop. Slow output therefore
 propagates pressure back to Kafka, and the reorder buffer cannot hold more

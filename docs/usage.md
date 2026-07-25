@@ -51,8 +51,10 @@ The default start is `beginning`. `-o, --offset` accepts:
 | `e@1720000000000` | exclusive timestamp end |
 
 A timestamp with no matching record resolves to the current high watermark.
-An unavailable absolute offset is an error; `jkq` never silently resets it to
-the beginning or end of the partition.
+Absolute offsets are passed directly to Kafka. When a fixed end or snapshot is
+at or before the start, the partition is an empty range and completes without
+polling. Otherwise, an unavailable start is reported if Kafka rejects it;
+`jkq` does not reset it to the beginning or end.
 
 `--end-offset <offset>` sets an exclusive offset end for every assigned
 partition. It cannot be combined with `e@...`.
@@ -218,8 +220,8 @@ failures into an explicit action:
 
 `pass` preserves the original payload exactly. It cannot be selected for
 invalid JSON with `--envelope-payload value`. Fatal Kafka state errors and
-unavailable requested offsets remain fatal even when `--on-kafka-error
-continue` is selected.
+offset errors reported while polling remain fatal even when
+`--on-kafka-error continue` is selected.
 
 JSONata parse errors are command-line errors. Runtime evaluation errors name
 the failing drop predicate, tombstone predicate, or projection. The pipeline
@@ -296,8 +298,8 @@ Sizes accept bytes or `KiB`, `MiB`, and `GiB`. `--max-inflight-bytes` is an
 admission budget for owned source record bytes and copied source metadata: the
 payload, key, header names, and header values required by the output plan. It
 does not account for jsonata-core's parsed value tree, evaluation
-intermediates, or projected output. Full JSONata can construct data-dependent
-results, so those allocations are not statically bounded by this option.
+intermediates, or projected output. Those allocations depend on the input and
+expressions and are outside this source-byte budget.
 
 All three limits must be positive. `--max-inflight-per-partition` cannot exceed
 `--max-inflight-records`. Global record and byte limits apply across all Kafka
