@@ -1,7 +1,7 @@
 # Architecture
 
-`jkq` is a threaded Kafka-to-JSONata pipeline around a directly assigned
-librdkafka consumer. The design keeps Kafka ownership, record actions,
+`jkq` is a threaded Kafka-to-JSONata pipeline around directly assigned
+librdkafka consumers. The design keeps Kafka ownership, record actions,
 ordering, and shutdown visible while isolating jsonata-core's single-threaded
 runtime values inside compute workers.
 
@@ -9,7 +9,7 @@ runtime values inside compute workers.
 CLI and Kafka properties
 → startup JSONata and output plans
 → partition discovery, direct assignment, and offset resolution
-→ Kafka poller and source-byte admission control
+→ one or more Kafka pollers with disjoint partition assignments
 → bounded record batches through JSONata workers
 → batched completions and per-partition ordering
 → one output writer
@@ -47,19 +47,20 @@ Before polling, `jkq`:
 3. stores only expression source and variable JSON in the shared transform
    plan;
 4. compiles the output format and its metadata requirements;
-5. creates the consumer and discovers all topic partitions when none were
+5. creates a consumer and discovers all topic partitions when none were
    selected;
 6. fetches watermarks only for ranges that need them, resolves partition
    starts and ends, and captures snapshot highs in that same watermark pass;
-7. assigns partitions directly;
+7. distributes partitions across the requested number of consumers and
+   assigns each partition directly to exactly one;
 8. installs the bounded pipeline.
 
 A startup failure cannot produce partial record output. `--check` exits after
 local plan validation and does not create a consumer.
 
 The Kafka adapter calls `assign`, never `subscribe`. Automatic commits and
-offset storage are disabled. The poller is the only thread that calls the
-consumer, including pause and resume. Automatic partition discovery is a
+offset storage are disabled. Each consumer is owned by one poller thread,
+including its pause and resume calls. Automatic partition discovery is a
 startup snapshot; partitions added later are not assigned to the running
 process.
 
@@ -73,9 +74,10 @@ Each admitted input gets a dense local partition sequence. Kafka offsets remain
 source metadata; the local sequence drives completion ordering even when
 offsets are sparse.
 
-The poller groups admitted inputs into batches capped by record count and
+Each poller groups admitted inputs into batches capped by record count and
 retained source bytes. Partial batches flush when Kafka is idle, backpressure
-starts, or consumption stops. Workers process each received batch
+starts, or consumption stops. All pollers feed the same bounded worker and
+completion channels. Workers process each received batch
 sequentially, and completions and source-byte releases cross their channels in
 batches. Admission, actions, ordering, and byte accounting remain per record.
 
@@ -151,8 +153,10 @@ the worker or projection and labels them with `payloadEncoding: "json"`.
 
 ## Backpressure and Memory Accounting
 
-Admission tracks global records, source bytes, and records per partition. The
-byte charge covers owned bytes copied from the source record:
+Shared atomic admission tracks global records and source bytes across all
+consumers. Each poller separately tracks its partition sequences, per-partition
+records, and pause state. The byte charge covers owned bytes copied from the
+source record:
 
 - payload;
 - key, when required;
@@ -170,14 +174,16 @@ Charges are released only after ordered write or drop. Slow output therefore
 propagates pressure back to Kafka, and the reorder buffer cannot hold more
 records than admission permits.
 
-Global pressure pauses all assigned partitions. Per-partition record pressure
-pauses only that partition. Resume uses a 75% low-water threshold to avoid
-thrashing. The poller continues serving Kafka events while paused.
+When a poller cannot reserve shared capacity, it holds that one record and
+pauses its assigned partitions until capacity becomes available. Per-partition
+record pressure pauses only that partition and resumes at a 75% low-water
+threshold to avoid thrashing. Every poller continues serving its Kafka events
+while paused.
 
 Because a source record's size is known only after polling, at most one owned
-record may wait outside admitted accounting. A source record larger than the
-byte budget is admitted only when no other admitted bytes remain, preventing
-deadlock while preserving the runs-alone behavior.
+record per consumer may wait outside admitted accounting. A source record
+larger than the byte budget is admitted only when no other admitted bytes
+remain, preventing deadlock while preserving the runs-alone behavior.
 
 ## Termination and Failure
 
@@ -185,7 +191,8 @@ Fixed ranges use exclusive end offsets. Snapshot boundaries are captured once
 and never extended. Completion means that the poller has stopped admitting the
 range and every admitted partition sequence has crossed its frontier.
 
-Global counts stop all admission after the configured number of input records.
+Global counts atomically stop all admission after the configured number of
+input records.
 Per-partition counts mark each partition complete independently after its
 limit; already admitted records still cross the normal completion frontier.
 
@@ -203,6 +210,8 @@ stdout that cannot make progress.
 
 - One invocation consumes one topic and directly assigns either explicitly
   selected partitions or every partition discovered at startup.
+- Every assigned partition belongs to exactly one consumer for the complete
+  run.
 - JSONata is the only expression language.
 - Every successfully transformed non-tombstone input resolves to exactly one
   action.

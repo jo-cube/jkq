@@ -90,6 +90,9 @@ Consume a fixed snapshot of every current topic partition:
 jkq -b localhost:9092 -t events --snapshot
 ```
 
+Add `--consumers 3` to poll disjoint partition subsets with three Kafka
+consumers when one consumer does not saturate a multi-partition topic.
+
 Turn logical deletions into Kafka tombstones while preserving the key:
 
 ```sh

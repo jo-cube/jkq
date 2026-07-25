@@ -34,6 +34,11 @@ order. Duplicate, descending, negative, and empty selections are rejected. At
 most 100,000 partitions may be assigned. `jkq` does not join a consumer group
 or commit offsets; a configured `group.id` is only passed to librdkafka.
 
+`--consumers <n>` distributes the selected partitions round-robin across up to
+`n` directly assigned Kafka consumers. The default is one, values must be
+between 1 and 1024, and jkq never creates more consumers than assigned
+partitions. Each partition remains owned by one consumer for the complete run.
+
 The default start is `beginning`. `-o, --offset` accepts:
 
 | Form | Meaning |
@@ -260,6 +265,11 @@ There is no implicit configuration-file discovery.
 
 ## Parallelism and Memory
 
+`--consumers <n>` controls Kafka polling parallelism across partitions. Each
+active consumer has its own poller thread and direct partition assignment.
+Use more than one only when multiple partitions are selected; it cannot
+parallelize a single partition.
+
 `-j, --jobs` controls JSON compute workers. The default is available CPU
 parallelism minus two, with a minimum of one. Identity transforms bypass the
 worker pool. Values must be between 1 and 1024.
@@ -283,7 +293,8 @@ intermediates, or projected output. Full JSONata can construct data-dependent
 results, so those allocations are not statically bounded by this option.
 
 All three limits must be positive. `--max-inflight-per-partition` cannot exceed
-`--max-inflight-records`.
+`--max-inflight-records`. Global record and byte limits apply across all Kafka
+consumers, while the per-partition limit remains local to each partition.
 
 A source record larger than the byte budget may run alone. When admission
 limits are reached, `jkq` pauses affected partitions while continuing to serve
@@ -373,7 +384,7 @@ encoding fields the downstream consumer does not use. JSON-value envelopes
 also compactly serialize pass-through payloads, so use that mode when the
 downstream consumer benefits from a typed JSON field.
 
-### Scale with partitions, then tune workers
+### Scale consumers with partitions, then tune workers
 
 The default worker count leaves one CPU for Kafka polling and one for output.
 Measure nearby `--jobs` values with representative payloads and expressions;
@@ -381,21 +392,20 @@ additional workers can increase contention after polling or output becomes the
 bottleneck.
 
 Keep the default per-partition ordering when later records update earlier
-records. Use `--unordered` only when completion order is acceptable. If one
-invocation reaches its polling or output limit and the topic has enough
-partitions, run independent invocations over disjoint partition sets:
+records. Use `--unordered` only when completion order is acceptable. If polling
+limits a multi-partition run, increase `--consumers` while keeping the existing
+worker pool and output writer:
 
 ```sh
-jkq -F kafka.properties -t events -p 0-15 --snapshot \
-  -f '%R%s' > shard-0.bin &
-jkq -F kafka.properties -t events -p 16-31 --snapshot \
-  -f '%R%s' > shard-1.bin &
-wait
+jkq -F kafka.properties -t events -p 0-23 --consumers 3 --snapshot \
+  -f '%R%s' > records.bin
 ```
 
 This preserves ordering within every partition; `jkq` never provides global
-ordering across partitions. Adjust the in-flight limits only when measurements
-show worker starvation or excessive retained memory.
+ordering across partitions. Additional consumers create more broker
+connections and poller threads, so compare nearby values rather than assuming
+the partition count is the right setting. Adjust the in-flight limits only
+when measurements show worker starvation or excessive retained memory.
 
 ### Validate a bounded slice first
 
