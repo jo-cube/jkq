@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 
 use crate::{cli::RuntimeLimits, kafka::KafkaInput};
 
@@ -10,6 +13,82 @@ pub(super) struct Release {
     pub retained_bytes: usize,
 }
 
+pub(super) struct SharedAdmission {
+    records: AtomicUsize,
+    bytes: AtomicUsize,
+    admitted: AtomicU64,
+    limits: RuntimeLimits,
+    count_limit: Option<u64>,
+}
+
+impl SharedAdmission {
+    pub fn new(limits: RuntimeLimits, count_limit: Option<u64>) -> Self {
+        Self {
+            records: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+            admitted: AtomicU64::new(0),
+            limits,
+            count_limit,
+        }
+    }
+
+    pub fn try_reserve(&self, bytes: usize) -> bool {
+        if self
+            .records
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |records| {
+                (records < self.limits.max_inflight_records).then_some(records + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(bytes).filter(|total| {
+                    *total <= self.limits.max_inflight_bytes
+                        || (current == 0 && bytes > self.limits.max_inflight_bytes)
+                })
+            })
+            .is_err()
+        {
+            self.records.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        if self.count_limit.is_some_and(|limit| {
+            self.admitted
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |admitted| {
+                    (admitted < limit).then_some(admitted + 1)
+                })
+                .is_err()
+        }) {
+            self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+            self.records.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    pub fn release(&self, records: usize, bytes: usize) -> Result<(), String> {
+        self.records
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(records)
+            })
+            .map_err(|_| "shared in-flight record accounting underflow".to_owned())?;
+        self.bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(bytes)
+            })
+            .map_err(|_| "shared retained-byte accounting underflow".to_owned())?;
+        Ok(())
+    }
+
+    pub fn count_reached(&self) -> bool {
+        self.count_limit
+            .is_some_and(|limit| self.admitted.load(Ordering::Relaxed) >= limit)
+    }
+}
+
 struct PartitionAdmission {
     next_sequence: u64,
     in_flight: usize,
@@ -19,20 +98,16 @@ struct PartitionAdmission {
 
 pub(super) struct Admission {
     pub total_records: usize,
-    total_bytes: usize,
-    global_limited: bool,
     all_paused: bool,
     partition_pause_dirty: bool,
     partitions: BTreeMap<i32, PartitionAdmission>,
-    limits: RuntimeLimits,
+    max_inflight_per_partition: usize,
 }
 
 impl Admission {
-    pub fn new(partitions: &[i32], limits: RuntimeLimits) -> Self {
+    pub fn new(partitions: &[i32], max_inflight_per_partition: usize) -> Self {
         Self {
             total_records: 0,
-            total_bytes: 0,
-            global_limited: false,
             all_paused: false,
             partition_pause_dirty: false,
             partitions: partitions
@@ -49,33 +124,18 @@ impl Admission {
                     )
                 })
                 .collect(),
-            limits,
+            max_inflight_per_partition,
         }
     }
 
-    pub fn can_reserve(&self, partition: i32, bytes: usize) -> bool {
-        let Some(state) = self.partitions.get(&partition) else {
-            return false;
-        };
-        if self.total_records >= self.limits.max_inflight_records
-            || state.in_flight >= self.limits.max_inflight_per_partition
-        {
-            return false;
-        }
-        self.total_bytes
-            .checked_add(bytes)
-            .is_some_and(|total| total <= self.limits.max_inflight_bytes)
-            || (self.total_bytes == 0 && bytes > self.limits.max_inflight_bytes)
+    pub fn can_reserve(&self, partition: i32) -> bool {
+        self.partitions
+            .get(&partition)
+            .is_some_and(|state| state.in_flight < self.max_inflight_per_partition)
     }
 
-    pub fn should_wait_for_capacity(&self) -> bool {
-        self.total_records >= self.limits.max_inflight_records
-            || self.total_bytes >= self.limits.max_inflight_bytes
-            || self.partitions.values().all(|state| state.limited)
-    }
-
-    pub fn reserve(&mut self, partition: i32, bytes: usize) -> Result<u64, String> {
-        if !self.can_reserve(partition, bytes) {
+    pub fn reserve(&mut self, partition: i32) -> Result<u64, String> {
+        if !self.can_reserve(partition) {
             return Err("record admitted without available capacity".to_owned());
         }
         let state = self
@@ -89,70 +149,40 @@ impl Admission {
             .ok_or_else(|| format!("partition {partition} sequence overflow"))?;
         state.in_flight += 1;
         self.partition_pause_dirty |=
-            update_partition_limit(state, self.limits.max_inflight_per_partition);
+            update_partition_limit(state, self.max_inflight_per_partition);
         self.total_records += 1;
-        self.total_bytes = self
-            .total_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| "retained-byte accounting overflow".to_owned())?;
         Ok(sequence)
     }
 
-    pub fn release(&mut self, release: Release) -> Result<(), String> {
-        let state = self.partitions.get_mut(&release.partition).ok_or_else(|| {
-            format!(
-                "completion released unknown partition {}",
-                release.partition
-            )
-        })?;
-        if state.in_flight == 0
-            || self.total_records == 0
-            || self.total_bytes < release.retained_bytes
-        {
+    pub fn release(&mut self, partition: i32) -> Result<(), String> {
+        let state = self
+            .partitions
+            .get_mut(&partition)
+            .ok_or_else(|| format!("completion released unknown partition {partition}"))?;
+        if state.in_flight == 0 || self.total_records == 0 {
             return Err(format!(
-                "invalid completion release for partition {}",
-                release.partition
+                "invalid completion release for partition {partition}"
             ));
         }
         state.in_flight -= 1;
         self.partition_pause_dirty |=
-            update_partition_limit(state, self.limits.max_inflight_per_partition);
+            update_partition_limit(state, self.max_inflight_per_partition);
         self.total_records -= 1;
-        self.total_bytes -= release.retained_bytes;
         Ok(())
     }
 
-    fn update_global_limit(&mut self, pending: bool) {
-        if self.global_limited {
-            self.global_limited = pending
-                || self.total_records >= low_water(self.limits.max_inflight_records)
-                || self.total_bytes >= low_water(self.limits.max_inflight_bytes);
-        } else {
-            self.global_limited = pending
-                || self.total_records >= self.limits.max_inflight_records
-                || self.total_bytes >= self.limits.max_inflight_bytes;
-        }
-    }
-
-    pub fn sync_pauses(
-        &mut self,
-        input: &mut KafkaInput,
-        stopping: bool,
-        pending: bool,
-    ) -> Result<(), String> {
-        self.update_global_limit(pending);
-        let all_paused = stopping || self.global_limited;
-        if all_paused == self.all_paused && !self.partition_pause_dirty {
+    pub fn sync_pauses(&mut self, input: &mut KafkaInput, pause_all: bool) -> Result<(), String> {
+        if pause_all == self.all_paused && !self.partition_pause_dirty {
             return Ok(());
         }
         for (partition, state) in &mut self.partitions {
-            let pause = all_paused || state.limited;
+            let pause = pause_all || state.limited;
             if pause != state.applied_paused {
                 input.set_paused(*partition, pause)?;
                 state.applied_paused = pause;
             }
         }
-        self.all_paused = all_paused;
+        self.all_paused = pause_all;
         self.partition_pause_dirty = false;
         Ok(())
     }
@@ -230,6 +260,8 @@ impl Orderer {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, thread};
+
     use crate::{
         output::Timestamp,
         transform::jsonata::{Action, PassPayload},
@@ -240,6 +272,7 @@ mod tests {
 
     fn completion(partition: i32, sequence: u64, bytes: usize, action: Action) -> Completion {
         Completion {
+            consumer: 0,
             partition,
             sequence,
             retained_bytes: bytes,
@@ -297,72 +330,82 @@ mod tests {
     }
 
     #[test]
-    fn admission_enforces_records_bytes_partitions_and_oversized_rule() {
-        let mut admission = Admission::new(
-            &[0, 1],
-            RuntimeLimits {
-                max_inflight_records: 2,
-                max_inflight_bytes: 10,
-                max_inflight_per_partition: 1,
-            },
-        );
-        assert_eq!(admission.reserve(0, 6).unwrap(), 0);
-        assert!(!admission.can_reserve(0, 1));
-        assert!(admission.can_reserve(1, 4));
-        assert!(!admission.can_reserve(1, 5));
-        admission
-            .release(Release {
-                partition: 0,
-                retained_bytes: 6,
-            })
-            .unwrap();
-        assert!(admission.can_reserve(1, 11));
-        admission.reserve(1, 11).unwrap();
-        assert!(!admission.can_reserve(0, 1));
+    fn admission_enforces_per_partition_limits() {
+        let mut admission = Admission::new(&[0, 1], 1);
+        assert_eq!(admission.reserve(0).unwrap(), 0);
+        assert!(!admission.can_reserve(0));
+        assert!(admission.can_reserve(1));
+        admission.release(0).unwrap();
+        assert_eq!(admission.reserve(0).unwrap(), 1);
     }
 
     #[test]
-    fn release_is_exactly_once_and_low_water_is_hysteretic() {
-        let mut admission = Admission::new(
-            &[0],
+    fn shared_admission_enforces_limits_across_consumers() {
+        let admission = SharedAdmission::new(
             RuntimeLimits {
-                max_inflight_records: 4,
-                max_inflight_bytes: 100,
-                max_inflight_per_partition: 4,
+                max_inflight_records: 2,
+                max_inflight_bytes: 10,
+                max_inflight_per_partition: 2,
             },
+            Some(3),
         );
+        assert!(admission.try_reserve(6));
+        assert!(!admission.try_reserve(5));
+        admission.release(1, 6).unwrap();
+        assert!(admission.try_reserve(11));
+        assert!(!admission.try_reserve(1));
+        admission.release(1, 11).unwrap();
+        assert!(admission.try_reserve(1));
+        admission.release(1, 1).unwrap();
+        assert!(!admission.try_reserve(1));
+
+        let admission = Arc::new(SharedAdmission::new(
+            RuntimeLimits {
+                max_inflight_records: 100,
+                max_inflight_bytes: 100,
+                max_inflight_per_partition: 100,
+            },
+            Some(50),
+        ));
+        let admitted = thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| {
+                    let admission = Arc::clone(&admission);
+                    scope.spawn(move || {
+                        (0..100)
+                            .filter(|_| {
+                                let reserved = admission.try_reserve(1);
+                                if reserved {
+                                    admission.release(1, 1).unwrap();
+                                }
+                                reserved
+                            })
+                            .count()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .sum::<usize>()
+        });
+        assert_eq!(admitted, 50);
+    }
+
+    #[test]
+    fn partition_release_is_exactly_once_and_low_water_is_hysteretic() {
+        let mut admission = Admission::new(&[0], 4);
         for _ in 0..4 {
-            admission.reserve(0, 10).unwrap();
+            admission.reserve(0).unwrap();
         }
-        admission.update_global_limit(false);
-        assert!(admission.global_limited);
         assert!(admission.partitions[&0].limited);
         for expected_limited in [true, false] {
-            admission
-                .release(Release {
-                    partition: 0,
-                    retained_bytes: 10,
-                })
-                .unwrap();
-            admission.update_global_limit(false);
-            assert_eq!(admission.global_limited, expected_limited);
-            assert_eq!(admission.should_wait_for_capacity(), expected_limited);
+            admission.release(0).unwrap();
+            assert_eq!(admission.partitions[&0].limited, expected_limited);
         }
         for _ in 0..2 {
-            admission
-                .release(Release {
-                    partition: 0,
-                    retained_bytes: 10,
-                })
-                .unwrap();
+            admission.release(0).unwrap();
         }
-        assert!(
-            admission
-                .release(Release {
-                    partition: 0,
-                    retained_bytes: 10,
-                })
-                .is_err()
-        );
+        assert!(admission.release(0).is_err());
     }
 }
