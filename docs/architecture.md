@@ -10,8 +10,8 @@ CLI and Kafka properties
 → startup JSONata and output plans
 → partition discovery, direct assignment, and offset resolution
 → Kafka poller and source-byte admission control
-→ bounded JSONata workers
-→ per-partition completion ordering
+→ bounded record batches through JSONata workers
+→ batched completions and per-partition ordering
 → one output writer
 ```
 
@@ -73,6 +73,12 @@ Each admitted input gets a dense local partition sequence. Kafka offsets remain
 source metadata; the local sequence drives completion ordering even when
 offsets are sparse.
 
+The poller groups admitted inputs into batches capped by record count and
+retained source bytes. Partial batches flush when Kafka is idle, backpressure
+starts, or consumption stops. Workers process each received batch
+sequentially, and completions and source-byte releases cross their channels in
+batches. Admission, actions, ordering, and byte accounting remain per record.
+
 An action is separate from its output representation:
 
 ```text
@@ -84,7 +90,8 @@ Project(compact JSON bytes)
 
 Every admitted record produces one completion, including drops and fatal
 transform results. This lets the partition completion frontier advance and
-releases source-byte accounting exactly once.
+releases source-byte accounting exactly once even though channel handoffs are
+batched.
 
 ## JSONata Execution
 
@@ -157,6 +164,7 @@ JSON-value envelope. Full JSONata can construct data-dependent values, so total
 evaluator and output memory cannot be bounded by a static expression compiler.
 Bounded channels, `--max-inflight-records`, `--max-inflight-per-partition`, and
 the owned source-byte admission budget still bound queued source work.
+Batches do not admit records ahead of those limits.
 
 Charges are released only after ordered write or drop. Slow output therefore
 propagates pressure back to Kafka, and the reorder buffer cannot hold more
