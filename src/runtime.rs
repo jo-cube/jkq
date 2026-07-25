@@ -29,6 +29,8 @@ mod state;
 use state::{Admission, Orderer, Release};
 
 const CONTROL_POLL: Duration = Duration::from_millis(10);
+const BATCH_RECORDS: usize = 64;
+const BATCH_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub enum PipelineError {
@@ -238,9 +240,15 @@ struct WorkItem {
     record: OwnedRecord,
 }
 
+struct BatchSender<T> {
+    sender: Sender<Vec<T>>,
+    pending: Vec<T>,
+    retained_bytes: usize,
+}
+
 enum Dispatcher {
-    Transform(Sender<WorkItem>),
-    Identity(Sender<Completion>),
+    Transform(BatchSender<WorkItem>),
+    Identity(BatchSender<Completion>),
 }
 
 #[derive(Debug)]
@@ -267,6 +275,92 @@ enum CompletionOutcome {
     Fatal(String),
 }
 
+impl<T> BatchSender<T> {
+    fn new(sender: Sender<Vec<T>>) -> Self {
+        Self {
+            sender,
+            pending: Vec::with_capacity(BATCH_RECORDS),
+            retained_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, item: T, retained_bytes: usize) -> Result<(), String> {
+        self.pending.push(item);
+        self.retained_bytes += retained_bytes;
+        if self.pending.len() >= BATCH_RECORDS || self.retained_bytes >= BATCH_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.retained_bytes = 0;
+        self.sender
+            .try_send(std::mem::take(&mut self.pending))
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Dispatcher {
+    fn transform(sender: Sender<Vec<WorkItem>>) -> Self {
+        Self::Transform(BatchSender::new(sender))
+    }
+
+    fn identity(sender: Sender<Vec<Completion>>) -> Self {
+        Self::Identity(BatchSender::new(sender))
+    }
+
+    fn push(&mut self, record: OwnedRecord, sequence: u64, stats: &Stats) -> Result<(), String> {
+        let record_bytes = record.retained_bytes;
+        match self {
+            Self::Transform(batch) => batch.push(WorkItem { sequence, record }, record_bytes),
+            Self::Identity(batch) => {
+                let OwnedRecord {
+                    partition,
+                    offset,
+                    timestamp,
+                    key,
+                    headers,
+                    payload,
+                    retained_bytes: record_bytes,
+                } = record;
+                let source_tombstone = payload.is_none();
+                let action = match payload {
+                    Some(bytes) => Action::PassThrough(PassPayload::Exact(bytes)),
+                    None => Action::Tombstone,
+                };
+                stats.transformed(&action, None, source_tombstone);
+                batch.push(
+                    Completion {
+                        partition,
+                        sequence,
+                        retained_bytes: record_bytes,
+                        source: SourceRecord {
+                            partition,
+                            offset,
+                            timestamp,
+                            key,
+                            headers,
+                        },
+                        outcome: CompletionOutcome::Action(action),
+                    },
+                    record_bytes,
+                )
+            }
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        match self {
+            Self::Transform(batch) => batch.flush(),
+            Self::Identity(batch) => batch.flush(),
+        }
+    }
+}
+
 pub fn run_pipeline(
     config: &RuntimeConfig,
     input: KafkaInput,
@@ -276,9 +370,9 @@ pub fn run_pipeline(
     stats: Arc<Stats>,
 ) -> Result<Option<i32>, PipelineError> {
     let capacity = config.limits.max_inflight_records;
-    let (work_tx, work_rx) = bounded::<WorkItem>(capacity);
-    let (completion_tx, completion_rx) = bounded::<Completion>(capacity);
-    let (release_tx, release_rx) = bounded::<Release>(capacity);
+    let (work_tx, work_rx) = bounded::<Vec<WorkItem>>(capacity);
+    let (completion_tx, completion_rx) = bounded::<Vec<Completion>>(capacity);
+    let (release_tx, release_rx) = bounded::<Vec<Release>>(capacity);
     let started = Instant::now();
     let first_failure = Arc::new(OnceLock::new());
     let transforms_json = config.transform.capabilities.parses_json;
@@ -288,9 +382,9 @@ pub fn run_pipeline(
         let poller_stats = Arc::clone(&stats);
         let poller_failure = Arc::clone(&first_failure);
         let dispatcher = if transforms_json {
-            Dispatcher::Transform(work_tx)
+            Dispatcher::transform(work_tx)
         } else {
-            Dispatcher::Identity(completion_tx.clone())
+            Dispatcher::identity(completion_tx.clone())
         };
         let poller = match thread::Builder::new()
             .name("jkq-kafka-poll".to_owned())
@@ -395,7 +489,7 @@ fn poll_loop(
     config: &RuntimeConfig,
     mut input: KafkaInput,
     dispatcher: Dispatcher,
-    release_rx: Receiver<Release>,
+    release_rx: Receiver<Vec<Release>>,
     shutdown: Arc<AtomicBool>,
     received_signal: Arc<AtomicUsize>,
     stats: Arc<Stats>,
@@ -410,11 +504,11 @@ fn poll_loop(
     let mut admitted = 0_u64;
     let mut next_stats = config.stats_interval;
 
-    loop {
+    'polling: loop {
         loop {
             match release_rx.try_recv() {
-                Ok(release) => {
-                    if let Err(release_error) = admission.release(release) {
+                Ok(releases) => {
+                    if let Err(release_error) = release_batch(&mut admission, releases) {
                         runtime_failure(&first_failure, &shutdown, release_error);
                     }
                 }
@@ -428,14 +522,25 @@ fn poll_loop(
         if config.count_limit.is_some_and(|limit| admitted >= limit) {
             stopping = true;
         }
+        if (stopping || pending.is_some() || admission.should_wait_for_capacity())
+            && let Some(dispatcher) = dispatcher.as_mut()
+            && let Err(error) = dispatcher.flush()
+        {
+            runtime_failure(
+                &first_failure,
+                &shutdown,
+                format!("cannot dispatch admitted record batch: {error}"),
+            );
+            break 'polling;
+        }
         if stopping {
             pending = None;
             dispatcher.take();
         }
         if !stopping && pending.is_none() && admission.should_wait_for_capacity() {
             match release_rx.recv_timeout(CONTROL_POLL) {
-                Ok(release) => {
-                    if let Err(release_error) = admission.release(release) {
+                Ok(releases) => {
+                    if let Err(release_error) = release_batch(&mut admission, releases) {
                         runtime_failure(&first_failure, &shutdown, release_error);
                     }
                     continue;
@@ -465,8 +570,8 @@ fn poll_loop(
                 break;
             }
             match release_rx.recv_timeout(CONTROL_POLL) {
-                Ok(release) => {
-                    if let Err(release_error) = admission.release(release) {
+                Ok(releases) => {
+                    if let Err(release_error) = release_batch(&mut admission, releases) {
                         runtime_failure(&first_failure, &shutdown, release_error);
                     }
                 }
@@ -494,12 +599,13 @@ fn poll_loop(
                     record,
                     &mut admission,
                     dispatcher
-                        .as_ref()
+                        .as_mut()
                         .expect("running poller has a dispatcher"),
                     &stats,
                 ) {
                     Err(admit_error) => {
                         runtime_failure(&first_failure, &shutdown, admit_error);
+                        break 'polling;
                     }
                     Ok(sequence) => {
                         admitted += 1;
@@ -521,9 +627,19 @@ fn poll_loop(
         }
 
         if all_paused {
+            if let Some(dispatcher) = dispatcher.as_mut()
+                && let Err(error) = dispatcher.flush()
+            {
+                runtime_failure(
+                    &first_failure,
+                    &shutdown,
+                    format!("cannot dispatch admitted record batch: {error}"),
+                );
+                break 'polling;
+            }
             match release_rx.recv_timeout(CONTROL_POLL) {
-                Ok(release) => {
-                    if let Err(release_error) = admission.release(release) {
+                Ok(releases) => {
+                    if let Err(release_error) = release_batch(&mut admission, releases) {
                         runtime_failure(&first_failure, &shutdown, release_error);
                     }
                 }
@@ -562,12 +678,13 @@ fn poll_loop(
                         record,
                         &mut admission,
                         dispatcher
-                            .as_ref()
+                            .as_mut()
                             .expect("running poller has a dispatcher"),
                         &stats,
                     ) {
                         Err(admit_error) => {
                             runtime_failure(&first_failure, &shutdown, admit_error);
+                            break 'polling;
                         }
                         Ok(sequence) => {
                             admitted += 1;
@@ -584,7 +701,18 @@ fn poll_loop(
                     pending = Some(record);
                 }
             }
-            Ok(PollEvent::Idle) => {}
+            Ok(PollEvent::Idle) => {
+                if let Some(dispatcher) = dispatcher.as_mut()
+                    && let Err(error) = dispatcher.flush()
+                {
+                    runtime_failure(
+                        &first_failure,
+                        &shutdown,
+                        format!("cannot dispatch admitted record batch: {error}"),
+                    );
+                    break 'polling;
+                }
+            }
             Ok(PollEvent::Done) => stopping = true,
             Err(poll_error) => {
                 runtime_failure(&first_failure, &shutdown, poll_error);
@@ -594,6 +722,13 @@ fn poll_loop(
 
     let signal = received_signal.load(Ordering::SeqCst);
     (signal != 0).then(|| i32::try_from(signal).expect("registered signal fits in i32"))
+}
+
+fn release_batch(admission: &mut Admission, releases: Vec<Release>) -> Result<(), String> {
+    for release in releases {
+        admission.release(release)?;
+    }
+    Ok(())
 }
 
 fn runtime_failure(first: &OnceLock<RecordedFailure>, shutdown: &AtomicBool, message: String) {
@@ -643,18 +778,30 @@ fn report_periodic(
 fn admit(
     record: OwnedRecord,
     admission: &mut Admission,
-    dispatcher: &Dispatcher,
+    dispatcher: &mut Dispatcher,
     stats: &Stats,
 ) -> Result<u64, String> {
     let partition = record.partition;
     let retained_bytes = record.retained_bytes;
     let sequence = admission.reserve(partition, retained_bytes)?;
     stats.admit(&record);
-    let send_result = match dispatcher {
-        Dispatcher::Transform(sender) => sender
-            .try_send(WorkItem { sequence, record })
-            .map_err(|error| error.to_string()),
-        Dispatcher::Identity(sender) => {
+    dispatcher
+        .push(record, sequence, stats)
+        .map_err(|error| format!("cannot dispatch admitted record batch: {error}"))?;
+    Ok(sequence)
+}
+
+fn worker_loop(
+    config: &RuntimeConfig,
+    work_rx: Receiver<Vec<WorkItem>>,
+    completion_tx: Sender<Vec<Completion>>,
+    stats: Arc<Stats>,
+) {
+    let worker = jsonata::Worker::new(&config.transform, config.output.embeds_json());
+    for work_batch in work_rx {
+        let mut completions = Vec::with_capacity(work_batch.len());
+        for work in work_batch {
+            let WorkItem { sequence, record } = work;
             let OwnedRecord {
                 partition,
                 offset,
@@ -665,79 +812,27 @@ fn admit(
                 retained_bytes,
             } = record;
             let source_tombstone = payload.is_none();
-            let action = match payload {
-                Some(bytes) => Action::PassThrough(PassPayload::Exact(bytes)),
-                None => Action::Tombstone,
-            };
-            stats.transformed(&action, None, source_tombstone);
-            sender
-                .try_send(Completion {
-                    partition,
-                    sequence,
-                    retained_bytes,
-                    source: SourceRecord {
-                        partition,
-                        offset,
-                        timestamp,
-                        key,
-                        headers,
-                    },
-                    outcome: CompletionOutcome::Action(action),
-                })
-                .map_err(|error| error.to_string())
-        }
-    };
-    if let Err(send_error) = send_result {
-        admission.release(Release {
-            partition,
-            retained_bytes,
-        })?;
-        return Err(format!("cannot dispatch admitted record: {send_error}"));
-    }
-    Ok(sequence)
-}
-
-fn worker_loop(
-    config: &RuntimeConfig,
-    work_rx: Receiver<WorkItem>,
-    completion_tx: Sender<Completion>,
-    stats: Arc<Stats>,
-) {
-    let worker = jsonata::Worker::new(&config.transform, config.output.embeds_json());
-    for work in work_rx {
-        let WorkItem { sequence, record } = work;
-        let OwnedRecord {
-            partition,
-            offset,
-            timestamp,
-            key,
-            headers,
-            payload,
-            retained_bytes,
-        } = record;
-        let source_tombstone = payload.is_none();
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            worker.execute_report(payload, config.errors)
-        }));
-        let outcome = match result {
-            Ok(Ok(execution)) => {
-                stats.transformed(&execution.action, execution.issue, source_tombstone);
-                CompletionOutcome::Action(execution.action)
-            }
-            Ok(Err(transform_error)) => {
-                stats.failed(&transform_error);
-                CompletionOutcome::Fatal(format!(
-                    "transform failed at {} partition {partition} offset {offset}: {transform_error}",
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                worker.execute_report(payload, config.errors)
+            }));
+            let outcome = match result {
+                Ok(Ok(execution)) => {
+                    stats.transformed(&execution.action, execution.issue, source_tombstone);
+                    CompletionOutcome::Action(execution.action)
+                }
+                Ok(Err(transform_error)) => {
+                    stats.failed(&transform_error);
+                    CompletionOutcome::Fatal(format!(
+                        "transform failed at {} partition {partition} offset {offset}: {transform_error}",
+                        config.topic
+                    ))
+                }
+                Err(_) => CompletionOutcome::Fatal(format!(
+                    "compute worker panicked at {} partition {partition} offset {offset}",
                     config.topic
-                ))
-            }
-            Err(_) => CompletionOutcome::Fatal(format!(
-                "compute worker panicked at {} partition {partition} offset {offset}",
-                config.topic
-            )),
-        };
-        if completion_tx
-            .send(Completion {
+                )),
+            };
+            completions.push(Completion {
                 partition,
                 sequence,
                 retained_bytes,
@@ -749,9 +844,9 @@ fn worker_loop(
                     headers,
                 },
                 outcome,
-            })
-            .is_err()
-        {
+            });
+        }
+        if completion_tx.send(completions).is_err() {
             break;
         }
     }
@@ -760,8 +855,8 @@ fn worker_loop(
 fn writer_loop(
     config: &RuntimeConfig,
     writer: &mut impl Write,
-    completion_rx: Receiver<Completion>,
-    release_tx: Sender<Release>,
+    completion_rx: Receiver<Vec<Completion>>,
+    release_tx: Sender<Vec<Release>>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Stats>,
     first_failure: Arc<OnceLock<RecordedFailure>>,
@@ -770,56 +865,64 @@ fn writer_loop(
     let mut ready = Vec::new();
     let mut failure = None;
     let ordered = !config.unordered && config.transform.capabilities.parses_json;
-    for completion in completion_rx {
-        ready.clear();
-        if ordered {
-            if let Err((message, completion)) = orderer.insert(completion, &mut ready) {
-                let completion = *completion;
-                release(&release_tx, &completion);
-                writer_failure(
-                    &mut failure,
-                    &first_failure,
-                    &shutdown,
-                    PipelineError::Runtime(message),
-                );
+    for completion_batch in completion_rx {
+        let mut releases = Vec::with_capacity(completion_batch.len());
+        for completion in completion_batch {
+            ready.clear();
+            if ordered {
+                if let Err((message, completion)) = orderer.insert(completion, &mut ready) {
+                    let completion = *completion;
+                    release(&mut releases, &completion);
+                    writer_failure(
+                        &mut failure,
+                        &first_failure,
+                        &shutdown,
+                        PipelineError::Runtime(message),
+                    );
+                }
+            } else {
+                ready.push(completion);
             }
-        } else {
-            ready.push(completion);
-        }
-        for completion in ready.drain(..) {
-            if failure.is_none() {
-                match completion.outcome {
-                    CompletionOutcome::Fatal(ref message) => {
-                        writer_failure(
-                            &mut failure,
-                            &first_failure,
-                            &shutdown,
-                            PipelineError::Runtime(message.clone()),
-                        );
-                    }
-                    CompletionOutcome::Action(ref action) => {
-                        if let Err(error) =
-                            write_action(config, writer, &completion.source, action, &stats)
-                        {
+            for completion in ready.drain(..) {
+                if failure.is_none() {
+                    match completion.outcome {
+                        CompletionOutcome::Fatal(ref message) => {
                             writer_failure(
                                 &mut failure,
                                 &first_failure,
                                 &shutdown,
-                                PipelineError::Output(error),
+                                PipelineError::Runtime(message.clone()),
                             );
+                        }
+                        CompletionOutcome::Action(ref action) => {
+                            if let Err(error) =
+                                write_action(config, writer, &completion.source, action, &stats)
+                            {
+                                writer_failure(
+                                    &mut failure,
+                                    &first_failure,
+                                    &shutdown,
+                                    PipelineError::Output(error),
+                                );
+                            }
                         }
                     }
                 }
+                release(&mut releases, &completion);
             }
-            release(&release_tx, &completion);
+        }
+        if !releases.is_empty() {
+            let _ = release_tx.send(releases);
         }
     }
 
     let pending = orderer.take_pending();
     if !pending.is_empty() {
+        let mut releases = Vec::with_capacity(pending.len());
         for completion in &pending {
-            release(&release_tx, completion);
+            release(&mut releases, completion);
         }
+        let _ = release_tx.send(releases);
         writer_failure(
             &mut failure,
             &first_failure,
@@ -853,8 +956,8 @@ fn writer_failure(
     shutdown.store(true, Ordering::SeqCst);
 }
 
-fn release(sender: &Sender<Release>, completion: &Completion) {
-    let _ = sender.send(Release {
+fn release(releases: &mut Vec<Release>, completion: &Completion) {
+    releases.push(Release {
         partition: completion.partition,
         retained_bytes: completion.retained_bytes,
     });
@@ -988,7 +1091,7 @@ mod tests {
     #[test]
     fn identity_dispatch_completes_without_a_worker() {
         let (completion_tx, completion_rx) = bounded(1);
-        let dispatcher = Dispatcher::Identity(completion_tx);
+        let mut dispatcher = Dispatcher::identity(completion_tx);
         let mut admission = Admission::new(
             &[0],
             crate::cli::RuntimeLimits {
@@ -1008,18 +1111,35 @@ mod tests {
                 retained_bytes: 5,
             },
             &mut admission,
-            &dispatcher,
+            &mut dispatcher,
             &Stats::default(),
         )
         .unwrap();
+        dispatcher.flush().unwrap();
 
-        let completion = completion_rx.recv().unwrap();
+        let batch = completion_rx.recv().unwrap();
+        assert_eq!(batch.len(), 1);
+        let completion = &batch[0];
         assert_eq!(completion.sequence, 0);
         assert!(matches!(
             completion.outcome,
             CompletionOutcome::Action(Action::PassThrough(PassPayload::Exact(ref bytes)))
                 if bytes == b"exact"
         ));
+    }
+
+    #[test]
+    fn batch_sender_flushes_at_the_record_limit() {
+        let (sender, receiver) = bounded(1);
+        let mut sender = BatchSender::new(sender);
+        for value in 0..BATCH_RECORDS {
+            sender.push(value, 0).unwrap();
+        }
+
+        assert_eq!(
+            receiver.recv().unwrap(),
+            (0..BATCH_RECORDS).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1069,12 +1189,12 @@ mod tests {
         let (completion_tx, completion_rx) = bounded(3);
         let (release_tx, release_rx) = bounded(3);
         completion_tx
-            .send(completion(0, 2, 3, Action::Tombstone))
+            .send(vec![
+                completion(0, 2, 3, Action::Tombstone),
+                completion(0, 1, 2, Action::Drop),
+                completion(0, 0, 1, pass(b"a")),
+            ])
             .unwrap();
-        completion_tx
-            .send(completion(0, 1, 2, Action::Drop))
-            .unwrap();
-        completion_tx.send(completion(0, 0, 1, pass(b"a"))).unwrap();
         drop(completion_tx);
 
         let mut output = Vec::new();
@@ -1090,7 +1210,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, b"0:0:1:a\n0:2:-1:\n");
-        let releases = release_rx.iter().collect::<Vec<_>>();
+        let releases = release_rx.iter().flatten().collect::<Vec<_>>();
         assert_eq!(releases.len(), 3);
         assert_eq!(
             releases
@@ -1106,9 +1226,13 @@ mod tests {
         let config = config(&["--drop-if", "false"]);
         let (completion_tx, completion_rx) = bounded(3);
         let (release_tx, release_rx) = bounded(3);
-        completion_tx.send(completion(0, 2, 3, pass(b"c"))).unwrap();
-        completion_tx.send(fatal_completion(0, 1, 2)).unwrap();
-        completion_tx.send(completion(0, 0, 1, pass(b"a"))).unwrap();
+        completion_tx
+            .send(vec![
+                completion(0, 2, 3, pass(b"c")),
+                fatal_completion(0, 1, 2),
+                completion(0, 0, 1, pass(b"a")),
+            ])
+            .unwrap();
         drop(completion_tx);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1134,7 +1258,7 @@ mod tests {
             first_failure.get(),
             Some(RecordedFailure::Runtime(message)) if message == "fatal transform"
         ));
-        let releases = release_rx.iter().collect::<Vec<_>>();
+        let releases = release_rx.iter().flatten().collect::<Vec<_>>();
         assert_eq!(releases.len(), 3);
         assert_eq!(
             releases
@@ -1150,8 +1274,12 @@ mod tests {
         let config = config(&["--unordered", "-f", "%o\\n"]);
         let (completion_tx, completion_rx) = bounded(2);
         let (release_tx, release_rx) = bounded(2);
-        completion_tx.send(completion(0, 1, 1, pass(b"b"))).unwrap();
-        completion_tx.send(completion(0, 0, 1, pass(b"a"))).unwrap();
+        completion_tx
+            .send(vec![
+                completion(0, 1, 1, pass(b"b")),
+                completion(0, 0, 1, pass(b"a")),
+            ])
+            .unwrap();
         drop(completion_tx);
 
         let mut output = Vec::new();
@@ -1167,7 +1295,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, b"1\n0\n");
-        assert_eq!(release_rx.iter().count(), 2);
+        assert_eq!(release_rx.iter().flatten().count(), 2);
     }
 
     #[test]

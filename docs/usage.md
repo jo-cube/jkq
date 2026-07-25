@@ -351,8 +351,9 @@ operands to strings; include separators or other disambiguation when different
 attribute combinations could otherwise produce the same key.
 
 The variables object is parsed once per worker rather than once per record.
-Each worker holds its own copy, so account for the set size when increasing
-`--jobs`.
+Binding `$vars` for an expression clones a reference-counted handle, not the
+object tree. Each worker still holds its own parsed copy, so account for the
+set size when increasing `--jobs`.
 
 ### Preserve bytes and emit only required metadata
 
