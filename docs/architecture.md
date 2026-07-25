@@ -80,6 +80,8 @@ starts, or consumption stops. All pollers feed the same bounded worker and
 completion channels. Workers process each received batch
 sequentially, and completions and source-byte releases cross their channels in
 batches. Admission, actions, ordering, and byte accounting remain per record.
+The completion source metadata retains the original payload length without
+retaining another payload copy.
 
 An action is separate from its output representation:
 
@@ -126,9 +128,11 @@ jsonata-core 2.2.7 does not expose its bytecode compiler as a stable production
 Rust API. Workers therefore use the public AST evaluator. jkq does not use the
 feature-gated internal `_bench` facade.
 
-Existing Kafka tombstones bypass all JSONata work. An identity transform also
-bypasses parsing unless `--on-invalid-json` was supplied explicitly or a
-JSON-value envelope was requested.
+Existing Kafka tombstones bypass all JSONata work. They remain tombstones by
+default and become drops when `--drop-tombstones` is set. Records selected by
+`--tombstone-if` follow the same option before projection. An identity
+transform also bypasses parsing unless `--on-invalid-json` was supplied
+explicitly or a JSON-value envelope was requested.
 
 ## Ordering and Output
 
@@ -147,7 +151,8 @@ completion arrival order instead.
 One writer owns stdout. Formats and JSON envelopes stream directly to its
 buffer, avoiding byte interleaving and an additional record-sized staging
 buffer. `%s`, `%S`, `%R`, envelopes, and action names operate on the
-post-transform action. Broken pipe is normal pipeline termination.
+post-transform action; `%L` reports the source payload length. Broken pipe is
+normal pipeline termination.
 For a JSON-value envelope, the writer inserts compact JSON bytes produced by
 the worker or projection and labels them with `payloadEncoding: "json"`.
 
@@ -216,7 +221,8 @@ stdout that cannot make progress.
 - Every successfully transformed non-tombstone input resolves to exactly one
   action.
 - One input never expands into multiple output records.
-- Existing tombstones bypass JSON and JSONata and remain tombstones.
+- Existing tombstones bypass JSON and JSONata and remain tombstones unless
+  `--drop-tombstones` is set.
 - Pass-through preserves exact source payload bytes unless the user explicitly
   requests a JSON-value envelope.
 - Ordering is per partition, never global.

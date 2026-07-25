@@ -29,17 +29,20 @@ without creating a Kafka consumer.
 For each non-tombstone input record, `jkq` parses the payload into one
 jsonata-core value and reuses it while it:
 
-1. evaluates `--drop-if` expressions in command-line order, stopping at the
-   first Boolean `true`;
-2. evaluates `--tombstone-if` expressions in command-line order, stopping at
-   the first Boolean `true`;
-3. evaluates `--project`, when present;
+1. evaluates `--drop-if` expressions in command-line order, dropping the
+   record at the first Boolean `true`;
+2. evaluates `--tombstone-if` expressions in command-line order, tombstoning
+   the record at the first Boolean `true`, or dropping it when
+   `--drop-tombstones` is set;
+3. evaluates `--project` for surviving records, when present;
 4. otherwise passes through the source payload, preserving its exact bytes
    unless `--envelope-payload value` requests compact JSON serialization.
 
 Existing Kafka tombstones bypass JSON parsing and every expression. A
-successfully evaluated input record produces one action; a JSONata result
-sequence never expands into multiple jkq output records.
+source tombstone remains a tombstone by default and is dropped when
+`--drop-tombstones` is set. A successfully evaluated input record produces one
+action; a JSONata result sequence never expands into multiple jkq output
+records.
 
 ## Action Predicates
 

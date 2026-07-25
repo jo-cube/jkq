@@ -100,16 +100,20 @@ without supplying it evaluates as JSONata `Undefined`.
 
 For each non-tombstone input, `jkq`:
 
-1. evaluates repeated `--drop-if` predicates in command-line order;
-2. evaluates repeated `--tombstone-if` predicates in command-line order;
-3. applies the optional `--project` expression;
+1. evaluates repeated `--drop-if` predicates in command-line order, dropping
+   the record on the first `true`;
+2. evaluates repeated `--tombstone-if` predicates in command-line order,
+   tombstoning the record on the first `true`, or dropping it when
+   `--drop-tombstones` is set;
+3. applies the optional `--project` expression to surviving records;
 4. otherwise passes the source payload through, preserving its exact bytes
    unless `--envelope-payload value` is selected.
 
 Each predicate list stops at its first Boolean `true` result. The top-level
 result of an action predicate must be a JSONata Boolean; JSONata truthiness is
 not applied at this external boundary. An existing Kafka tombstone bypasses
-JSON parsing, predicates, and projection.
+JSON parsing, predicates, and projection. It remains a tombstone by default
+and is dropped when `--drop-tombstones` is set.
 
 Projection results are compact JSON. `Undefined`, functions, regular
 expressions, nested non-JSON values, and serialization failures are evaluation
@@ -131,6 +135,7 @@ The default format is `%s\n`. `-f, --format` accepts these placeholders:
 | `%K` | source key byte length, or `-1` for null |
 | `%s` | post-transform payload bytes |
 | `%S` | post-transform payload byte length, or `-1` for a tombstone |
+| `%L` | source payload byte length, or `-1` for a source tombstone |
 | `%R` | four-byte big-endian signed payload length |
 | `%t` | source topic |
 | `%p` | source partition |
@@ -155,6 +160,8 @@ Payload lengths distinguish values that look identical through `%s`:
 | source or projected JSON `null` | `null` | `4` | signed big-endian `4` |
 
 `%R` rejects a payload larger than `i32::MAX` bytes.
+`%L` is independent of the emitted action: projecting or tombstoning a
+non-tombstone input still reports the original payload length.
 
 ### JSON envelopes
 

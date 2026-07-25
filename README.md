@@ -22,8 +22,9 @@ A successfully processed input record produces one of four actions:
 - **project**: write compact JSON produced by JSONata.
 
 Kafka tombstones bypass JSON parsing and JSONata evaluation and remain
-tombstones. Records stay in source order within each partition by default;
-there is no global order across partitions.
+tombstones by default. `--drop-tombstones` drops them, as well as records
+selected by `--tombstone-if`, before projection. Records stay in source order
+within each partition by default; there is no global order across partitions.
 
 ## What It Is For
 
