@@ -4,7 +4,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -14,9 +14,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use signal_hook::{
     SigId,
     consts::{SIGINT, SIGTERM},
-    flag,
-    iterator::Signals,
-    low_level,
+    flag, low_level,
 };
 
 use crate::{
@@ -74,13 +72,14 @@ impl fmt::Display for PipelineError {
 
 pub struct SignalControl {
     armed: Arc<AtomicBool>,
-    signals: Signals,
+    received: Arc<AtomicUsize>,
     registrations: Vec<SigId>,
 }
 
 impl SignalControl {
     pub fn install() -> Result<Self, String> {
         let armed = Arc::new(AtomicBool::new(false));
+        let received = Arc::new(AtomicUsize::new(0));
         let mut registrations = Vec::new();
         for (signal, status) in [(SIGINT, 130), (SIGTERM, 143)] {
             registrations.push(
@@ -88,9 +87,15 @@ impl SignalControl {
                     .map_err(|error| format!("cannot install signal handler: {error}"))?,
             );
         }
-        let signals = Signals::new([SIGINT, SIGTERM])
-            .map_err(|error| format!("cannot install signal handler: {error}"))?;
         for signal in [SIGINT, SIGTERM] {
+            registrations.push(
+                flag::register_usize(
+                    signal,
+                    Arc::clone(&received),
+                    usize::try_from(signal).expect("termination signals are positive"),
+                )
+                .map_err(|error| format!("cannot install signal handler: {error}"))?,
+            );
             registrations.push(
                 flag::register(signal, Arc::clone(&armed))
                     .map_err(|error| format!("cannot install signal handler: {error}"))?,
@@ -98,13 +103,13 @@ impl SignalControl {
         }
         Ok(Self {
             armed,
-            signals,
+            received,
             registrations,
         })
     }
 
-    pub fn parts(&mut self) -> (Arc<AtomicBool>, &mut Signals) {
-        (Arc::clone(&self.armed), &mut self.signals)
+    pub fn parts(&self) -> (Arc<AtomicBool>, Arc<AtomicUsize>) {
+        (Arc::clone(&self.armed), Arc::clone(&self.received))
     }
 }
 
@@ -267,7 +272,7 @@ pub fn run_pipeline(
     input: KafkaInput,
     writer: &mut impl Write,
     shutdown: Arc<AtomicBool>,
-    signals: &mut Signals,
+    received_signal: Arc<AtomicUsize>,
     stats: Arc<Stats>,
 ) -> Result<Option<i32>, PipelineError> {
     let capacity = config.limits.max_inflight_records;
@@ -296,7 +301,7 @@ pub fn run_pipeline(
                     dispatcher,
                     release_rx,
                     poller_shutdown,
-                    signals,
+                    received_signal,
                     poller_stats,
                     started,
                     poller_failure,
@@ -392,7 +397,7 @@ fn poll_loop(
     dispatcher: Dispatcher,
     release_rx: Receiver<Release>,
     shutdown: Arc<AtomicBool>,
-    signals: &mut Signals,
+    received_signal: Arc<AtomicUsize>,
     stats: Arc<Stats>,
     started: Instant,
     first_failure: Arc<OnceLock<RecordedFailure>>,
@@ -402,7 +407,6 @@ fn poll_loop(
     let mut dispatcher = Some(dispatcher);
     let mut pending: Option<OwnedRecord> = None;
     let mut stopping = false;
-    let mut signal = None;
     let mut admitted = 0_u64;
     let mut next_stats = config.stats_interval;
 
@@ -417,9 +421,6 @@ fn poll_loop(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
-        }
-        for received in signals.pending() {
-            signal.get_or_insert(received);
         }
         if shutdown.load(Ordering::SeqCst) {
             stopping = true;
@@ -591,7 +592,8 @@ fn poll_loop(
         }
     }
 
-    signal
+    let signal = received_signal.load(Ordering::SeqCst);
+    (signal != 0).then(|| i32::try_from(signal).expect("registered signal fits in i32"))
 }
 
 fn runtime_failure(first: &OnceLock<RecordedFailure>, shutdown: &AtomicBool, message: String) {
