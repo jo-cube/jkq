@@ -58,12 +58,8 @@ When code and documentation disagree, determine whether the code is wrong or the
 - Make integer conversions checked when values can cross API or platform boundaries.
 - Preserve exact source bytes for pass-through output.
 
-Run formatting and linting with no ignored warnings:
-
-```sh
-cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-```
+Do not ignore formatting or lint warnings. Use the canonical repository check
+in the work process below.
 
 ## Dependency Policy
 
@@ -182,12 +178,12 @@ During implementation:
 Before considering work complete:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+make check
 ```
 
-Also run Kafka integration tests and performance smoke tests when the change affects consumption, offsets, ordering, backpressure, JSON execution, or formatting.
+This includes the installer, formatting, linting, unit tests, process tests,
+and mock-cluster Kafka tests. For performance-sensitive data-path changes, also
+run the manual performance smoke test in `docs/development.md`.
 
 Before preparing a release, update the package version in `Cargo.toml`,
 regenerate `Cargo.lock`, and follow the release checklist in
