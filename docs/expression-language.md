@@ -1,9 +1,10 @@
-# JSONata Integration
+# Expression Language
 
-`jkq` uses native JSONata for every drop predicate, tombstone predicate, and
-projection. The [JSONata documentation](https://docs.jsonata.org/) defines the
-language, and [jsonata-js](https://github.com/jsonata-js/jsonata) is the
-semantic reference implementation.
+`jkq` uses JSONata as its expression language for drop predicates, tombstone
+predicates, and projections. The
+[JSONata documentation](https://docs.jsonata.org/) defines the language, and
+[jsonata-js](https://github.com/jsonata-js/jsonata) is the semantic reference
+implementation.
 
 The runtime implementation is the public Rust API of
 [`jsonata-core`](https://github.com/txjmb/jsonata-core), currently version

@@ -10,7 +10,7 @@ src/main.rs              process entrypoint
 src/cli.rs               CLI and configuration
 src/app.rs               application assembly
 src/kafka.rs             direct Kafka input
-src/transform/           startup JSONata plan and worker-local execution
+src/transform/           startup expression plan and worker-local execution
 src/runtime.rs           bounded execution pipeline
 src/runtime/state.rs     admission and ordering state
 src/output.rs            formats and JSON envelopes
@@ -158,7 +158,7 @@ Keep each fact in one place:
 |---|---|
 | root `README.md` | purpose, scope, installation, build, and quick start |
 | `usage.md` | CLI workflows and output behavior |
-| `expression-language.md` | jkq's JSONata integration contract and deviations |
+| `expression-language.md` | expression semantics, integration contract, and deviations |
 | `architecture.md` | module boundaries, ownership, and invariants |
 | `development.md` | contributor workflow, tests, dependencies, and releases |
 

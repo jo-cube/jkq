@@ -25,7 +25,7 @@ pub(crate) const MAX_ASSIGNED_PARTITIONS: usize = 100_000;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Run JSONata over records from directly assigned Kafka partitions"
+    about = "Filter and transform JSON records from directly assigned Kafka partitions"
 )]
 pub struct RawCli {
     /// Comma-separated bootstrap broker list

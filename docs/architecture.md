@@ -1,21 +1,21 @@
 # Architecture
 
-`jkq` is a threaded Kafka-to-JSONata pipeline around directly assigned
+`jkq` is a threaded Kafka JSON-processing pipeline around directly assigned
 librdkafka consumers. The design keeps Kafka ownership, record actions,
-ordering, and shutdown visible while isolating jsonata-core's single-threaded
-runtime values inside compute workers.
+ordering, and shutdown visible while isolating expression runtime values
+inside compute workers.
 
 ```text
 CLI and Kafka properties
-→ startup JSONata and output plans
+→ startup expression and output plans
 → partition discovery, direct assignment, and offset resolution
 → one or more Kafka pollers with disjoint partition assignments
-→ bounded record batches through JSONata workers
+→ bounded record batches through compute workers
 → batched completions and per-partition ordering
 → one output writer
 ```
 
-Plans that neither evaluate JSONata nor explicitly validate JSON bypass the
+Plans that neither evaluate expressions nor explicitly validate JSON bypass the
 worker pool. The poller sends pass-through and tombstone completions directly
 to the writer.
 
@@ -26,8 +26,8 @@ src/main.rs                process exit behavior
 src/cli.rs                 parsing, validation, config, startup plans
 src/app.rs                 process IO, signals, pipeline assembly
 src/kafka.rs               assignment, offsets, polling, owned records
-src/transform/mod.rs       startup JSONata source plan and validation
-src/transform/jsonata.rs   worker-local JSONata execution and actions
+src/transform/mod.rs       startup expression source plan and validation
+src/transform/jsonata.rs   worker-local expression execution and actions
 src/runtime.rs             poller, workers, writer, shutdown, statistics
 src/runtime/state.rs       admission and completion-frontier state
 src/output.rs              compiled formats and JSON envelopes
@@ -42,7 +42,7 @@ evaluator, context, and value APIs.
 Before polling, `jkq`:
 
 1. parses and validates the CLI and librdkafka properties;
-2. reads an optional `--vars-file`, parses every JSONata expression, and
+2. reads an optional `--vars-file`, parses every expression, and
    validates the strict JSON `$vars` object;
 3. stores only expression source and variable JSON in the shared transform
    plan;
@@ -97,7 +97,7 @@ transform results. This lets the partition completion frontier advance and
 releases source-byte accounting exactly once even though channel handoffs are
 batched.
 
-## JSONata Execution
+## Expression Execution
 
 The startup plan contains `String` expression sources and optional variable
 JSON, all safe to share across worker threads. Each worker parses its own
@@ -136,7 +136,7 @@ explicitly or a JSON-value envelope was requested.
 
 ## Ordering and Output
 
-JSONata workers may process records from the same partition concurrently.
+Compute workers may process records from the same partition concurrently.
 Completions enter a per-partition frontier:
 
 ```text

@@ -1,10 +1,11 @@
 # jkq
 
-`jkq` is a Kafka JSONata runner. It directly assigns Kafka partitions,
-evaluates native [JSONata](https://jsonata.org/) over JSON record values, and
-writes record data to stdout. It is built for shell pipelines that need Kafka
-metadata, predictable ordering, and JSON query or transformation without a
-JavaScript runtime.
+`jkq` is a bounded Kafka JSON processor for shell pipelines. It directly
+assigns Kafka partitions, filters or reshapes JSON record values, preserves
+Kafka metadata and tombstones, and streams record data to stdout with
+predictable per-partition ordering.
+
+Filtering and projection expressions use [JSONata](https://jsonata.org/).
 
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \
@@ -19,9 +20,9 @@ A successfully processed input record produces one of four actions:
 - **tombstone**: retain the source metadata with a null Kafka payload;
 - **pass**: preserve the exact source value bytes unless a JSON-value envelope
   is requested;
-- **project**: write compact JSON produced by JSONata.
+- **project**: write a compact JSON result.
 
-Kafka tombstones bypass JSON parsing and JSONata evaluation and remain
+Kafka tombstones bypass JSON parsing and expression evaluation and remain
 tombstones by default. `--drop-tombstones` drops them, as well as records
 selected by `--tombstone-if`, before projection. Records stay in source order
 within each partition by default; there is no global order across partitions.
@@ -31,9 +32,9 @@ within each partition by default; there is no global order across partitions.
 Use `jkq` to:
 
 - inspect or export a bounded range from a large JSON topic;
-- filter records with JSONata before sending them to another command;
+- filter records before sending them to another command;
 - preserve source keys, offsets, timestamps, and headers;
-- emit compact JSONata projections instead of complete documents;
+- emit compact projections instead of complete documents;
 - retain tombstone semantics in text or binary-framed output.
 
 `jkq` is deliberately not a producer, consumer-group client, Kafka
@@ -129,8 +130,8 @@ payloads may contain newlines or arbitrary bytes.
   controls.
 - [High-throughput patterns](docs/usage.md#high-throughput-patterns): large
   policy sets, output framing, partition scaling, and bounded validation.
-- [JSONata integration](docs/expression-language.md): jkq's predicate,
-  projection, variables, result, and error contracts.
+- [Expression language](docs/expression-language.md): predicates, projections,
+  variables, results, and errors.
 - [Architecture](docs/architecture.md): data flow, ownership, ordering, and
   backpressure.
 - [Development](docs/development.md): repository shape, checks, tests, and
