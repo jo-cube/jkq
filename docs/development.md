@@ -10,7 +10,7 @@ src/main.rs              process entrypoint
 src/cli.rs               CLI and configuration
 src/app.rs               application assembly
 src/kafka.rs             direct Kafka input
-src/transform/           startup JSONata plan and worker-local execution
+src/transform/           startup expression plan and worker-local execution
 src/runtime.rs           bounded execution pipeline
 src/runtime/state.rs     admission and ordering state
 src/output.rs            formats and JSON envelopes
@@ -112,18 +112,37 @@ Optimize the record path, not startup convenience. Preserve these properties:
   bytes;
 - continued Kafka event polling during backpressure;
 - per-partition ordering unless `--unordered` is selected;
-- worker-local JSONata values and evaluator contexts without cross-record
+- worker-local expression values and evaluator contexts without cross-record
   state.
 
-Full JSONata can construct data-dependent intermediate and output values.
-`--max-inflight-bytes` does not bound those allocations, so performance smoke
-tests should include representative expressions and result sizes as well as
-source payloads.
+Expression intermediates and output are outside the source-byte admission
+budget, so performance smoke tests should include representative expressions,
+result sizes, and source payloads.
 
 Use release builds and representative payloads for measurements. Record the
 hardware, compiler, command, input distribution, and median results. Do not add
 CI throughput thresholds or permanent benchmark machinery for a one-off
 question.
+
+For a low-effort smoke test, choose a retained single-partition offset range
+and run it three times with a representative expression:
+
+```sh
+cargo build --release --locked
+JKQ_BENCH_START=1000000
+JKQ_BENCH_END=1100000
+for JKQ_BENCH_RUN in 1 2 3; do
+  echo "run $JKQ_BENCH_RUN" >&2
+  /usr/bin/time -p target/release/jkq \
+    -F kafka.properties -t events -p 0 \
+    -o "$JKQ_BENCH_START" --end-offset "$JKQ_BENCH_END" \
+    --project '{"id": id}' -f '' >/dev/null
+done
+```
+
+An empty format removes stdout volume while retaining consumption and
+transformation work. Repeat with the production format when output cost is
+part of the question.
 
 ## Dependencies
 
@@ -158,7 +177,7 @@ Keep each fact in one place:
 |---|---|
 | root `README.md` | purpose, scope, installation, build, and quick start |
 | `usage.md` | CLI workflows and output behavior |
-| `expression-language.md` | jkq's JSONata integration contract and deviations |
+| `expression-language.md` | expression semantics, integration contract, and deviations |
 | `architecture.md` | module boundaries, ownership, and invariants |
 | `development.md` | contributor workflow, tests, dependencies, and releases |
 

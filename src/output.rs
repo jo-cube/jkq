@@ -11,6 +11,7 @@ enum FormatToken {
     KeyLength,
     Payload,
     PayloadLength,
+    SourcePayloadLength,
     PayloadLengthBinary,
     Topic,
     Partition,
@@ -98,6 +99,7 @@ pub struct OutputRecord<'a> {
     pub timestamp: Option<Timestamp>,
     pub key: Option<&'a [u8]>,
     pub headers: &'a [Header],
+    pub source_payload_length: Option<usize>,
     pub payload: Payload<'a>,
     pub action: EmittedAction,
 }
@@ -134,6 +136,7 @@ impl CompiledFormat {
                         b'K' => FormatToken::KeyLength,
                         b's' => FormatToken::Payload,
                         b'S' => FormatToken::PayloadLength,
+                        b'L' => FormatToken::SourcePayloadLength,
                         b'R' => FormatToken::PayloadLengthBinary,
                         b't' => FormatToken::Topic,
                         b'p' => FormatToken::Partition,
@@ -229,6 +232,10 @@ impl CompiledFormat {
                     }
                 }
                 FormatToken::PayloadLength => match record.payload.length() {
+                    Some(length) => write_decimal(output, length, &mut written)?,
+                    None => write_decimal(output, -1, &mut written)?,
+                },
+                FormatToken::SourcePayloadLength => match record.source_payload_length {
                     Some(length) => write_decimal(output, length, &mut written)?,
                     None => write_decimal(output, -1, &mut written)?,
                 },
@@ -550,6 +557,7 @@ mod tests {
             timestamp: None,
             key,
             headers: &[],
+            source_payload_length: payload.length(),
             payload,
             action: EmittedAction::Tombstone,
         }
@@ -573,6 +581,7 @@ mod tests {
         ];
         let record = OutputRecord {
             headers: &headers,
+            source_payload_length: Some(9),
             timestamp: Some(Timestamp {
                 milliseconds: 7,
                 kind: TimestampType::CreateTime,
@@ -581,12 +590,12 @@ mod tests {
             ..record(Some(b"k"), Payload::Bytes(b"v"))
         };
         let format =
-            CompiledFormat::compile("%a\\t%t\\t%p\\t%o\\t%T\\t%K%k\\t%S%s\\t%h%%\\x0a").unwrap();
+            CompiledFormat::compile("%a\\t%t\\t%p\\t%o\\t%T\\t%K%k\\t%L:%S%s\\t%h%%\\x0a").unwrap();
         let mut output = Vec::new();
         let written = format.write_to(&record, &mut output).unwrap();
         assert_eq!(
             output,
-            b"pass\tevents\t3\t42\t7\t1k\t1v\tnull=NULL,empty=,raw=x%\n"
+            b"pass\tevents\t3\t42\t7\t1k\t9:1v\tnull=NULL,empty=,raw=x%\n"
         );
         assert_eq!(written, output.len());
     }

@@ -58,12 +58,8 @@ When code and documentation disagree, determine whether the code is wrong or the
 - Make integer conversions checked when values can cross API or platform boundaries.
 - Preserve exact source bytes for pass-through output.
 
-Run formatting and linting with no ignored warnings:
-
-```sh
-cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-```
+Do not ignore formatting or lint warnings. Use the canonical repository check
+in the work process below.
 
 ## Dependency Policy
 
@@ -94,6 +90,7 @@ These invariants must remain true unless the owning behavior or architecture doc
 
 - Consumption uses direct partition assignment only.
 - One invocation consumes one topic and directly assigns either explicitly selected partitions or every partition discovered at startup.
+- Each assigned partition remains owned by exactly one Kafka consumer.
 - Existing Kafka tombstones bypass JSON parsing and remain tombstones by default.
 - Every non-tombstone input produces exactly one action: drop, tombstone, pass through, or project.
 - One input record never expands into multiple output records.
@@ -108,7 +105,7 @@ These invariants must remain true unless the owning behavior or architecture doc
 - All predicates and projections use native JSONata.
 - Channels, admitted record counts, per-partition work, and owned source record bytes are bounded.
 - `--max-inflight-bytes` accounts for owned source payload, key, header names, and header values; it does not cover jsonata-core's parsed tree, evaluation intermediates, or projected output.
-- Backpressure may pause partitions, but the consumer must continue serving Kafka events.
+- Backpressure may pause partitions, but every consumer must continue serving Kafka events.
 - Snapshot termination is based on captured exclusive high-watermark offsets.
 - Shared transform plans contain only thread-safe JSONata expression source and variable JSON; ASTs, values, contexts, and evaluators are worker-local.
 - Each Kafka payload is parsed into jsonata-core's value representation at most once per record and reused across predicates and projection.
@@ -181,12 +178,12 @@ During implementation:
 Before considering work complete:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+make check
 ```
 
-Also run Kafka integration tests and performance smoke tests when the change affects consumption, offsets, ordering, backpressure, JSON execution, or formatting.
+This includes the installer, formatting, linting, unit tests, process tests,
+and mock-cluster Kafka tests. For performance-sensitive data-path changes, also
+run the manual performance smoke test in `docs/development.md`.
 
 Before preparing a release, update the package version in `Cargo.toml`,
 regenerate `Cargo.lock`, and follow the release checklist in

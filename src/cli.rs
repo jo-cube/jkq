@@ -19,12 +19,13 @@ use crate::{
 const DEFAULT_MAX_INFLIGHT_RECORDS: usize = 8_192;
 const DEFAULT_MAX_INFLIGHT_BYTES: &str = "256MiB";
 const DEFAULT_MAX_INFLIGHT_PER_PARTITION: usize = 8_192;
+const MAX_CONSUMERS: usize = 128;
 pub(crate) const MAX_ASSIGNED_PARTITIONS: usize = 100_000;
 
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Run JSONata over records from directly assigned Kafka partitions"
+    about = "Filter and transform JSON records from directly assigned Kafka partitions"
 )]
 pub struct RawCli {
     /// Comma-separated bootstrap broker list
@@ -60,6 +61,9 @@ pub struct RawCli {
     /// Tombstone records when this JSONata predicate returns true; repeatable
     #[arg(long)]
     tombstone_if: Vec<String>,
+    /// Drop source and predicate-generated tombstones before projection
+    #[arg(long)]
+    drop_tombstones: bool,
     /// Project each surviving record with this JSONata expression
     #[arg(long)]
     project: Option<String>,
@@ -93,6 +97,9 @@ pub struct RawCli {
     /// Number of compute workers
     #[arg(short = 'j', long)]
     jobs: Option<usize>,
+    /// Number of Kafka consumers
+    #[arg(long, default_value_t = 1)]
+    consumers: usize,
     /// Emit records in completion order
     #[arg(long)]
     unordered: bool,
@@ -191,6 +198,7 @@ pub struct RuntimeConfig {
     pub count_per_partition: Option<u64>,
     pub exit_at_end: bool,
     pub jobs: usize,
+    pub consumers: usize,
     pub unordered: bool,
     pub limits: RuntimeLimits,
     pub transform: TransformPlan,
@@ -244,6 +252,12 @@ impl RawCli {
         }
         if jobs > 1_024 {
             return Err("jobs must not exceed 1024".to_owned());
+        }
+        if self.consumers == 0 {
+            return Err("consumer count must be at least 1".to_owned());
+        }
+        if self.consumers > MAX_CONSUMERS {
+            return Err(format!("consumer count must not exceed {MAX_CONSUMERS}"));
         }
         if self.max_inflight_records == 0
             || self.max_inflight_bytes == 0
@@ -300,6 +314,7 @@ impl RawCli {
         let transform = build_plan(
             &self.drop_if,
             &self.tombstone_if,
+            self.drop_tombstones,
             self.project.as_deref(),
             file_variables.as_deref().or(self.vars.as_deref()),
             force_json_validation,
@@ -351,6 +366,7 @@ impl RawCli {
             count_limit: self.count,
             count_per_partition: self.count_per_partition,
             jobs,
+            consumers: self.consumers,
             unordered: self.unordered,
             limits: RuntimeLimits {
                 max_inflight_records: self.max_inflight_records,
@@ -599,6 +615,29 @@ mod tests {
     fn cli_defaults_to_all_partitions() {
         let all = resolve(&["jkq", "-b", "localhost", "-t", "events"]).unwrap();
         assert_eq!(all.partitions, None);
+        assert_eq!(all.consumers, 1);
+    }
+
+    #[test]
+    fn cli_accepts_a_custom_consumer_count() {
+        let config =
+            resolve(&["jkq", "-b", "localhost", "-t", "events", "--consumers", "3"]).unwrap();
+        assert_eq!(config.consumers, 3);
+    }
+
+    #[test]
+    fn dropping_tombstones_keeps_the_identity_path() {
+        let config = resolve(&[
+            "jkq",
+            "-b",
+            "localhost",
+            "-t",
+            "events",
+            "--drop-tombstones",
+        ])
+        .unwrap();
+        assert!(config.transform.drop_tombstones);
+        assert!(!config.transform.capabilities.parses_json);
     }
 
     #[test]
@@ -630,6 +669,8 @@ mod tests {
             vec!["jkq", "-b", "x", "-t", "t", "-p", "0", "-p", "0"],
             vec!["jkq", "-b", "x", "-t", "t", "-p", "-1"],
             vec!["jkq", "-b", "x", "-t", "t", "-p", "0", "-c", "0"],
+            vec!["jkq", "-b", "x", "-t", "t", "--consumers", "0"],
+            vec!["jkq", "-b", "x", "-t", "t", "--consumers", "129"],
             vec![
                 "jkq",
                 "-b",
@@ -960,6 +1001,9 @@ mod tests {
         assert!(help.contains("Maximum admitted input records per partition"));
         assert!(help.contains("Validate local configuration and exit without connecting"));
         assert!(help.contains("Owned source-byte admission budget; supports KiB, MiB, and GiB"));
+        assert!(help.contains("Number of Kafka consumers"));
+        assert!(help.contains("--consumers <CONSUMERS>"));
+        assert!(help.contains("Drop source and predicate-generated tombstones before projection"));
         assert!(help.contains("Strict JSON object available as $vars"));
         assert!(help.contains("Read the strict JSON object available as $vars from a file"));
         assert!(help.contains("Representation used for the envelope payload"));

@@ -1,21 +1,21 @@
 # Architecture
 
-`jkq` is a threaded Kafka-to-JSONata pipeline around a directly assigned
-librdkafka consumer. The design keeps Kafka ownership, record actions,
-ordering, and shutdown visible while isolating jsonata-core's single-threaded
-runtime values inside compute workers.
+`jkq` is a threaded Kafka JSON-processing pipeline around directly assigned
+librdkafka consumers. The design keeps Kafka ownership, record actions,
+ordering, and shutdown visible while isolating expression runtime values
+inside compute workers.
 
 ```text
 CLI and Kafka properties
-→ startup JSONata and output plans
+→ startup expression and output plans
 → partition discovery, direct assignment, and offset resolution
-→ Kafka poller and source-byte admission control
-→ bounded record batches through JSONata workers
+→ one or more Kafka pollers with disjoint partition assignments
+→ bounded record batches through compute workers
 → batched completions and per-partition ordering
 → one output writer
 ```
 
-Plans that neither evaluate JSONata nor explicitly validate JSON bypass the
+Plans that neither evaluate expressions nor explicitly validate JSON bypass the
 worker pool. The poller sends pass-through and tombstone completions directly
 to the writer.
 
@@ -26,8 +26,8 @@ src/main.rs                process exit behavior
 src/cli.rs                 parsing, validation, config, startup plans
 src/app.rs                 process IO, signals, pipeline assembly
 src/kafka.rs               assignment, offsets, polling, owned records
-src/transform/mod.rs       startup JSONata source plan and validation
-src/transform/jsonata.rs   worker-local JSONata execution and actions
+src/transform/mod.rs       startup expression source plan and validation
+src/transform/jsonata.rs   worker-local expression execution and actions
 src/runtime.rs             poller, workers, writer, shutdown, statistics
 src/runtime/state.rs       admission and completion-frontier state
 src/output.rs              compiled formats and JSON envelopes
@@ -42,24 +42,25 @@ evaluator, context, and value APIs.
 Before polling, `jkq`:
 
 1. parses and validates the CLI and librdkafka properties;
-2. reads an optional `--vars-file`, parses every JSONata expression, and
+2. reads an optional `--vars-file`, parses every expression, and
    validates the strict JSON `$vars` object;
 3. stores only expression source and variable JSON in the shared transform
    plan;
 4. compiles the output format and its metadata requirements;
-5. creates the consumer and discovers all topic partitions when none were
+5. creates a consumer and discovers all topic partitions when none were
    selected;
 6. fetches watermarks only for ranges that need them, resolves partition
    starts and ends, and captures snapshot highs in that same watermark pass;
-7. assigns partitions directly;
+7. distributes partitions across the requested number of consumers and
+   assigns each partition directly to exactly one;
 8. installs the bounded pipeline.
 
 A startup failure cannot produce partial record output. `--check` exits after
 local plan validation and does not create a consumer.
 
 The Kafka adapter calls `assign`, never `subscribe`. Automatic commits and
-offset storage are disabled. The poller is the only thread that calls the
-consumer, including pause and resume. Automatic partition discovery is a
+offset storage are disabled. Each consumer is owned by one poller thread,
+including its pause and resume calls. Automatic partition discovery is a
 startup snapshot; partitions added later are not assigned to the running
 process.
 
@@ -73,11 +74,14 @@ Each admitted input gets a dense local partition sequence. Kafka offsets remain
 source metadata; the local sequence drives completion ordering even when
 offsets are sparse.
 
-The poller groups admitted inputs into batches capped by record count and
+Each poller groups admitted inputs into batches capped by record count and
 retained source bytes. Partial batches flush when Kafka is idle, backpressure
-starts, or consumption stops. Workers process each received batch
+starts, or consumption stops. All pollers feed the same bounded worker and
+completion channels. Workers process each received batch
 sequentially, and completions and source-byte releases cross their channels in
 batches. Admission, actions, ordering, and byte accounting remain per record.
+The completion source metadata retains the original payload length without
+retaining another payload copy.
 
 An action is separate from its output representation:
 
@@ -93,7 +97,7 @@ transform results. This lets the partition completion frontier advance and
 releases source-byte accounting exactly once even though channel handoffs are
 batched.
 
-## JSONata Execution
+## Expression Execution
 
 The startup plan contains `String` expression sources and optional variable
 JSON, all safe to share across worker threads. Each worker parses its own
@@ -124,13 +128,15 @@ jsonata-core 2.2.7 does not expose its bytecode compiler as a stable production
 Rust API. Workers therefore use the public AST evaluator. jkq does not use the
 feature-gated internal `_bench` facade.
 
-Existing Kafka tombstones bypass all JSONata work. An identity transform also
-bypasses parsing unless `--on-invalid-json` was supplied explicitly or a
-JSON-value envelope was requested.
+Existing Kafka tombstones bypass all JSONata work. They remain tombstones by
+default and become drops when `--drop-tombstones` is set. Records selected by
+`--tombstone-if` follow the same option before projection. An identity
+transform also bypasses parsing unless `--on-invalid-json` was supplied
+explicitly or a JSON-value envelope was requested.
 
 ## Ordering and Output
 
-JSONata workers may process records from the same partition concurrently.
+Compute workers may process records from the same partition concurrently.
 Completions enter a per-partition frontier:
 
 ```text
@@ -145,39 +151,43 @@ completion arrival order instead.
 One writer owns stdout. Formats and JSON envelopes stream directly to its
 buffer, avoiding byte interleaving and an additional record-sized staging
 buffer. `%s`, `%S`, `%R`, envelopes, and action names operate on the
-post-transform action. Broken pipe is normal pipeline termination.
+post-transform action; `%L` reports the source payload length. Broken pipe is
+normal pipeline termination.
 For a JSON-value envelope, the writer inserts compact JSON bytes produced by
 the worker or projection and labels them with `payloadEncoding: "json"`.
 
 ## Backpressure and Memory Accounting
 
-Admission tracks global records, source bytes, and records per partition. The
-byte charge covers owned bytes copied from the source record:
+Shared atomic admission tracks global records and source bytes across all
+consumers. Each poller separately tracks its partition sequences, per-partition
+records, and pause state. The byte charge covers owned bytes copied from the
+source record:
 
 - payload;
 - key, when required;
 - header names and header values, when required.
 
-The charge intentionally excludes jsonata-core's parsed value tree,
-evaluation intermediates, projected output, and compact pass output for a
-JSON-value envelope. Full JSONata can construct data-dependent values, so total
-evaluator and output memory cannot be bounded by a static expression compiler.
-Bounded channels, `--max-inflight-records`, `--max-inflight-per-partition`, and
-the owned source-byte admission budget still bound queued source work.
-Batches do not admit records ahead of those limits.
+The charge intentionally excludes the parsed value tree, evaluation
+intermediates, projected output, and compact pass output for a JSON-value
+envelope. Those allocations depend on the input and expressions. Bounded
+channels, `--max-inflight-records`, `--max-inflight-per-partition`, and the
+owned source-byte admission budget bound queued source work. Batches do not
+admit records ahead of those limits.
 
 Charges are released only after ordered write or drop. Slow output therefore
 propagates pressure back to Kafka, and the reorder buffer cannot hold more
 records than admission permits.
 
-Global pressure pauses all assigned partitions. Per-partition record pressure
-pauses only that partition. Resume uses a 75% low-water threshold to avoid
-thrashing. The poller continues serving Kafka events while paused.
+When a poller cannot reserve shared capacity, it holds that one record and
+pauses its assigned partitions until capacity becomes available. Per-partition
+record pressure pauses only that partition and resumes at a 75% low-water
+threshold to avoid thrashing. Every poller continues serving its Kafka events
+while paused.
 
 Because a source record's size is known only after polling, at most one owned
-record may wait outside admitted accounting. A source record larger than the
-byte budget is admitted only when no other admitted bytes remain, preventing
-deadlock while preserving the runs-alone behavior.
+record per consumer may wait outside admitted accounting. A source record
+larger than the byte budget is admitted only when no other admitted bytes
+remain, preventing deadlock while preserving the runs-alone behavior.
 
 ## Termination and Failure
 
@@ -185,7 +195,8 @@ Fixed ranges use exclusive end offsets. Snapshot boundaries are captured once
 and never extended. Completion means that the poller has stopped admitting the
 range and every admitted partition sequence has crossed its frontier.
 
-Global counts stop all admission after the configured number of input records.
+Global counts atomically stop all admission after the configured number of
+input records.
 Per-partition counts mark each partition complete independently after its
 limit; already admitted records still cross the normal completion frontier.
 
@@ -203,11 +214,14 @@ stdout that cannot make progress.
 
 - One invocation consumes one topic and directly assigns either explicitly
   selected partitions or every partition discovered at startup.
+- Every assigned partition belongs to exactly one consumer for the complete
+  run.
 - JSONata is the only expression language.
 - Every successfully transformed non-tombstone input resolves to exactly one
   action.
 - One input never expands into multiple output records.
-- Existing tombstones bypass JSON and JSONata and remain tombstones.
+- Existing tombstones bypass JSON and JSONata and remain tombstones unless
+  `--drop-tombstones` is set.
 - Pass-through preserves exact source payload bytes unless the user explicitly
   requests a JSON-value envelope.
 - Ordering is per partition, never global.

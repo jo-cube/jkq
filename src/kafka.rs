@@ -52,7 +52,7 @@ pub struct KafkaInput {
 }
 
 impl KafkaInput {
-    pub fn prepare(config: &RuntimeConfig) -> Result<Self, String> {
+    pub fn prepare(config: &RuntimeConfig) -> Result<Vec<Self>, String> {
         let consumer = create_consumer(config)?;
         let partitions = match &config.partitions {
             Some(partitions) => partitions.clone(),
@@ -132,26 +132,49 @@ impl KafkaInput {
             None => None,
         };
 
-        let mut assignment = TopicPartitionList::with_capacity(partitions.len());
-        for partition in &partitions {
-            let start = starts[partition];
+        let partition_shards = shard_partitions(&partitions, config.consumers);
+        let mut consumers = Vec::with_capacity(partition_shards.len());
+        consumers.push(consumer);
+        for _ in 1..partition_shards.len() {
+            consumers.push(create_consumer(config)?);
+        }
+
+        consumers
+            .into_iter()
+            .zip(partition_shards)
+            .map(|(consumer, partitions)| {
+                Self::assign(config, consumer, &partitions, &starts, fixed_ends.as_ref())
+            })
+            .collect()
+    }
+
+    fn assign(
+        config: &RuntimeConfig,
+        consumer: BaseConsumer,
+        assigned: &[i32],
+        starts: &BTreeMap<i32, Offset>,
+        fixed_ends: Option<&BTreeMap<i32, i64>>,
+    ) -> Result<Self, String> {
+        let mut assignment = TopicPartitionList::with_capacity(assigned.len());
+        for partition in assigned {
             assignment
-                .add_partition_offset(&config.topic, *partition, start)
+                .add_partition_offset(&config.topic, *partition, starts[partition])
                 .map_err(|error| assignment_error(&config.topic, *partition, error))?;
         }
         consumer
             .assign(&assignment)
             .map_err(|error| format!("cannot assign topic {}: {error}", config.topic))?;
-        let partitions = starts
-            .into_iter()
-            .map(|(partition, start)| {
-                let end_exclusive = fixed_ends.as_ref().map(|boundaries| boundaries[&partition]);
+        let partitions = assigned
+            .iter()
+            .map(|partition| {
+                let start = starts[partition];
+                let end_exclusive = fixed_ends.map(|boundaries| boundaries[partition]);
                 let done = match (start, end_exclusive) {
                     (Offset::Offset(start), Some(end)) => start >= end,
                     _ => false,
                 };
                 (
-                    partition,
+                    *partition,
                     PartitionState {
                         end_exclusive,
                         done,
@@ -344,6 +367,15 @@ impl KafkaInput {
     }
 }
 
+fn shard_partitions(partitions: &[i32], consumer_count: usize) -> Vec<Vec<i32>> {
+    let shard_count = consumer_count.min(partitions.len());
+    let mut shards = vec![Vec::new(); shard_count];
+    for (index, partition) in partitions.iter().enumerate() {
+        shards[index % shard_count].push(*partition);
+    }
+    shards
+}
+
 fn retained_bytes(
     message: &rdkafka::message::BorrowedMessage<'_>,
     requirements: OutputRequirements,
@@ -527,6 +559,15 @@ fn watermark_error(topic: &str, partition: i32, error: KafkaError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partitions_are_distributed_across_available_consumers() {
+        assert_eq!(
+            shard_partitions(&[0, 1, 2, 3, 4, 5], 4),
+            [vec![0, 4], vec![1, 5], vec![2], vec![3]]
+        );
+        assert_eq!(shard_partitions(&[0, 1], 4), [vec![0], vec![1]]);
+    }
 
     #[test]
     fn timestamp_without_a_matching_record_resolves_to_current_end() {
