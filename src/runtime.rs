@@ -254,7 +254,7 @@ struct BatchSender<T> {
 
 enum Dispatcher {
     Transform(BatchSender<WorkItem>),
-    Identity(BatchSender<Completion>),
+    Identity(BatchSender<Completion>, bool),
 }
 
 #[derive(Debug)]
@@ -264,6 +264,7 @@ struct SourceRecord {
     timestamp: Option<Timestamp>,
     key: Option<Vec<u8>>,
     headers: Vec<Header>,
+    payload_length: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -320,15 +321,15 @@ impl Dispatcher {
         Self::Transform(BatchSender::new(consumer, sender))
     }
 
-    fn identity(consumer: usize, sender: Sender<Batch<Completion>>) -> Self {
-        Self::Identity(BatchSender::new(consumer, sender))
+    fn identity(consumer: usize, sender: Sender<Batch<Completion>>, drop_tombstones: bool) -> Self {
+        Self::Identity(BatchSender::new(consumer, sender), drop_tombstones)
     }
 
     fn push(&mut self, record: OwnedRecord, sequence: u64, stats: &Stats) -> Result<(), String> {
         let record_bytes = record.retained_bytes;
         match self {
             Self::Transform(batch) => batch.push(WorkItem { sequence, record }, record_bytes),
-            Self::Identity(batch) => {
+            Self::Identity(batch, drop_tombstones) => {
                 let OwnedRecord {
                     partition,
                     offset,
@@ -339,8 +340,10 @@ impl Dispatcher {
                     retained_bytes: record_bytes,
                 } = record;
                 let source_tombstone = payload.is_none();
+                let payload_length = payload.as_ref().map(Vec::len);
                 let action = match payload {
                     Some(bytes) => Action::PassThrough(PassPayload::Exact(bytes)),
+                    None if *drop_tombstones => Action::Drop,
                     None => Action::Tombstone,
                 };
                 stats.transformed(&action, None, source_tombstone);
@@ -357,6 +360,7 @@ impl Dispatcher {
                             timestamp,
                             key,
                             headers,
+                            payload_length,
                         },
                         outcome: CompletionOutcome::Action(action),
                     },
@@ -369,7 +373,7 @@ impl Dispatcher {
     fn flush(&mut self) -> Result<(), String> {
         match self {
             Self::Transform(batch) => batch.flush(),
-            Self::Identity(batch) => batch.flush(),
+            Self::Identity(batch, _) => batch.flush(),
         }
     }
 }
@@ -406,7 +410,11 @@ pub fn run_pipeline(
             let dispatcher = if transforms_json {
                 Dispatcher::transform(consumer, work_tx.clone())
             } else {
-                Dispatcher::identity(consumer, completion_tx.clone())
+                Dispatcher::identity(
+                    consumer,
+                    completion_tx.clone(),
+                    config.transform.drop_tombstones,
+                )
             };
             match thread::Builder::new()
                 .name(format!("jkq-kafka-poll-{consumer}"))
@@ -856,6 +864,7 @@ fn worker_loop(
                 retained_bytes,
             } = record;
             let source_tombstone = payload.is_none();
+            let payload_length = payload.as_ref().map(Vec::len);
             let result = catch_unwind(AssertUnwindSafe(|| {
                 worker.execute_report(payload, config.errors)
             }));
@@ -887,6 +896,7 @@ fn worker_loop(
                     timestamp,
                     key,
                     headers,
+                    payload_length,
                 },
                 outcome,
             });
@@ -1072,6 +1082,7 @@ fn write_action(
         timestamp: source.timestamp,
         key: source.key.as_deref(),
         headers: &source.headers,
+        source_payload_length: source.payload_length,
         payload,
         action: emitted_action,
     };
@@ -1105,6 +1116,7 @@ mod tests {
                 timestamp: None,
                 key: None,
                 headers: Vec::new(),
+                payload_length: None,
             },
             outcome: CompletionOutcome::Action(action),
         }
@@ -1151,7 +1163,7 @@ mod tests {
     #[test]
     fn identity_dispatch_completes_without_a_worker() {
         let (completion_tx, completion_rx) = bounded(1);
-        let mut dispatcher = Dispatcher::identity(0, completion_tx);
+        let mut dispatcher = Dispatcher::identity(0, completion_tx, false);
         let limits = crate::cli::RuntimeLimits {
             max_inflight_records: 1,
             max_inflight_bytes: 1024,
@@ -1186,6 +1198,33 @@ mod tests {
             completion.outcome,
             CompletionOutcome::Action(Action::PassThrough(PassPayload::Exact(ref bytes)))
                 if bytes == b"exact"
+        ));
+    }
+
+    #[test]
+    fn identity_dispatch_drops_source_tombstones_when_requested() {
+        let (completion_tx, completion_rx) = bounded(1);
+        let mut dispatcher = Dispatcher::identity(0, completion_tx, true);
+        dispatcher
+            .push(
+                OwnedRecord {
+                    partition: 0,
+                    offset: 7,
+                    timestamp: None,
+                    key: None,
+                    headers: Vec::new(),
+                    payload: None,
+                    retained_bytes: 0,
+                },
+                0,
+                &Stats::default(),
+            )
+            .unwrap();
+        dispatcher.flush().unwrap();
+
+        assert!(matches!(
+            completion_rx.recv().unwrap().items[0].outcome,
+            CompletionOutcome::Action(Action::Drop)
         ));
     }
 
@@ -1225,6 +1264,7 @@ mod tests {
             timestamp: None,
             key: None,
             headers: Vec::new(),
+            payload_length: Some(12),
         };
         let mut output = Vec::new();
 

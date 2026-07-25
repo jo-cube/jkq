@@ -11,6 +11,7 @@ pub struct PlanCapabilities {
 pub struct TransformPlan {
     pub drops: Vec<String>,
     pub tombstones: Vec<String>,
+    pub drop_tombstones: bool,
     pub projection: Option<String>,
     pub variables: Option<String>,
     pub capabilities: PlanCapabilities,
@@ -19,6 +20,7 @@ pub struct TransformPlan {
 pub fn build_plan(
     drops: &[String],
     tombstones: &[String],
+    drop_tombstones: bool,
     projection: Option<&str>,
     variables: Option<&str>,
     force_json_validation: bool,
@@ -46,6 +48,7 @@ pub fn build_plan(
     Ok(TransformPlan {
         drops: drops.to_vec(),
         tombstones: tombstones.to_vec(),
+        drop_tombstones,
         projection: projection.map(str::to_owned),
         variables: variables.map(str::to_owned),
         capabilities: PlanCapabilities {
@@ -75,6 +78,7 @@ mod tests {
         build_plan(
             &[r#"environment != "production""#.to_owned()],
             &[],
+            false,
             Some(r#"{"id": id, "total": $sum(items.price)}"#),
             None,
             false,
@@ -84,6 +88,7 @@ mod tests {
         let error = build_plan(
             &[r#"environment === "production""#.to_owned()],
             &[],
+            false,
             None,
             None,
             false,
@@ -94,7 +99,8 @@ mod tests {
 
     #[test]
     fn jsonata_core_object_regex_parse_deviation_is_visible() {
-        let error = build_plan(&[], &[], Some(r#"{"value": /x/}"#), None, false).unwrap_err();
+        let error =
+            build_plan(&[], &[], false, Some(r#"{"value": /x/}"#), None, false).unwrap_err();
         assert!(error.contains("projection JSONata parse error"));
     }
 
@@ -103,6 +109,7 @@ mod tests {
         build_plan(
             &[],
             &[],
+            false,
             Some("$vars.tenant"),
             Some(r#"{"tenant":"acme","cutoff":1000}"#),
             false,
@@ -111,7 +118,7 @@ mod tests {
 
         for variables in [r#"{tenant:"acme"}"#, "[]", "null"] {
             assert!(
-                build_plan(&[], &[], None, Some(variables), false).is_err(),
+                build_plan(&[], &[], false, None, Some(variables), false).is_err(),
                 "{variables}"
             );
         }
@@ -120,13 +127,13 @@ mod tests {
     #[test]
     fn explicit_validation_turns_identity_into_a_json_plan() {
         assert!(
-            !build_plan(&[], &[], None, None, false)
+            !build_plan(&[], &[], false, None, None, false)
                 .unwrap()
                 .capabilities
                 .parses_json
         );
         assert!(
-            build_plan(&[], &[], None, None, true)
+            build_plan(&[], &[], false, None, None, true)
                 .unwrap()
                 .capabilities
                 .parses_json

@@ -194,7 +194,7 @@ mod tests {
             "1",
             "--snapshot",
             "-f",
-            "%p:%o:%K:%k:%S:%s:%h\n",
+            "%p:%o:%K:%k:%L:%S:%s:%h\n",
         ]);
         let input = KafkaInput::prepare(&config).unwrap().pop().unwrap();
         fixture.produce(0, Some(br#"{"value":1}"#), None, 102, None);
@@ -208,8 +208,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                b"0:0:3:key:11:{\"value\":0}:trace=abc".as_slice(),
-                b"1:0:-1::-1::".as_slice(),
+                b"0:0:3:key:11:11:{\"value\":0}:trace=abc".as_slice(),
+                b"1:0:-1::-1:-1::".as_slice(),
             ]
         );
     }
@@ -473,11 +473,11 @@ mod tests {
             "--project",
             "$pad(\"\", 1024, \"x\")",
             "-f",
-            "%a:%S\n",
+            "%L:%a:%S\n",
         ]);
 
         let mut output = Vec::new();
         run_with_writer(&config, &mut output).unwrap();
-        assert_eq!(output, b"project:1026\n");
+        assert_eq!(output, b"2:project:1026\n");
     }
 }

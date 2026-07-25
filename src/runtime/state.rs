@@ -282,6 +282,7 @@ mod tests {
                 timestamp: None::<Timestamp>,
                 key: None,
                 headers: Vec::new(),
+                payload_length: None,
             },
             outcome: CompletionOutcome::Action(action),
         }

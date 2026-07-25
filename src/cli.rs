@@ -61,6 +61,9 @@ pub struct RawCli {
     /// Tombstone records when this JSONata predicate returns true; repeatable
     #[arg(long)]
     tombstone_if: Vec<String>,
+    /// Drop source and predicate-generated tombstones before projection
+    #[arg(long)]
+    drop_tombstones: bool,
     /// Project each surviving record with this JSONata expression
     #[arg(long)]
     project: Option<String>,
@@ -311,6 +314,7 @@ impl RawCli {
         let transform = build_plan(
             &self.drop_if,
             &self.tombstone_if,
+            self.drop_tombstones,
             self.project.as_deref(),
             file_variables.as_deref().or(self.vars.as_deref()),
             force_json_validation,
@@ -619,6 +623,21 @@ mod tests {
         let config =
             resolve(&["jkq", "-b", "localhost", "-t", "events", "--consumers", "3"]).unwrap();
         assert_eq!(config.consumers, 3);
+    }
+
+    #[test]
+    fn dropping_tombstones_keeps_the_identity_path() {
+        let config = resolve(&[
+            "jkq",
+            "-b",
+            "localhost",
+            "-t",
+            "events",
+            "--drop-tombstones",
+        ])
+        .unwrap();
+        assert!(config.transform.drop_tombstones);
+        assert!(!config.transform.capabilities.parses_json);
     }
 
     #[test]
@@ -984,6 +1003,7 @@ mod tests {
         assert!(help.contains("Owned source-byte admission budget; supports KiB, MiB, and GiB"));
         assert!(help.contains("Number of Kafka consumers"));
         assert!(help.contains("--consumers <CONSUMERS>"));
+        assert!(help.contains("Drop source and predicate-generated tombstones before projection"));
         assert!(help.contains("Strict JSON object available as $vars"));
         assert!(help.contains("Read the strict JSON object available as $vars from a file"));
         assert!(help.contains("Representation used for the envelope payload"));

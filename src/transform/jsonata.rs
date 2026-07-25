@@ -81,6 +81,7 @@ impl std::error::Error for TransformError {}
 pub(crate) struct Worker {
     parses_json: bool,
     embeds_json: bool,
+    drop_tombstones: bool,
     drops: Vec<AstNode>,
     tombstones: Vec<AstNode>,
     projection: Option<AstNode>,
@@ -92,6 +93,7 @@ impl Worker {
         Self {
             parses_json: plan.capabilities.parses_json,
             embeds_json,
+            drop_tombstones: plan.drop_tombstones,
             drops: plan.drops.iter().map(|source| parsed(source)).collect(),
             tombstones: plan
                 .tombstones
@@ -112,7 +114,7 @@ impl Worker {
     ) -> Result<Execution, TransformError> {
         let Some(payload) = payload else {
             return Ok(Execution {
-                action: Action::Tombstone,
+                action: self.tombstone_action(),
                 issue: None,
             });
         };
@@ -163,7 +165,7 @@ impl Worker {
         }
         for (index, expression) in self.tombstones.iter().enumerate() {
             if self.predicate(expression, document, "tombstone predicate", index)? {
-                return Ok(Action::Tombstone);
+                return Ok(self.tombstone_action());
             }
         }
         let Some(expression) = &self.projection else {
@@ -211,6 +213,14 @@ impl Worker {
                 format!("result must be a Boolean, received {}", value_type(&value)),
             )
         })
+    }
+
+    fn tombstone_action(&self) -> Action {
+        if self.drop_tombstones {
+            Action::Drop
+        } else {
+            Action::Tombstone
+        }
     }
 
     fn evaluate_expression(
@@ -330,6 +340,7 @@ mod tests {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect::<Vec<_>>(),
+            false,
             projection,
             variables,
             validate,
@@ -439,6 +450,22 @@ mod tests {
             false,
         );
         assert_eq!(run(&transform, None).unwrap(), Action::Tombstone);
+    }
+
+    #[test]
+    fn drop_tombstones_applies_before_projection() {
+        let transform =
+            build_plan(&[], &["deleted".to_owned()], true, Some("id"), None, false).unwrap();
+
+        assert_eq!(run(&transform, None).unwrap(), Action::Drop);
+        assert_eq!(
+            run(&transform, Some(br#"{"deleted":true,"id":1}"#)).unwrap(),
+            Action::Drop
+        );
+        assert_eq!(
+            run(&transform, Some(br#"{"deleted":false,"id":1}"#)).unwrap(),
+            Action::Project(b"1".to_vec())
+        );
     }
 
     #[test]
