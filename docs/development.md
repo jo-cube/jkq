@@ -110,7 +110,7 @@ Optimize the record path, not startup convenience. Preserve these properties:
   was explicitly selected;
 - bounded channels, admitted records, per-partition work, and owned source
   bytes;
-- continued Kafka event polling during backpressure;
+- no new consumer polling while a record is waiting for admission;
 - per-partition ordering unless `--unordered` is selected;
 - worker-local expression values and evaluator contexts without cross-record
   state.

@@ -306,10 +306,12 @@ All three limits must be positive. `--max-inflight-per-partition` cannot exceed
 consumers, while the per-partition limit remains local to each partition.
 
 A source record larger than the byte budget may run alone. When admission
-limits are reached, `jkq` pauses affected partitions while continuing to serve
-Kafka events. Shared and per-partition capacity resume below a 75% low-water
-threshold to avoid pause and resume churn. Channels, admitted record counts,
-per-partition admission, and source-byte accounting remain bounded.
+limits are reached, the affected poller stops requesting records from its
+consumer and waits for admitted work to drain. A record already returned by
+Kafka may wait outside admission, bounded to one record per consumer.
+librdkafka's internal prefetch queue is separate and follows its Kafka
+configuration. Channels, admitted record counts, per-partition admission, and
+owned source-byte accounting remain bounded.
 
 ## High-throughput Patterns
 
