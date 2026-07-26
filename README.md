@@ -58,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/jo-cube/jkq/main/scripts/install.sh
 Install a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jo-cube/jkq/main/scripts/install.sh | VERSION=v0.5.0 sh
+curl -fsSL https://raw.githubusercontent.com/jo-cube/jkq/main/scripts/install.sh | VERSION=v0.5.1 sh
 ```
 
 Release archives are verified with SHA-256 checksums. Published platforms:

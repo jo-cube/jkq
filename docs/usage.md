@@ -307,8 +307,9 @@ consumers, while the per-partition limit remains local to each partition.
 
 A source record larger than the byte budget may run alone. When admission
 limits are reached, `jkq` pauses affected partitions while continuing to serve
-Kafka events. Channels, admitted record counts, per-partition admission, and
-source-byte accounting remain bounded.
+Kafka events. Shared and per-partition capacity resume below a 75% low-water
+threshold to avoid pause and resume churn. Channels, admitted record counts,
+per-partition admission, and source-byte accounting remain bounded.
 
 ## High-throughput Patterns
 

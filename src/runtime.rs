@@ -563,7 +563,8 @@ fn poll_loop(
         if shared_admission.count_reached() {
             stopping = true;
         }
-        if (stopping || pending.is_some())
+        let global_limited = admission.update_global_limit(&shared_admission, pending.is_some());
+        if (stopping || global_limited)
             && let Some(dispatcher) = dispatcher.as_mut()
             && let Err(error) = dispatcher.flush()
         {
@@ -578,7 +579,7 @@ fn poll_loop(
             pending = None;
             dispatcher.take();
         }
-        if let Err(pause_error) = admission.sync_pauses(&mut input, stopping || pending.is_some()) {
+        if let Err(pause_error) = admission.sync_pauses(&mut input, stopping) {
             runtime_failure(&first_failure, &shutdown, pause_error);
             stopping = true;
             dispatcher.take();
