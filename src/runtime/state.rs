@@ -98,6 +98,7 @@ struct PartitionAdmission {
 
 pub(super) struct Admission {
     pub total_records: usize,
+    global_limited: bool,
     all_paused: bool,
     partition_pause_dirty: bool,
     partitions: BTreeMap<i32, PartitionAdmission>,
@@ -108,6 +109,7 @@ impl Admission {
     pub fn new(partitions: &[i32], max_inflight_per_partition: usize) -> Self {
         Self {
             total_records: 0,
+            global_limited: false,
             all_paused: false,
             partition_pause_dirty: false,
             partitions: partitions
@@ -171,7 +173,23 @@ impl Admission {
         Ok(())
     }
 
+    pub fn update_global_limit(&mut self, shared: &SharedAdmission, pending: bool) -> bool {
+        let records = shared.records.load(Ordering::Relaxed);
+        let bytes = shared.bytes.load(Ordering::Relaxed);
+        self.global_limited = if self.global_limited {
+            pending
+                || records >= low_water(shared.limits.max_inflight_records)
+                || bytes >= low_water(shared.limits.max_inflight_bytes)
+        } else {
+            pending
+                || records >= shared.limits.max_inflight_records
+                || bytes >= shared.limits.max_inflight_bytes
+        };
+        self.global_limited
+    }
+
     pub fn sync_pauses(&mut self, input: &mut KafkaInput, pause_all: bool) -> Result<(), String> {
+        let pause_all = pause_all || self.global_limited;
         if pause_all == self.all_paused && !self.partition_pause_dirty {
             return Ok(());
         }
@@ -391,6 +409,30 @@ mod tests {
                 .sum::<usize>()
         });
         assert_eq!(admitted, 50);
+    }
+
+    #[test]
+    fn shared_capacity_resumes_only_below_low_water() {
+        let shared = SharedAdmission::new(
+            RuntimeLimits {
+                max_inflight_records: 4,
+                max_inflight_bytes: 100,
+                max_inflight_per_partition: 4,
+            },
+            None,
+        );
+        let mut admission = Admission::new(&[0], 4);
+
+        for _ in 0..4 {
+            assert!(shared.try_reserve(1));
+        }
+        assert!(admission.update_global_limit(&shared, false));
+
+        shared.release(1, 1).unwrap();
+        assert!(admission.update_global_limit(&shared, false));
+
+        shared.release(1, 1).unwrap();
+        assert!(!admission.update_global_limit(&shared, false));
     }
 
     #[test]
