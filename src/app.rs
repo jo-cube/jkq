@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_backpressure_drains_oversized_records_one_at_a_time() {
+    fn byte_backpressure_waits_for_capacity_one_record_at_a_time() {
         let fixture = Fixture::new("oversized-backpressure", 1);
         for value in [br#"{"value":0}"#, br#"{"value":1}"#, br#"{"value":2}"#] {
             fixture.produce(0, Some(value), None, 0, None);

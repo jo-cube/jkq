@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
-use crate::{cli::RuntimeLimits, kafka::KafkaInput};
+use crate::cli::RuntimeLimits;
 
 use super::Completion;
 
@@ -92,15 +92,10 @@ impl SharedAdmission {
 struct PartitionAdmission {
     next_sequence: u64,
     in_flight: usize,
-    limited: bool,
-    applied_paused: bool,
 }
 
 pub(super) struct Admission {
     pub total_records: usize,
-    global_limited: bool,
-    all_paused: bool,
-    partition_pause_dirty: bool,
     partitions: BTreeMap<i32, PartitionAdmission>,
     max_inflight_per_partition: usize,
 }
@@ -109,9 +104,6 @@ impl Admission {
     pub fn new(partitions: &[i32], max_inflight_per_partition: usize) -> Self {
         Self {
             total_records: 0,
-            global_limited: false,
-            all_paused: false,
-            partition_pause_dirty: false,
             partitions: partitions
                 .iter()
                 .map(|partition| {
@@ -120,8 +112,6 @@ impl Admission {
                         PartitionAdmission {
                             next_sequence: 0,
                             in_flight: 0,
-                            limited: false,
-                            applied_paused: false,
                         },
                     )
                 })
@@ -150,8 +140,6 @@ impl Admission {
             .checked_add(1)
             .ok_or_else(|| format!("partition {partition} sequence overflow"))?;
         state.in_flight += 1;
-        self.partition_pause_dirty |=
-            update_partition_limit(state, self.max_inflight_per_partition);
         self.total_records += 1;
         Ok(sequence)
     }
@@ -167,57 +155,9 @@ impl Admission {
             ));
         }
         state.in_flight -= 1;
-        self.partition_pause_dirty |=
-            update_partition_limit(state, self.max_inflight_per_partition);
         self.total_records -= 1;
         Ok(())
     }
-
-    pub fn update_global_limit(&mut self, shared: &SharedAdmission, pending: bool) -> bool {
-        let records = shared.records.load(Ordering::Relaxed);
-        let bytes = shared.bytes.load(Ordering::Relaxed);
-        self.global_limited = if self.global_limited {
-            pending
-                || records >= low_water(shared.limits.max_inflight_records)
-                || bytes >= low_water(shared.limits.max_inflight_bytes)
-        } else {
-            pending
-                || records >= shared.limits.max_inflight_records
-                || bytes >= shared.limits.max_inflight_bytes
-        };
-        self.global_limited
-    }
-
-    pub fn sync_pauses(&mut self, input: &mut KafkaInput, pause_all: bool) -> Result<(), String> {
-        let pause_all = pause_all || self.global_limited;
-        if pause_all == self.all_paused && !self.partition_pause_dirty {
-            return Ok(());
-        }
-        for (partition, state) in &mut self.partitions {
-            let pause = pause_all || state.limited;
-            if pause != state.applied_paused {
-                input.set_paused(*partition, pause)?;
-                state.applied_paused = pause;
-            }
-        }
-        self.all_paused = pause_all;
-        self.partition_pause_dirty = false;
-        Ok(())
-    }
-}
-
-fn low_water(limit: usize) -> usize {
-    limit.saturating_mul(3).div_ceil(4)
-}
-
-fn update_partition_limit(state: &mut PartitionAdmission, limit: usize) -> bool {
-    let previous = state.limited;
-    state.limited = if state.limited {
-        state.in_flight >= low_water(limit)
-    } else {
-        state.in_flight >= limit
-    };
-    state.limited != previous
 }
 
 struct PartitionOrder {
@@ -412,41 +352,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_capacity_resumes_only_below_low_water() {
-        let shared = SharedAdmission::new(
-            RuntimeLimits {
-                max_inflight_records: 4,
-                max_inflight_bytes: 100,
-                max_inflight_per_partition: 4,
-            },
-            None,
-        );
-        let mut admission = Admission::new(&[0], 4);
-
-        for _ in 0..4 {
-            assert!(shared.try_reserve(1));
-        }
-        assert!(admission.update_global_limit(&shared, false));
-
-        shared.release(1, 1).unwrap();
-        assert!(admission.update_global_limit(&shared, false));
-
-        shared.release(1, 1).unwrap();
-        assert!(!admission.update_global_limit(&shared, false));
-    }
-
-    #[test]
-    fn partition_release_is_exactly_once_and_low_water_is_hysteretic() {
+    fn partition_release_is_exactly_once() {
         let mut admission = Admission::new(&[0], 4);
         for _ in 0..4 {
             admission.reserve(0).unwrap();
         }
-        assert!(admission.partitions[&0].limited);
-        for expected_limited in [true, false] {
-            admission.release(0).unwrap();
-            assert_eq!(admission.partitions[&0].limited, expected_limited);
-        }
-        for _ in 0..2 {
+        for _ in 0..4 {
             admission.release(0).unwrap();
         }
         assert!(admission.release(0).is_err());
