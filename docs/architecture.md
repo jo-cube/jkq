@@ -59,10 +59,10 @@ A startup failure cannot produce partial record output. `--check` exits after
 local plan validation and does not create a consumer.
 
 The Kafka adapter calls `assign`, never `subscribe`. Automatic commits and
-offset storage are disabled. Each consumer is owned by one poller thread,
-including its pause and resume calls. Automatic partition discovery is a
-startup snapshot; partitions added later are not assigned to the running
-process.
+offset storage are disabled. Each consumer is owned by one poller thread.
+Partitions are paused only after reaching a permanent end or count boundary.
+Automatic partition discovery is a startup snapshot; partitions added later
+are not assigned to the running process.
 
 ## Record Ownership
 
@@ -159,9 +159,9 @@ the worker or projection and labels them with `payloadEncoding: "json"`.
 ## Backpressure and Memory Accounting
 
 Shared atomic admission tracks global records and source bytes across all
-consumers. Each poller separately tracks its partition sequences, per-partition
-records, and pause state. The byte charge covers owned bytes copied from the
-source record:
+consumers. Each poller separately tracks its partition sequences and
+per-partition records. The byte charge covers owned bytes copied from the source
+record:
 
 - payload;
 - key, when required;
@@ -169,21 +169,22 @@ source record:
 
 The charge intentionally excludes the parsed value tree, evaluation
 intermediates, projected output, and compact pass output for a JSON-value
-envelope. Those allocations depend on the input and expressions. Bounded
-channels, `--max-inflight-records`, `--max-inflight-per-partition`, and the
-owned source-byte admission budget bound queued source work. Batches do not
-admit records ahead of those limits.
+envelope. It also excludes librdkafka's internal prefetch queue, which follows
+librdkafka's own configuration. Those allocations depend on the input,
+expressions, and Kafka client settings. Bounded channels,
+`--max-inflight-records`, `--max-inflight-per-partition`, and the owned
+source-byte admission budget bound queued source work. Batches do not admit
+records ahead of those limits.
 
 Charges are released only after ordered write or drop. Slow output therefore
 propagates pressure back to Kafka, and the reorder buffer cannot hold more
 records than admission permits.
 
-When shared capacity is reached, pollers pause their assigned partitions and
-resume only after shared record and byte occupancy fall below a 75% low-water
-threshold. A poller that already fetched a record holds that one record until
-it can reserve capacity. Per-partition record pressure pauses only that
-partition and uses the same low-water threshold. Every poller continues
-serving its Kafka events while paused.
+When a poller cannot reserve shared or per-partition capacity, it stops polling
+its consumer and waits for completions to release capacity. A record already
+returned by Kafka is held until it can be admitted. This can temporarily delay
+other partitions assigned to the same consumer, but does not affect ordering or
+memory bounds.
 
 Because a source record's size is known only after polling, at most one owned
 record per consumer may wait outside admitted accounting. A source record

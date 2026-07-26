@@ -31,7 +31,6 @@ pub struct OwnedRecord {
 struct PartitionState {
     end_exclusive: Option<i64>,
     done: bool,
-    paused: bool,
 }
 
 pub enum PollEvent {
@@ -178,14 +177,13 @@ impl KafkaInput {
                     PartitionState {
                         end_exclusive,
                         done,
-                        paused: false,
                     },
                 )
             })
             .collect::<BTreeMap<_, _>>();
         let remaining_partitions = partitions.values().filter(|state| !state.done).count();
 
-        let mut input = Self {
+        let input = Self {
             consumer,
             topic: config.topic.clone(),
             partitions,
@@ -201,7 +199,7 @@ impl KafkaInput {
             .filter_map(|(partition, state)| state.done.then_some(*partition))
             .collect::<Vec<_>>();
         for partition in initially_done {
-            input.set_paused(partition, true)?;
+            input.pause(partition)?;
         }
         Ok(input)
     }
@@ -212,19 +210,6 @@ impl KafkaInput {
 
     pub fn poll(&mut self) -> Result<PollEvent, String> {
         self.poll_with_timeout(POLL_TIMEOUT)
-    }
-
-    pub fn poll_nonblocking(&mut self) -> Result<PollEvent, String> {
-        self.poll_with_timeout(Duration::ZERO)
-    }
-
-    pub fn all_active_partitions_paused(&self) -> bool {
-        self.remaining_partitions > 0
-            && self
-                .partitions
-                .values()
-                .filter(|state| !state.done)
-                .all(|state| state.paused)
     }
 
     fn poll_with_timeout(&mut self, timeout: Duration) -> Result<PollEvent, String> {
@@ -328,42 +313,32 @@ impl KafkaInput {
     }
 
     pub(crate) fn finish(&mut self, partition: i32) -> Result<(), String> {
-        if let Some(state) = self.partitions.get_mut(&partition) {
-            if !state.done {
-                self.remaining_partitions -= 1;
-            }
-            state.done = true;
-        }
-        self.set_paused(partition, true)
-    }
-
-    pub fn set_paused(&mut self, partition: i32, paused: bool) -> Result<(), String> {
         let Some(state) = self.partitions.get_mut(&partition) else {
             return Err(format!(
-                "cannot control unassigned topic {} partition {partition}",
+                "cannot finish unassigned topic {} partition {partition}",
                 self.topic
             ));
         };
-        let paused = paused || state.done;
-        if state.paused == paused {
+        if state.done {
             return Ok(());
+        }
+        self.remaining_partitions -= 1;
+        state.done = true;
+        self.pause(partition)
+    }
+
+    fn pause(&self, partition: i32) -> Result<(), String> {
+        if !self.partitions.contains_key(&partition) {
+            return Err(format!(
+                "cannot pause unassigned topic {} partition {partition}",
+                self.topic
+            ));
         }
         let mut partitions = TopicPartitionList::new();
         partitions.add_partition(&self.topic, partition);
-        if paused {
-            self.consumer.pause(&partitions).map_err(|error| {
-                format!("cannot pause {} partition {partition}: {error}", self.topic)
-            })?;
-        } else {
-            self.consumer.resume(&partitions).map_err(|error| {
-                format!(
-                    "cannot resume {} partition {partition}: {error}",
-                    self.topic
-                )
-            })?;
-        }
-        state.paused = paused;
-        Ok(())
+        self.consumer
+            .pause(&partitions)
+            .map_err(|error| format!("cannot pause {} partition {partition}: {error}", self.topic))
     }
 }
 

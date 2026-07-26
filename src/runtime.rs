@@ -563,8 +563,7 @@ fn poll_loop(
         if shared_admission.count_reached() {
             stopping = true;
         }
-        let global_limited = admission.update_global_limit(&shared_admission, pending.is_some());
-        if (stopping || global_limited)
+        if stopping
             && let Some(dispatcher) = dispatcher.as_mut()
             && let Err(error) = dispatcher.flush()
         {
@@ -579,12 +578,6 @@ fn poll_loop(
             pending = None;
             dispatcher.take();
         }
-        if let Err(pause_error) = admission.sync_pauses(&mut input, stopping) {
-            runtime_failure(&first_failure, &shutdown, pause_error);
-            stopping = true;
-            dispatcher.take();
-        }
-        let all_paused = input.all_active_partitions_paused();
         report_periodic(config, &stats, started, &mut next_stats, &periodic_stats);
 
         if stopping {
@@ -599,11 +592,7 @@ fn poll_loop(
                         runtime_failure(&first_failure, &shutdown, release_error);
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    if let Err(poll_error) = input.poll() {
-                        runtime_failure(&first_failure, &shutdown, poll_error);
-                    }
-                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     runtime_failure(
                         &first_failure,
@@ -649,9 +638,6 @@ fn poll_loop(
             if pending.is_none() {
                 continue;
             }
-        }
-
-        if all_paused {
             if let Some(dispatcher) = dispatcher.as_mut()
                 && let Err(error) = dispatcher.flush()
             {
@@ -671,20 +657,7 @@ fn poll_loop(
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    match input.poll_nonblocking() {
-                        Ok(PollEvent::Record(_)) => {
-                            runtime_failure(
-                                &first_failure,
-                                &shutdown,
-                                "Kafka returned a record while all partitions were paused for backpressure"
-                                    .to_owned(),
-                            );
-                        }
-                        Ok(PollEvent::Done | PollEvent::Idle) => {}
-                        Err(poll_error) => {
-                            runtime_failure(&first_failure, &shutdown, poll_error);
-                        }
-                    }
+                    continue;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     runtime_failure(
@@ -692,6 +665,7 @@ fn poll_loop(
                         &shutdown,
                         "completion release channel closed early".to_owned(),
                     );
+                    break;
                 }
             }
             continue;
