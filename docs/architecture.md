@@ -178,11 +178,12 @@ Charges are released only after ordered write or drop. Slow output therefore
 propagates pressure back to Kafka, and the reorder buffer cannot hold more
 records than admission permits.
 
-When a poller cannot reserve shared capacity, it holds that one record and
-pauses its assigned partitions until capacity becomes available. Per-partition
-record pressure pauses only that partition and resumes at a 75% low-water
-threshold to avoid thrashing. Every poller continues serving its Kafka events
-while paused.
+When shared capacity is reached, pollers pause their assigned partitions and
+resume only after shared record and byte occupancy fall below a 75% low-water
+threshold. A poller that already fetched a record holds that one record until
+it can reserve capacity. Per-partition record pressure pauses only that
+partition and uses the same low-water threshold. Every poller continues
+serving its Kafka events while paused.
 
 Because a source record's size is known only after polling, at most one owned
 record per consumer may wait outside admitted accounting. A source record
