@@ -185,20 +185,13 @@ Update the owning document when observable behavior or an architectural
 invariant changes. Prefer examples and current facts over roadmaps, historical
 rationale, or exhaustive checklists.
 
-## Optional Graphify Workflow
+## Optional CodeGraph Workflow
 
-`graphify-out/` is generated and git-ignored. When Graphify is installed, build
-the local code graph with:
-
-```sh
-graphify .
-```
-
-Query it before broad source browsing and refresh it after code or
-documentation changes:
+`.codegraph/` is generated and git-ignored. When it exists, query it before
+broad source browsing:
 
 ```sh
-graphify update .
+codegraph explore "Where is partition admission implemented?"
 ```
 
-Fresh clones do not contain the generated graph.
+Indexing is a local developer choice; fresh clones do not contain the graph.

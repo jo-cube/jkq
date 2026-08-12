@@ -39,6 +39,7 @@ pub enum PipelineError {
 }
 
 enum RecordedFailure {
+    Startup(String),
     Runtime(String),
     Output(io::ErrorKind, String),
 }
@@ -53,7 +54,7 @@ impl RecordedFailure {
 
     fn into_error(self) -> PipelineError {
         match self {
-            Self::Runtime(message) => PipelineError::Runtime(message),
+            Self::Startup(message) | Self::Runtime(message) => PipelineError::Runtime(message),
             Self::Output(kind, message) => PipelineError::Output(io::Error::new(kind, message)),
         }
     }
@@ -80,34 +81,32 @@ pub struct SignalControl {
 
 impl SignalControl {
     pub fn install() -> Result<Self, String> {
-        let armed = Arc::new(AtomicBool::new(false));
-        let received = Arc::new(AtomicUsize::new(0));
-        let mut registrations = Vec::new();
+        let mut control = Self {
+            armed: Arc::new(AtomicBool::new(false)),
+            received: Arc::new(AtomicUsize::new(0)),
+            registrations: Vec::new(),
+        };
         for (signal, status) in [(SIGINT, 130), (SIGTERM, 143)] {
-            registrations.push(
-                flag::register_conditional_shutdown(signal, status, Arc::clone(&armed))
+            control.registrations.push(
+                flag::register_conditional_shutdown(signal, status, Arc::clone(&control.armed))
                     .map_err(|error| format!("cannot install signal handler: {error}"))?,
             );
         }
         for signal in [SIGINT, SIGTERM] {
-            registrations.push(
+            control.registrations.push(
                 flag::register_usize(
                     signal,
-                    Arc::clone(&received),
+                    Arc::clone(&control.received),
                     usize::try_from(signal).expect("termination signals are positive"),
                 )
                 .map_err(|error| format!("cannot install signal handler: {error}"))?,
             );
-            registrations.push(
-                flag::register(signal, Arc::clone(&armed))
+            control.registrations.push(
+                flag::register(signal, Arc::clone(&control.armed))
                     .map_err(|error| format!("cannot install signal handler: {error}"))?,
             );
         }
-        Ok(Self {
-            armed,
-            received,
-            registrations,
-        })
+        Ok(control)
     }
 
     pub fn parts(&self) -> (Arc<AtomicBool>, Arc<AtomicUsize>) {
@@ -405,6 +404,8 @@ pub fn run_pipeline(
             let poller_signal = Arc::clone(&received_signal);
             let poller_stats = Arc::clone(&stats);
             let poller_failure = Arc::clone(&first_failure);
+            let panic_shutdown = Arc::clone(&poller_shutdown);
+            let panic_failure = Arc::clone(&poller_failure);
             let poller_admission = Arc::clone(&shared_admission);
             let poller_periodic_stats = Arc::clone(&periodic_stats);
             let dispatcher = if transforms_json {
@@ -419,19 +420,22 @@ pub fn run_pipeline(
             match thread::Builder::new()
                 .name(format!("jkq-kafka-poll-{consumer}"))
                 .spawn_scoped(scope, move || {
-                    poll_loop(
-                        config,
-                        input,
-                        dispatcher,
-                        release_rx,
-                        poller_admission,
-                        poller_periodic_stats,
-                        poller_shutdown,
-                        poller_signal,
-                        poller_stats,
-                        started,
-                        poller_failure,
-                    )
+                    guard_thread(&panic_shutdown, &panic_failure, "Kafka poll thread", || {
+                        poll_loop(
+                            config,
+                            input,
+                            dispatcher,
+                            release_rx,
+                            poller_admission,
+                            poller_periodic_stats,
+                            poller_shutdown,
+                            poller_signal,
+                            poller_stats,
+                            started,
+                            poller_failure,
+                        )
+                    })
+                    .flatten()
                 }) {
                 Ok(poller) => pollers.push(poller),
                 Err(error) => {
@@ -453,8 +457,8 @@ pub fn run_pipeline(
                 match thread::Builder::new()
                     .name(format!("jkq-worker-{index}"))
                     .spawn_scoped(scope, move || {
-                        guard_worker(worker_shutdown, worker_failure, || {
-                            worker_loop(config, receiver, sender, worker_stats);
+                        guard_thread(&worker_shutdown, &worker_failure, "compute worker", || {
+                            worker_loop(config, receiver, sender, worker_stats)
                         });
                     }) {
                     Ok(worker) => workers.push(worker),
@@ -755,18 +759,26 @@ fn thread_start_failure(
     role: &str,
     error: io::Error,
 ) {
-    runtime_failure(first, shutdown, format!("cannot start {role}: {error}"));
+    let _ = first.set(RecordedFailure::Startup(format!(
+        "cannot start {role}: {error}"
+    )));
+    shutdown.store(true, Ordering::SeqCst);
 }
 
-fn guard_worker(
-    shutdown: Arc<AtomicBool>,
-    first: Arc<OnceLock<RecordedFailure>>,
-    worker: impl FnOnce(),
-) {
-    if catch_unwind(AssertUnwindSafe(worker)).is_err() {
-        let error = PipelineError::Runtime("compute worker panicked".to_owned());
-        record_failure(&first, &error);
-        shutdown.store(true, Ordering::SeqCst);
+fn guard_thread<T>(
+    shutdown: &AtomicBool,
+    first: &OnceLock<RecordedFailure>,
+    role: &str,
+    task: impl FnOnce() -> T,
+) -> Option<T> {
+    match catch_unwind(AssertUnwindSafe(task)) {
+        Ok(result) => Some(result),
+        Err(_) => {
+            let error = PipelineError::Runtime(format!("{role} panicked"));
+            record_failure(first, &error);
+            shutdown.store(true, Ordering::SeqCst);
+            None
+        }
     }
 }
 
@@ -899,7 +911,10 @@ fn writer_loop(
 ) -> Result<(), PipelineError> {
     let mut orderer = Orderer::default();
     let mut ready = Vec::new();
-    let mut failure = None;
+    let mut failure = match first_failure.get() {
+        Some(RecordedFailure::Startup(message)) => Some(PipelineError::Runtime(message.clone())),
+        _ => None,
+    };
     let ordered = !config.unordered && config.transform.capabilities.parses_json;
     for completion_batch in completion_rx {
         let Batch { consumer, items } = completion_batch;
@@ -1126,8 +1141,8 @@ mod tests {
         );
 
         assert!(shutdown.load(Ordering::SeqCst));
-        let Some(RecordedFailure::Runtime(message)) = first.get() else {
-            panic!("expected a runtime failure");
+        let Some(RecordedFailure::Startup(message)) = first.get() else {
+            panic!("expected a startup failure");
         };
         assert_eq!(
             message,
@@ -1256,6 +1271,48 @@ mod tests {
             br#""action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":8}
 "#
         ));
+    }
+
+    #[test]
+    fn writer_suppresses_output_after_a_startup_failure() {
+        let config = config(&["-f", "%s"]);
+        let (completion_tx, completion_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        completion_tx
+            .send(Batch {
+                consumer: 0,
+                items: vec![completion(0, 0, 1, pass(b"data"))],
+            })
+            .unwrap();
+        drop(completion_tx);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let first_failure = Arc::new(OnceLock::new());
+        thread_start_failure(
+            &first_failure,
+            &shutdown,
+            "Kafka poll thread",
+            io::Error::other("resource limit"),
+        );
+        let mut output = Vec::new();
+        let error = writer_loop(
+            &config,
+            &mut output,
+            completion_rx,
+            vec![release_tx],
+            shutdown,
+            Arc::new(Stats::default()),
+            first_failure,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Runtime(ref message)
+                if message == "cannot start Kafka poll thread: resource limit"
+        ));
+        assert!(output.is_empty());
+        assert_eq!(release_rx.iter().flatten().count(), 1);
     }
 
     #[test]
@@ -1415,22 +1472,25 @@ mod tests {
     }
 
     #[test]
-    fn worker_panic_records_the_first_failure_and_starts_shutdown() {
+    fn thread_panic_records_the_first_failure_and_starts_shutdown() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let first = Arc::new(OnceLock::new());
-        guard_worker(Arc::clone(&shutdown), Arc::clone(&first), || {
-            panic!("worker failure")
-        });
+        assert!(
+            guard_thread(&shutdown, &first, "Kafka poll thread", || panic!(
+                "poller failure"
+            ))
+            .is_none()
+        );
         assert!(shutdown.load(Ordering::SeqCst));
         assert!(matches!(
             first.get(),
-            Some(RecordedFailure::Runtime(message)) if message == "compute worker panicked"
+            Some(RecordedFailure::Runtime(message)) if message == "Kafka poll thread panicked"
         ));
 
         record_failure(&first, &PipelineError::Runtime("later failure".to_owned()));
         assert!(matches!(
             first.get(),
-            Some(RecordedFailure::Runtime(message)) if message == "compute worker panicked"
+            Some(RecordedFailure::Runtime(message)) if message == "Kafka poll thread panicked"
         ));
     }
 }
