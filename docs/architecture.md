@@ -205,12 +205,12 @@ limit; already admitted records still cross the normal completion frontier.
 The first fatal error wins. It triggers shared cancellation, closes the work
 path, and drains retained work. The ordered writer emits preceding in-order
 records, emits nothing after the first fatal result, and releases accounting
-for every completion. Worker and writer panics become pipeline failures rather
-than leaving another stage blocked.
+for every completion. Poller, worker, and writer panics become pipeline
+failures rather than leaving another stage blocked.
 
 The first termination signal stops admission and drains. signal-hook arms the
-second signal for immediate process exit, which also handles a worker or
-stdout that cannot make progress.
+second signal for immediate process exit, which also handles a poller, worker,
+or stdout that cannot make progress.
 
 ## Invariants
 
