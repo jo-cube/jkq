@@ -165,6 +165,37 @@ Payload lengths distinguish values that look identical through `%s`:
 `%L` is independent of the emitted action: projecting or tombstoning a
 non-tombstone input still reports the original payload length.
 
+### Payload formatting
+
+`--payload-format <format>` builds a new payload from each emitted
+non-tombstone action before `-f` writes the record. It accepts the same
+placeholders and escapes as `-f`:
+
+```sh
+jkq -b localhost:9092 -t events -p 0 --snapshot \
+  --payload-format '{"partition":%p,"offset":%o,"payload":%s}' \
+  -f '%k\t%S\t%s\n' \
+  | pbl apply events --format kcat
+```
+
+Inside `--payload-format`, `%s`, `%S`, and `%R` refer to the payload selected by
+the action: exact source bytes for pass or compact JSON for project. The
+resulting bytes become the post-transform payload seen by `-f`, so the outer
+`%S` and `%R` include selected metadata and literals as well as the action
+payload. An empty payload format produces a non-tombstone payload of length
+zero. `%L` always reports the source payload length.
+
+Dropped records still produce no output. Source and generated tombstones
+bypass `--payload-format`, so final `%S` remains `-1` and `%R` remains signed
+big-endian `-1`. The action reported by `%a` does not change. This preserves
+delete streams such as `-f '%k\t%S\t%s\n'` while allowing selected metadata
+to be placed in non-tombstone payloads.
+
+`--payload-format` cannot be combined with `-J`. Use the JSON envelope when the
+complete binary-safe metadata schema is required. Raw `%k` and `%h` output is
+not JSON escaped, so do not place them in JSON literals unless their bytes are
+known to be safe.
+
 ### JSON envelopes
 
 `-J, --json-envelope` writes one compact, newline-terminated JSON object per
@@ -383,6 +414,10 @@ set size when increasing `--jobs`.
 When predicates choose between pass and tombstone, omit `--project` unless the
 payload must change. Passing preserves the exact source payload and avoids
 projection serialization.
+
+When only selected metadata must be included in the payload, use
+[`--payload-format`](#payload-formatting) instead of a complete JSON envelope.
+The final format can then frame the exact generated payload length.
 
 The example format above is compact and stream-decodable: `%K\t` writes a
 decimal key length followed by a tab, `%k` writes that many key bytes, and

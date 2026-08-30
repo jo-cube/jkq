@@ -46,7 +46,8 @@ Before polling, `jkq`:
    validates the strict JSON `$vars` object;
 3. stores only expression source and variable JSON in the shared transform
    plan;
-4. compiles the output format and its metadata requirements;
+4. compiles the optional payload format and final output format, combining
+   their metadata requirements;
 5. creates a consumer and discovers all topic partitions when none were
    selected;
 6. fetches watermarks only for ranges that need them, resolves partition
@@ -67,8 +68,8 @@ are not assigned to the running process.
 ## Record Ownership
 
 librdkafka messages are borrowed. The poller copies the payload and only the
-source metadata required by the compiled output plan, then releases the
-borrowed message. It never mutates librdkafka-owned memory.
+source metadata required by either compiled format, then releases the borrowed
+message. It never mutates librdkafka-owned memory.
 
 Each admitted input gets a dense local partition sequence. Kafka offsets remain
 source metadata; the local sequence drives completion ordering even when
@@ -148,11 +149,14 @@ writer drains the contiguous range. This preserves source order within each
 partition but imposes no order across partitions. `--unordered` writes
 completion arrival order instead.
 
-One writer owns stdout. Formats and JSON envelopes stream directly to its
-buffer, avoiding byte interleaving and an additional record-sized staging
-buffer. `%s`, `%S`, `%R`, envelopes, and action names operate on the
-post-transform action; `%L` reports the source payload length. Broken pipe is
-normal pipeline termination.
+One writer owns stdout. By default, formats and JSON envelopes stream directly
+to its buffer, avoiding byte interleaving and an additional record-sized
+staging buffer. With `--payload-format`, the writer formats each non-tombstone
+action into one reused buffer before applying the final output format. Final
+`%s`, `%S`, and `%R` therefore operate on the exact generated payload without
+putting Kafka metadata into JSONata. Drops produce no bytes, tombstones bypass
+payload formatting, and `%L` continues to report the source payload length.
+Broken pipe is normal pipeline termination.
 For a JSON-value envelope, the writer inserts compact JSON bytes produced by
 the worker or projection and labels them with `payloadEncoding: "json"`.
 
@@ -168,10 +172,11 @@ record:
 - header names and header values, when required.
 
 The charge intentionally excludes the parsed value tree, evaluation
-intermediates, projected output, and compact pass output for a JSON-value
-envelope. It also excludes librdkafka's internal prefetch queue, which follows
-librdkafka's own configuration. Those allocations depend on the input,
-expressions, and Kafka client settings. Bounded channels,
+intermediates, projected output, the writer-local payload-format buffer, and
+compact pass output for a JSON-value envelope. It also excludes librdkafka's
+internal prefetch queue, which follows librdkafka's own configuration. Those
+allocations depend on the input, formats, expressions, and Kafka client
+settings. Bounded channels,
 `--max-inflight-records`, `--max-inflight-per-partition`, and the owned
 source-byte admission budget bound queued source work. Batches do not admit
 records ahead of those limits.
@@ -225,13 +230,16 @@ or stdout that cannot make progress.
 - Existing tombstones bypass JSON and JSONata and remain tombstones unless
   `--drop-tombstones` is set.
 - Pass-through preserves exact source payload bytes unless the user explicitly
-  requests a JSON-value envelope.
+  requests a JSON-value envelope or payload format.
+- Payload formatting applies only to emitted non-tombstone actions and does not
+  change their action name.
 - Ordering is per partition, never global.
 - Count limits apply to admitted input, not emitted output.
 - Per-partition count limits apply independently to each assigned partition.
 - Tombstones, empty payloads, and JSON `null` remain distinct.
 - Channels, admitted record counts, per-partition records, and owned source
-  bytes are bounded; JSONata intermediates, projected output, and compact
-  JSON-value envelope output are not covered by the byte budget.
+  bytes are bounded; JSONata intermediates, projected output, payload-formatted
+  output, and compact JSON-value envelope output are not covered by the byte
+  budget.
 - stdout is record data; diagnostics and statistics use stderr.
 - Errors follow explicit policy and are never silently successful.

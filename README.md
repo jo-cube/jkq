@@ -124,6 +124,18 @@ instead of a JSON string.
 The default output is `%s\n`. Use `%R%s` or another explicit frame when
 payloads may contain newlines or arbitrary bytes.
 
+Use `--payload-format` when selected source metadata must become part of the
+payload before final framing:
+
+```sh
+jkq -b localhost:9092 -t events -p 0 --snapshot \
+  --payload-format '{"partition":%p,"offset":%o,"payload":%s}' \
+  -f '%k\t%S\t%s\n'
+```
+
+The final `%S` measures the complete formatted payload. Tombstones bypass
+payload formatting and retain length `-1`.
+
 ## Documentation
 
 - [Usage](docs/usage.md): offsets, transforms, output, errors, and runtime
