@@ -8,6 +8,7 @@ use jsonata_core::{
 };
 
 use super::TransformPlan;
+use super::tape::{TapeAction, TapePlan};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidJsonPolicy {
@@ -86,24 +87,37 @@ pub(crate) struct Worker {
     tombstones: Vec<AstNode>,
     projection: Option<AstNode>,
     variables: Option<JValue>,
+    tape: Option<TapePlan>,
 }
 
 impl Worker {
     pub fn new(plan: &TransformPlan, embeds_json: bool) -> Self {
+        let drops: Vec<_> = plan.drops.iter().map(|source| parsed(source)).collect();
+        let tombstones: Vec<_> = plan
+            .tombstones
+            .iter()
+            .map(|source| parsed(source))
+            .collect();
+        let projection = plan.projection.as_deref().map(parsed);
+        let variables = plan.variables.as_deref().map(|source| {
+            JValue::from_json_str(source).expect("startup validated JSONata variables")
+        });
+        let tape = TapePlan::new(
+            &drops,
+            &tombstones,
+            projection.as_ref(),
+            variables.as_ref(),
+            embeds_json,
+        );
         Self {
             parses_json: plan.capabilities.parses_json,
             embeds_json,
             drop_tombstones: plan.drop_tombstones,
-            drops: plan.drops.iter().map(|source| parsed(source)).collect(),
-            tombstones: plan
-                .tombstones
-                .iter()
-                .map(|source| parsed(source))
-                .collect(),
-            projection: plan.projection.as_deref().map(parsed),
-            variables: plan.variables.as_deref().map(|source| {
-                JValue::from_json_str(source).expect("startup validated JSONata variables")
-            }),
+            drops,
+            tombstones,
+            projection,
+            variables,
+            tape,
         }
     }
 
@@ -125,6 +139,25 @@ impl Worker {
             });
         }
 
+        if let Some(action) = self.tape.as_ref().and_then(|tape| tape.execute(&payload)) {
+            return Ok(Execution {
+                action: match action {
+                    TapeAction::Drop => Action::Drop,
+                    TapeAction::Tombstone => self.tombstone_action(),
+                    TapeAction::Pass => Action::PassThrough(PassPayload::Exact(payload)),
+                },
+                issue: None,
+            });
+        }
+
+        self.execute_jsonata(payload, policies)
+    }
+
+    fn execute_jsonata(
+        &self,
+        payload: Vec<u8>,
+        policies: ErrorPolicies,
+    ) -> Result<Execution, TransformError> {
         let source = match str::from_utf8(&payload) {
             Ok(source) => source,
             Err(error) => {
@@ -466,11 +499,25 @@ mod tests {
             run(&transform, Some(br#"{"deleted":false,"id":1}"#)).unwrap(),
             Action::Project(b"1".to_vec())
         );
+
+        let transform = build_plan(&[], &["deleted".to_owned()], true, None, None, false).unwrap();
+        assert_eq!(
+            run(&transform, Some(br#"{"deleted":true}"#)).unwrap(),
+            Action::Drop
+        );
     }
 
     #[test]
     fn invalid_json_policies_preserve_exact_pass_bytes() {
         let transform = plan(&[], &[], None, None, true);
+        let worker = Worker::new(&transform, false);
+        assert_eq!(
+            worker
+                .tape
+                .as_ref()
+                .and_then(|tape| tape.execute(br#"{"valid":true}"#)),
+            Some(TapeAction::Pass)
+        );
         let invalid = b"{ not json \xff".to_vec();
         for (policy, expected) in [
             (InvalidJsonPolicy::Drop, Action::Drop),
@@ -628,6 +675,89 @@ mod tests {
         assert_eq!(
             run(&transform, Some(br#"{"value":9007199254740993}"#)).unwrap(),
             Action::Project(b"9007199254740992".to_vec())
+        );
+    }
+
+    #[test]
+    fn tape_predicates_match_jsonata_scalar_semantics() {
+        for (expression, variables, input, expected) in [
+            (
+                r#"kind = "ignore""#,
+                None,
+                br#"{"kind":"ignore"}"#.as_slice(),
+                TapeAction::Drop,
+            ),
+            (
+                r#"kind = "ignore""#,
+                None,
+                br#"{"kind":"keep"}"#.as_slice(),
+                TapeAction::Pass,
+            ),
+            (
+                "10 <= metrics.score",
+                None,
+                br#"{"metrics":{"score":10}}"#.as_slice(),
+                TapeAction::Drop,
+            ),
+            (
+                "tenant != $vars.tenant",
+                Some(r#"{"tenant":"acme"}"#),
+                br#"{"tenant":"other"}"#.as_slice(),
+                TapeAction::Drop,
+            ),
+            (
+                r#"(kind = "event" and active) or force = true"#,
+                None,
+                br#"{"kind":"event","active":true}"#.as_slice(),
+                TapeAction::Drop,
+            ),
+            (
+                r#"status = "keep""#,
+                None,
+                br#"{"status":"drop","status":"keep"}"#.as_slice(),
+                TapeAction::Drop,
+            ),
+            (
+                "value = 9007199254740992",
+                None,
+                br#"{"value":9007199254740993}"#.as_slice(),
+                TapeAction::Drop,
+            ),
+            (
+                "missing != null",
+                None,
+                br#"{}"#.as_slice(),
+                TapeAction::Drop,
+            ),
+        ] {
+            let transform = plan(&[expression], &[], None, variables, false);
+            let worker = Worker::new(&transform, false);
+            assert_eq!(
+                worker.tape.as_ref().and_then(|tape| tape.execute(input)),
+                Some(expected),
+                "{expression}"
+            );
+            assert_eq!(
+                worker.execute_report(Some(input.to_vec()), FAIL),
+                worker.execute_jsonata(input.to_vec(), FAIL),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn tape_path_falls_back_when_jsonata_sequence_semantics_are_needed() {
+        let transform = plan(&["items.active = true"], &[], None, None, false);
+        let worker = Worker::new(&transform, false);
+        let input = br#"{"items":[{"active":true},{"active":false}]}"#;
+
+        assert_eq!(
+            worker.tape.as_ref().and_then(|tape| tape.execute(input)),
+            None
+        );
+        assert_eq!(
+            worker.execute_report(Some(input.to_vec()), FAIL),
+            worker.execute_jsonata(input.to_vec(), FAIL)
         );
     }
 

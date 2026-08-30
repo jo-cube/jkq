@@ -456,6 +456,7 @@ dependencies = [
  "jsonata-core",
  "rdkafka",
  "signal-hook",
+ "simd-json",
 ]
 
 [[package]]
