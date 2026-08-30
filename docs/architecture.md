@@ -28,14 +28,16 @@ src/app.rs                 process IO, signals, pipeline assembly
 src/kafka.rs               assignment, offsets, polling, owned records
 src/transform/mod.rs       startup expression source plan and validation
 src/transform/jsonata.rs   worker-local expression execution and actions
+src/transform/tape.rs      conservative scalar-predicate fast path
 src/runtime.rs             poller, workers, writer, shutdown, statistics
 src/runtime/state.rs       admission and completion-frontier state
 src/output.rs              compiled formats and JSON envelopes
 tests/process.rs           Unix process and signal behavior
 ```
 
-The transform modules call jsonata-core directly through its public parser,
-evaluator, context, and value APIs.
+The transform modules use jsonata-core's public parser, evaluator, context, and
+value APIs. They use simd-json's public tape API for the scalar-predicate fast
+path.
 
 ## Startup
 
@@ -105,14 +107,27 @@ JSON, all safe to share across worker threads. Each worker parses its own
 JSONata ASTs and `$vars` value because jsonata-core values use `Rc` and are not
 `Send` or `Sync`.
 
-For a non-tombstone input, the worker validates UTF-8 and parses the payload
-once with `JValue::from_json_str`. The same worker-local document is used for
-all drop predicates, tombstone predicates, and the optional projection.
-Original payload bytes remain untouched for an eventual pass action or the
-invalid-JSON `pass` policy. With `--envelope-payload value`, a surviving pass
-instead serializes the existing parsed document once, retains the source byte
-length for envelope metadata, and releases the source buffer. The writer never
-parses payload JSON.
+When a plan has no projection or JSON-value envelope and every action predicate
+uses supported scalar operations, the worker evaluates it directly on a
+validated simd-json tape. The supported subset is Boolean literals, plain input
+paths, scalar literals and scalar `$vars` paths, comparisons, and `and`/`or`.
+Parser scratch and tape allocation are reused by that worker. Because simd-json
+unescapes strings in place, parsing uses a worker-local copy and leaves source
+bytes untouched for an eventual pass action.
+
+The tape evaluator declines expressions or record shapes that need full
+JSONata semantics, including functions, path filters, projections, container
+comparisons, and array-mapped paths. The worker then uses the normal
+jsonata-core path. A tape parse failure also falls back, preserving
+jsonata-core's accepted input and error handling. Fast-path selection never
+changes expression results or policies.
+
+The normal path validates UTF-8 and parses the payload once with
+`JValue::from_json_str`. The same worker-local document is used for all drop
+predicates, tombstone predicates, and the optional projection. With
+`--envelope-payload value`, a surviving pass serializes that document once,
+retains the source byte length for envelope metadata, and releases the source
+buffer. The writer never parses payload JSON.
 
 jsonata-core's `Evaluator` retains its first parent/root value. jkq therefore
 does not reuse evaluators: it creates a fresh `Context` and `Evaluator` for
@@ -177,12 +192,12 @@ record:
 - key, when required;
 - header names and header values, when required.
 
-The charge intentionally excludes the parsed value tree, evaluation
-intermediates, projected output, the writer-local payload-format buffer, and
-compact pass output for a JSON-value envelope. It also excludes librdkafka's
-internal prefetch queue, which follows librdkafka's own configuration. Those
-allocations depend on the input, formats, expressions, and Kafka client
-settings. Bounded channels,
+The charge intentionally excludes worker-local parser scratch and tape, the
+parsed value tree, evaluation intermediates, projected output, the writer-local
+payload-format buffer, and compact pass output for a JSON-value envelope. It
+also excludes librdkafka's internal prefetch queue, which follows librdkafka's
+own configuration. Those allocations depend on the input, formats,
+expressions, and Kafka client settings. Bounded channels,
 `--max-inflight-records`, `--max-inflight-per-partition`, and the owned
 source-byte admission budget bound queued source work. Batches do not admit
 records ahead of those limits.

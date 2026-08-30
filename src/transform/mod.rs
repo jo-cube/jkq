@@ -1,6 +1,7 @@
 use jsonata_core::{parser, value::JValue};
 
 pub mod jsonata;
+mod tape;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanCapabilities {

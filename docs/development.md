@@ -150,13 +150,15 @@ The direct runtime dependencies are deliberately limited to:
 
 - `rdkafka`
 - `jsonata-core`
+- `simd-json`
 - `clap`
 - `crossbeam-channel`
 - `signal-hook`
 
-`jsonata-core` is the sole expression engine and is used through its public
-`parser`, `evaluator`, and `value` APIs. Its default `simd` feature brings
-`simd-json` transitively; jkq does not depend on simd-json directly. Do not use
+`jsonata-core` is the sole expression language implementation and is used
+through its public `parser`, `evaluator`, and `value` APIs. jkq also depends on
+the same pinned simd-json version through its public tape API to avoid building
+a `JValue` tree for supported scalar-only action plans. Do not use
 jsonata-core's `_bench` module or other internal APIs.
 
 Before adding another dependency, confirm that the standard library or an
