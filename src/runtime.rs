@@ -138,6 +138,63 @@ pub struct Stats {
     output_bytes: AtomicU64,
 }
 
+#[derive(Clone, Copy, Default)]
+struct StatsSnapshot {
+    admitted: u64,
+    input_tombstones: u64,
+    input_bytes: u64,
+    dropped: u64,
+    generated_tombstones: u64,
+    passed: u64,
+    projected: u64,
+    invalid_json: u64,
+    evaluation_failures: u64,
+    output_records: u64,
+    output_bytes: u64,
+}
+
+impl StatsSnapshot {
+    fn since(self, previous: Self) -> Self {
+        Self {
+            admitted: self.admitted.saturating_sub(previous.admitted),
+            input_tombstones: self
+                .input_tombstones
+                .saturating_sub(previous.input_tombstones),
+            input_bytes: self.input_bytes.saturating_sub(previous.input_bytes),
+            dropped: self.dropped.saturating_sub(previous.dropped),
+            generated_tombstones: self
+                .generated_tombstones
+                .saturating_sub(previous.generated_tombstones),
+            passed: self.passed.saturating_sub(previous.passed),
+            projected: self.projected.saturating_sub(previous.projected),
+            invalid_json: self.invalid_json.saturating_sub(previous.invalid_json),
+            evaluation_failures: self
+                .evaluation_failures
+                .saturating_sub(previous.evaluation_failures),
+            output_records: self.output_records.saturating_sub(previous.output_records),
+            output_bytes: self.output_bytes.saturating_sub(previous.output_bytes),
+        }
+    }
+
+    fn report(self, elapsed: Duration) -> String {
+        format!(
+            "admitted={} input_tombstones={} input_bytes={} dropped={} generated_tombstones={} passed={} projected={} invalid_json={} evaluation_failures={} output_records={} output_bytes={} elapsed_ms={}",
+            self.admitted,
+            self.input_tombstones,
+            self.input_bytes,
+            self.dropped,
+            self.generated_tombstones,
+            self.passed,
+            self.projected,
+            self.invalid_json,
+            self.evaluation_failures,
+            self.output_records,
+            self.output_bytes,
+            elapsed.as_millis(),
+        )
+    }
+}
+
 impl Stats {
     pub fn new(enabled: bool) -> Self {
         Self {
@@ -147,21 +204,23 @@ impl Stats {
     }
 
     pub fn report(&self, elapsed: Duration) -> String {
-        format!(
-            "admitted={} input_tombstones={} input_bytes={} dropped={} generated_tombstones={} passed={} projected={} invalid_json={} evaluation_failures={} output_records={} output_bytes={} elapsed_ms={}",
-            self.admitted.load(Ordering::Relaxed),
-            self.input_tombstones.load(Ordering::Relaxed),
-            self.input_bytes.load(Ordering::Relaxed),
-            self.dropped.load(Ordering::Relaxed),
-            self.generated_tombstones.load(Ordering::Relaxed),
-            self.passed.load(Ordering::Relaxed),
-            self.projected.load(Ordering::Relaxed),
-            self.invalid_json.load(Ordering::Relaxed),
-            self.evaluation_failures.load(Ordering::Relaxed),
-            self.output_records.load(Ordering::Relaxed),
-            self.output_bytes.load(Ordering::Relaxed),
-            elapsed.as_millis(),
-        )
+        self.snapshot().report(elapsed)
+    }
+
+    fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            admitted: self.admitted.load(Ordering::Relaxed),
+            input_tombstones: self.input_tombstones.load(Ordering::Relaxed),
+            input_bytes: self.input_bytes.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            generated_tombstones: self.generated_tombstones.load(Ordering::Relaxed),
+            passed: self.passed.load(Ordering::Relaxed),
+            projected: self.projected.load(Ordering::Relaxed),
+            invalid_json: self.invalid_json.load(Ordering::Relaxed),
+            evaluation_failures: self.evaluation_failures.load(Ordering::Relaxed),
+            output_records: self.output_records.load(Ordering::Relaxed),
+            output_bytes: self.output_bytes.load(Ordering::Relaxed),
+        }
     }
 
     fn admit(&self, record: &OwnedRecord) {
@@ -394,10 +453,31 @@ pub fn run_pipeline(
     let started = Instant::now();
     let first_failure = Arc::new(OnceLock::new());
     let shared_admission = Arc::new(SharedAdmission::new(config.limits, config.count_limit));
-    let periodic_stats = Arc::new(AtomicU64::new(0));
     let transforms_json = config.transform.capabilities.parses_json;
 
     let signal = thread::scope(|scope| {
+        let (stats_stop_tx, stats_reporter) = if let Some(interval) = config.stats_interval {
+            let (stop_tx, stop_rx) = bounded::<()>(1);
+            let reporter_stats = Arc::clone(&stats);
+            match thread::Builder::new()
+                .name("jkq-stats".to_owned())
+                .spawn_scoped(scope, move || {
+                    report_periodically(&reporter_stats, interval, started, stop_rx)
+                }) {
+                Ok(reporter) => (Some(stop_tx), Some(reporter)),
+                Err(error) => {
+                    thread_start_failure(
+                        &first_failure,
+                        &shutdown,
+                        "statistics reporter thread",
+                        error,
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
         let mut pollers = Vec::with_capacity(inputs.len());
         for (consumer, (input, release_rx)) in inputs.into_iter().zip(release_rxs).enumerate() {
             let poller_shutdown = Arc::clone(&shutdown);
@@ -407,7 +487,6 @@ pub fn run_pipeline(
             let panic_shutdown = Arc::clone(&poller_shutdown);
             let panic_failure = Arc::clone(&poller_failure);
             let poller_admission = Arc::clone(&shared_admission);
-            let poller_periodic_stats = Arc::clone(&periodic_stats);
             let dispatcher = if transforms_json {
                 Dispatcher::transform(consumer, work_tx.clone())
             } else {
@@ -427,11 +506,9 @@ pub fn run_pipeline(
                             dispatcher,
                             release_rx,
                             poller_admission,
-                            poller_periodic_stats,
                             poller_shutdown,
                             poller_signal,
                             poller_stats,
-                            started,
                             poller_failure,
                         )
                     })
@@ -512,6 +589,14 @@ pub fn run_pipeline(
                 }
             }
         }
+        drop(stats_stop_tx);
+        if let Some(reporter) = stats_reporter
+            && reporter.join().is_err()
+        {
+            let error = PipelineError::Runtime("statistics reporter thread panicked".to_owned());
+            record_failure(&first_failure, &error);
+            shutdown.store(true, Ordering::SeqCst);
+        }
         signal
     });
 
@@ -533,11 +618,9 @@ fn poll_loop(
     dispatcher: Dispatcher,
     release_rx: Receiver<Vec<Release>>,
     shared_admission: Arc<SharedAdmission>,
-    periodic_stats: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     received_signal: Arc<AtomicUsize>,
     stats: Arc<Stats>,
-    started: Instant,
     first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> Option<i32> {
     let partitions = input.assigned_partitions();
@@ -545,7 +628,6 @@ fn poll_loop(
     let mut dispatcher = Some(dispatcher);
     let mut pending: Option<OwnedRecord> = None;
     let mut stopping = false;
-    let mut next_stats = config.stats_interval;
 
     'polling: loop {
         loop {
@@ -582,8 +664,6 @@ fn poll_loop(
             pending = None;
             dispatcher.take();
         }
-        report_periodic(config, &stats, started, &mut next_stats, &periodic_stats);
-
         if stopping {
             if admission.total_records == 0 {
                 break;
@@ -782,27 +862,23 @@ fn guard_thread<T>(
     }
 }
 
-fn report_periodic(
-    config: &RuntimeConfig,
-    stats: &Stats,
-    started: Instant,
-    next: &mut Option<Duration>,
-    reported: &AtomicU64,
-) {
-    let Some(deadline) = *next else {
-        return;
-    };
-    let elapsed = started.elapsed();
-    if elapsed < deadline {
-        return;
-    }
-    let interval = config
-        .stats_interval
-        .expect("periodic statistics deadline requires an interval");
-    *next = elapsed.checked_add(interval);
-    let period = u64::try_from(elapsed.as_millis() / interval.as_millis()).unwrap_or(u64::MAX);
-    if period > 0 && reported.fetch_max(period, Ordering::Relaxed) < period {
-        eprintln!("jkq: stats {}", stats.report(elapsed));
+fn report_periodically(stats: &Stats, interval: Duration, started: Instant, stop: Receiver<()>) {
+    let mut previous = StatsSnapshot::default();
+    let mut previous_elapsed = Duration::ZERO;
+    while matches!(
+        stop.recv_timeout(interval),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+    ) {
+        let elapsed = started.elapsed();
+        let current = stats.snapshot();
+        eprintln!(
+            "jkq: stats window {}",
+            current
+                .since(previous)
+                .report(elapsed.saturating_sub(previous_elapsed))
+        );
+        previous = current;
+        previous_elapsed = elapsed;
     }
 }
 
@@ -915,6 +991,7 @@ fn writer_loop(
         Some(RecordedFailure::Startup(message)) => Some(PipelineError::Runtime(message.clone())),
         _ => None,
     };
+    let mut payload_buffer = Vec::new();
     let ordered = !config.unordered && config.transform.capabilities.parses_json;
     for completion_batch in completion_rx {
         let Batch { consumer, items } = completion_batch;
@@ -948,9 +1025,14 @@ fn writer_loop(
                             );
                         }
                         CompletionOutcome::Action(ref action) => {
-                            if let Err(error) =
-                                write_action(config, writer, &completion.source, action, &stats)
-                            {
+                            if let Err(error) = write_action(
+                                config,
+                                writer,
+                                &completion.source,
+                                action,
+                                &mut payload_buffer,
+                                &stats,
+                            ) {
                                 writer_failure(
                                     &mut failure,
                                     &first_failure,
@@ -1027,6 +1109,7 @@ fn write_action(
     writer: &mut impl Write,
     source: &SourceRecord,
     action: &Action,
+    payload_buffer: &mut Vec<u8>,
     stats: &Stats,
 ) -> io::Result<()> {
     let embeds_json = config.output.embeds_json();
@@ -1065,7 +1148,7 @@ fn write_action(
         ),
         Action::Project(bytes) => (Payload::Bytes(bytes), EmittedAction::Project),
     };
-    let output_record = OutputRecord {
+    let mut output_record = OutputRecord {
         topic: &config.topic,
         partition: source.partition,
         offset: source.offset,
@@ -1077,7 +1160,19 @@ fn write_action(
         action: emitted_action,
     };
     let output_bytes = match &config.output {
-        OutputPlan::Format(format) => format.write_to(&output_record, writer)?,
+        OutputPlan::Format {
+            payload_format,
+            format,
+        } => {
+            if let Some(payload_format) = payload_format
+                && !matches!(output_record.payload, Payload::Tombstone)
+            {
+                payload_buffer.clear();
+                payload_format.write_to(&output_record, payload_buffer)?;
+                output_record.payload = Payload::Bytes(payload_buffer);
+            }
+            format.write_to(&output_record, writer)?
+        }
         OutputPlan::Envelope(_) => output::write_envelope(&output_record, writer)?,
     };
     if config.unbuffered {
@@ -1240,6 +1335,36 @@ mod tests {
     }
 
     #[test]
+    fn statistics_snapshot_reports_only_the_latest_window() {
+        let stats = Stats::new(true);
+        stats.emitted(10);
+        let previous = stats.snapshot();
+        stats.transformed(&Action::Drop, None, false);
+        stats.emitted(7);
+
+        let report = stats
+            .snapshot()
+            .since(previous)
+            .report(Duration::from_millis(25));
+        assert!(report.contains("dropped=1 "));
+        assert!(report.contains("output_records=1 output_bytes=7 elapsed_ms=25"));
+    }
+
+    #[test]
+    fn periodic_statistics_accept_the_largest_cli_duration() {
+        let config = config(&["--stats-interval", "18446744073709551615ms"]);
+        let (stop, stop_rx) = bounded::<()>(1);
+        drop(stop);
+
+        report_periodically(
+            &Stats::default(),
+            config.stats_interval.unwrap(),
+            Instant::now(),
+            stop_rx,
+        );
+    }
+
+    #[test]
     fn json_value_envelope_embeds_projected_payload() {
         let config = config(&[
             "-J",
@@ -1263,6 +1388,7 @@ mod tests {
             &mut output,
             &source,
             &Action::Project(br#"{"id":1}"#.to_vec()),
+            &mut Vec::new(),
             &Stats::default(),
         )
         .unwrap();
@@ -1271,6 +1397,50 @@ mod tests {
             br#""action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":8}
 "#
         ));
+    }
+
+    #[test]
+    fn payload_format_updates_final_length_and_preserves_tombstones() {
+        let config = config(&[
+            "--payload-format",
+            r#"{"partition":%p,"offset":%o,"payload":%s}"#,
+            "-f",
+            "%k\\t%S\\t%s\\n",
+        ]);
+        let source = SourceRecord {
+            partition: 3,
+            offset: 42,
+            timestamp: None,
+            key: Some(b"id".to_vec()),
+            headers: Vec::new(),
+            payload_length: Some(8),
+        };
+        let mut output = Vec::new();
+        let mut payload_buffer = Vec::new();
+
+        write_action(
+            &config,
+            &mut output,
+            &source,
+            &Action::Project(br#"{"id":1}"#.to_vec()),
+            &mut payload_buffer,
+            &Stats::default(),
+        )
+        .unwrap();
+        write_action(
+            &config,
+            &mut output,
+            &source,
+            &Action::Tombstone,
+            &mut payload_buffer,
+            &Stats::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            b"id\t46\t{\"partition\":3,\"offset\":42,\"payload\":{\"id\":1}}\nid\t-1\t\n"
+        );
     }
 
     #[test]
@@ -1437,38 +1607,6 @@ mod tests {
 
         assert_eq!(output, b"1\n0\n");
         assert_eq!(release_rx.iter().flatten().count(), 2);
-    }
-
-    #[test]
-    fn periodic_statistics_accept_the_largest_cli_duration() {
-        let config = config(&["--stats-interval", "18446744073709551615ms"]);
-        let reported = AtomicU64::new(0);
-        let mut next = config.stats_interval;
-        report_periodic(
-            &config,
-            &Stats::default(),
-            Instant::now(),
-            &mut next,
-            &reported,
-        );
-        assert_eq!(reported.load(Ordering::Relaxed), 0);
-        assert_eq!(next, config.stats_interval);
-    }
-
-    #[test]
-    fn pollers_share_each_periodic_statistics_interval() {
-        let config = config(&["--stats-interval", "1s"]);
-        let reported = AtomicU64::new(0);
-        let started = Instant::now() - Duration::from_millis(1_500);
-        let mut first = config.stats_interval;
-        let mut second = config.stats_interval;
-
-        report_periodic(&config, &Stats::default(), started, &mut first, &reported);
-        report_periodic(&config, &Stats::default(), started, &mut second, &reported);
-
-        assert_eq!(reported.load(Ordering::Relaxed), 1);
-        assert!(first > config.stats_interval);
-        assert!(second > config.stats_interval);
     }
 
     #[test]

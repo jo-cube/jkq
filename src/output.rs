@@ -181,10 +181,8 @@ impl CompiledFormat {
                     }
                 }
                 _ => {
-                    let character = source[cursor..].chars().next().expect("valid UTF-8");
-                    let mut encoded = [0; 4];
-                    literal.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
-                    cursor += character.len_utf8();
+                    literal.push(bytes[cursor]);
+                    cursor += 1;
                 }
             }
         }
@@ -590,12 +588,13 @@ mod tests {
             ..record(Some(b"k"), Payload::Bytes(b"v"))
         };
         let format =
-            CompiledFormat::compile("%a\\t%t\\t%p\\t%o\\t%T\\t%K%k\\t%L:%S%s\\t%h%%\\x0a").unwrap();
+            CompiledFormat::compile("π:%a\\t%t\\t%p\\t%o\\t%T\\t%K%k\\t%L:%S%s\\t%h%%\\x0a")
+                .unwrap();
         let mut output = Vec::new();
         let written = format.write_to(&record, &mut output).unwrap();
         assert_eq!(
             output,
-            b"pass\tevents\t3\t42\t7\t1k\t9:1v\tnull=NULL,empty=,raw=x%\n"
+            "π:pass\tevents\t3\t42\t7\t1k\t9:1v\tnull=NULL,empty=,raw=x%\n".as_bytes()
         );
         assert_eq!(written, output.len());
     }

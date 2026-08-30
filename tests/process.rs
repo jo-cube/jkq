@@ -189,7 +189,11 @@ fn first_termination_signal_drains_and_uses_signal_exit_code() {
         "{}",
         String::from_utf8_lossy(&stderr)
     );
-    assert!(String::from_utf8_lossy(&stderr).contains("admitted=0"));
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("jkq: stats total admitted=0"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
 }
 
 #[test]

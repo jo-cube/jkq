@@ -128,6 +128,13 @@ reference.
 
 stdout contains record data only. Diagnostics and statistics go to stderr.
 
+Formatting follows one of two paths:
+
+```text
+Kafka record -> action -> [--payload-format] -> -f -> stdout
+Kafka record -> action -> -J                    -> stdout
+```
+
 The default format is `%s\n`. `-f, --format` accepts these placeholders:
 
 | Placeholder | Value |
@@ -145,6 +152,11 @@ The default format is `%s\n`. `-f, --format` accepts these placeholders:
 | `%h` | source headers |
 | `%a` | emitted action: `tombstone`, `pass`, or `project` |
 | `%%` | literal `%` |
+
+The `-f` placeholder vocabulary and default consumer behavior are a superset
+of kcat's: jkq supports every kcat placeholder above and adds `%L` and `%a`.
+This guarantee does not include kcat's `-Z` null rendering or its permissive
+numeric and unknown escape handling.
 
 Format literals support `\n`, `\r`, `\t`, `\\`, and `\xNN`. Unsupported or
 incomplete placeholders and escapes fail before consumption.
@@ -165,10 +177,42 @@ Payload lengths distinguish values that look identical through `%s`:
 `%L` is independent of the emitted action: projecting or tombstoning a
 non-tombstone input still reports the original payload length.
 
+### Payload formatting
+
+`--payload-format <format>` builds a new payload from each emitted
+non-tombstone action before `-f` writes the record. It accepts the same
+placeholders and escapes as `-f`:
+
+```sh
+jkq -b localhost:9092 -t events -p 0 --snapshot \
+  --payload-format '{"partition":%p,"offset":%o,"payload":%s}' \
+  -f '%k\t%S\t%s\n' \
+  | pbl apply events --format kcat
+```
+
+Inside `--payload-format`, `%s`, `%S`, and `%R` refer to the payload selected by
+the action: exact source bytes for pass or compact JSON for project. The
+resulting bytes become the post-transform payload seen by `-f`, so the outer
+`%S` and `%R` include selected metadata and literals as well as the action
+payload. An empty payload format produces a non-tombstone payload of length
+zero. `%L` always reports the source payload length.
+
+Dropped records still produce no output. Source and generated tombstones
+bypass `--payload-format`, so final `%S` remains `-1` and `%R` remains signed
+big-endian `-1`. The action reported by `%a` does not change. This preserves
+delete streams such as `-f '%k\t%S\t%s\n'` while allowing selected metadata
+to be placed in non-tombstone payloads.
+
+`--payload-format` cannot be combined with `-J`. Use the JSON envelope when the
+complete binary-safe metadata schema is required. Raw `%k` and `%h` output is
+not JSON escaped, so do not place them in JSON literals unless their bytes are
+known to be safe.
+
 ### JSON envelopes
 
 `-J, --json-envelope` writes one compact, newline-terminated JSON object per
-emitted record and cannot be combined with `-f`:
+emitted record and cannot be combined with `-f`. Its binary-safe schema is
+specific to jkq and is not schema-compatible with kcat's `-J`:
 
 ```json
 {"topic":"events","partition":0,"offset":42,"timestamp":null,"timestampType":null,"key":"key","keyEncoding":"utf8","keyLength":3,"headers":[],"action":"project","payload":"{\"id\":1}","payloadEncoding":"utf8","payloadLength":8}
@@ -384,6 +428,10 @@ When predicates choose between pass and tombstone, omit `--project` unless the
 payload must change. Passing preserves the exact source payload and avoids
 projection serialization.
 
+When only selected metadata must be included in the payload, use
+[`--payload-format`](#payload-formatting) instead of a complete JSON envelope.
+The final format can then frame the exact generated payload length.
+
 The example format above is compact and stream-decodable: `%K\t` writes a
 decimal key length followed by a tab, `%k` writes that many key bytes, and
 `%R%s` writes a signed four-byte payload length followed by the payload. A
@@ -454,10 +502,20 @@ used by the run.
 
 ## Statistics, Signals, and Exit Status
 
-`--stats` writes a final report to stderr. `--stats-interval` also writes
-periodic reports and accepts positive integer durations such as `500ms`, `5s`,
-and `1m`. `-q, --quiet` suppresses non-error diagnostics but not explicitly
+`--stats` writes a cumulative `jkq: stats total` report to stderr.
+`--stats-interval` also writes `jkq: stats window` reports containing only the
+activity since the previous report; it accepts positive integer durations such
+as `500ms`, `5s`, and `1m`. Supplying an interval implies the final cumulative
+report. `-q, --quiet` suppresses non-error diagnostics but not explicitly
 requested statistics.
+
+`admitted` is the total input-record count. `input_tombstones` and
+`input_bytes` describe those inputs; `dropped`, `generated_tombstones`,
+`passed`, and `projected` describe their actions. `invalid_json` and
+`evaluation_failures` count policy-handled as well as fatal transform issues.
+`output_records` and `output_bytes` count successful writes. `elapsed_ms` is
+the window length in a periodic report and the complete run time in the final
+report.
 
 The first `SIGINT` or `SIGTERM` stops admission, drains admitted records, and
 flushes stdout. A second termination signal exits immediately. A downstream

@@ -73,15 +73,29 @@ pub struct RawCli {
     /// Read the strict JSON object available as $vars from a file
     #[arg(long, value_name = "PATH", conflicts_with = "vars")]
     vars_file: Option<PathBuf>,
-    /// Kcat-style output format
-    #[arg(short = 'f', long, conflicts_with = "json_envelope")]
-    format: Option<String>,
-    /// Emit one JSON envelope per output record
+    /// Build each non-tombstone payload before final -f formatting
+    #[arg(long, value_name = "FORMAT", conflicts_with = "json_envelope")]
+    payload_format: Option<String>,
+    /// Format output with kcat-compatible placeholders
+    #[arg(
+        short = 'f',
+        long,
+        default_value = "%s\\n",
+        conflicts_with = "json_envelope"
+    )]
+    format: String,
+    /// Emit a binary-safe jkq JSON envelope instead of -f output
     #[arg(short = 'J', long, conflicts_with = "format")]
     json_envelope: bool,
-    /// Representation used for the envelope payload
-    #[arg(long, value_enum, requires = "json_envelope")]
-    envelope_payload: Option<EnvelopePayload>,
+    /// Payload representation for -J envelopes
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        default_value = "string",
+        requires = "json_envelope"
+    )]
+    envelope_payload: EnvelopePayload,
     /// Flush stdout after every output record
     #[arg(short = 'u', long)]
     unbuffered: bool,
@@ -155,7 +169,9 @@ pub enum KafkaErrorPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum EnvelopePayload {
+    /// Encode bytes as a UTF-8 or base64 string; does not force JSON parsing
     String,
+    /// Embed valid JSON; forces validation and compacts pass-through payloads
     Value,
 }
 
@@ -184,7 +200,10 @@ pub struct RuntimeLimits {
 
 #[derive(Debug)]
 pub enum OutputPlan {
-    Format(CompiledFormat),
+    Format {
+        payload_format: Option<CompiledFormat>,
+        format: CompiledFormat,
+    },
     Envelope(EnvelopePayload),
 }
 
@@ -216,7 +235,19 @@ pub struct RuntimeConfig {
 impl OutputPlan {
     pub fn requirements(&self) -> OutputRequirements {
         match self {
-            Self::Format(format) => format.requirements(),
+            Self::Format {
+                payload_format,
+                format,
+            } => {
+                let mut requirements = format.requirements();
+                if let Some(payload_format) = payload_format {
+                    let payload_requirements = payload_format.requirements();
+                    requirements.key |= payload_requirements.key;
+                    requirements.headers |= payload_requirements.headers;
+                    requirements.timestamp |= payload_requirements.timestamp;
+                }
+                requirements
+            }
             Self::Envelope(_) => OutputRequirements {
                 key: true,
                 headers: true,
@@ -281,7 +312,7 @@ impl RawCli {
             explicit_end
         };
 
-        let envelope_payload = self.envelope_payload.unwrap_or(EnvelopePayload::String);
+        let envelope_payload = self.envelope_payload;
         if envelope_payload == EnvelopePayload::Value
             && self.on_invalid_json == Some(RawInvalidJsonPolicy::Pass)
         {
@@ -322,10 +353,15 @@ impl RawCli {
         let output = if self.json_envelope {
             OutputPlan::Envelope(envelope_payload)
         } else {
-            OutputPlan::Format(
-                CompiledFormat::compile(self.format.as_deref().unwrap_or("%s\\n"))
-                    .map_err(|error| error.to_string())?,
-            )
+            OutputPlan::Format {
+                payload_format: self
+                    .payload_format
+                    .as_deref()
+                    .map(CompiledFormat::compile)
+                    .transpose()
+                    .map_err(|error| format!("invalid --payload-format: {error}"))?,
+                format: CompiledFormat::compile(&self.format).map_err(|error| error.to_string())?,
+            }
         };
 
         let mut kafka_properties = if let Some(path) = &self.config {
@@ -756,7 +792,19 @@ mod tests {
                 "--on-invalid-json",
                 "pass",
             ],
+            vec!["jkq", "-b", "x", "-t", "t", "-J", "--payload-format", "%s"],
             vec!["jkq", "-b", "x", "-t", "t", "-p", "0", "-f", "%z"],
+            vec![
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                "-p",
+                "0",
+                "--payload-format",
+                "%z",
+            ],
         ] {
             assert!(resolve(&arguments).is_err(), "{arguments:?}");
         }
@@ -869,6 +917,32 @@ mod tests {
             value.output,
             OutputPlan::Envelope(EnvelopePayload::Value)
         ));
+    }
+
+    #[test]
+    fn payload_format_adds_its_metadata_requirements_without_json_parsing() {
+        let config = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "--payload-format",
+            "%T:%h:%s",
+            "-f",
+            "%K:%k:%S:%s",
+        ])
+        .unwrap();
+
+        assert!(!config.transform.capabilities.parses_json);
+        assert_eq!(
+            config.output.requirements(),
+            OutputRequirements {
+                key: true,
+                headers: true,
+                timestamp: true,
+            }
+        );
     }
 
     #[test]
@@ -995,7 +1069,18 @@ mod tests {
     }
 
     #[test]
-    fn help_describes_assignment_and_runtime_limits() {
+    fn statistics_are_opt_in_and_an_interval_enables_the_final_report() {
+        let default = resolve(&["jkq", "-b", "x", "-t", "t"]).unwrap();
+        assert!(!default.stats);
+        assert_eq!(default.stats_interval, None);
+
+        let periodic = resolve(&["jkq", "-b", "x", "-t", "t", "--stats-interval", "5m"]).unwrap();
+        assert!(periodic.stats);
+        assert_eq!(periodic.stats_interval, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn help_describes_assignment_runtime_limits_and_output_modes() {
         let help = RawCli::command().render_long_help().to_string();
         assert!(help.contains("Partitions to consume; defaults to all topic partitions"));
         assert!(help.contains("Maximum admitted input records per partition"));
@@ -1006,6 +1091,13 @@ mod tests {
         assert!(help.contains("Drop source and predicate-generated tombstones before projection"));
         assert!(help.contains("Strict JSON object available as $vars"));
         assert!(help.contains("Read the strict JSON object available as $vars from a file"));
-        assert!(help.contains("Representation used for the envelope payload"));
+        assert!(help.contains("Build each non-tombstone payload before final -f formatting"));
+        assert!(help.contains("Format output with kcat-compatible placeholders"));
+        assert!(help.contains("[default: %s\\n]"));
+        assert!(help.contains("Emit a binary-safe jkq JSON envelope instead of -f output"));
+        assert!(help.contains("Payload representation for -J envelopes"));
+        assert!(help.contains("does not force JSON parsing"));
+        assert!(help.contains("forces validation and compacts pass-through payloads"));
+        assert!(help.contains("[default: string]"));
     }
 }
