@@ -5,6 +5,15 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, for example 0.7.0
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -12,23 +21,73 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy,rustfmt
-      - name: Verify release tag
-        if: startsWith(github.ref, 'refs/tags/')
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: Bump package version
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "branch" ]; then
+            echo "::error::run a release from a branch"
+            exit 1
+          fi
+          version="${RELEASE_VERSION#v}"
+          case "$version" in
+            ''|*[!0-9A-Za-z.+-]*)
+              echo "::error::invalid release version $RELEASE_VERSION"
+              exit 1
+              ;;
+          esac
+          if git rev-parse --quiet --verify "refs/tags/v$version" >/dev/null; then
+            echo "::error::tag v$version already exists"
+            exit 1
+          fi
+          sed -i "0,/^version = \".*\"$/s//version = \"$version\"/" Cargo.toml
+          cargo check
+      - name: Verify release version
+        id: release
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           package_id="$(cargo pkgid)"
           package_version="${package_id##*#}"
           package_version="${package_version##*@}"
-          if [ "$GITHUB_REF_NAME" != "v$package_version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match package version $package_version"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="v${RELEASE_VERSION#v}"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          if [ "$tag" != "v$package_version" ]; then
+            echo "::error::tag $tag does not match package version $package_version"
             exit 1
           fi
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - run: make check
+      - name: Commit and tag release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          version="${RELEASE_VERSION#v}"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): v$version"
+          fi
+          git tag "v$version"
+          git push --atomic origin "HEAD:$GITHUB_REF" "v$version"
 
   release:
     needs: test
@@ -50,6 +109,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.test.outputs.tag }}
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
@@ -78,9 +139,9 @@ jobs:
           fi
 
       - name: Upload release assets
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
+          tag_name: ${{ needs.test.outputs.tag }}
           files: |
             dist/jkq_${{ matrix.asset }}.tar.gz
             dist/jkq_${{ matrix.asset }}.tar.gz.sha256
