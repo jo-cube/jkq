@@ -57,21 +57,18 @@ CI runs the same checks.
 
 ## Release Packaging
 
-Before creating a release tag:
+Run the `Release` workflow from the GitHub Actions tab on the branch to release
+and enter the new version, without the `v` prefix. The workflow updates
+`Cargo.toml` and `Cargo.lock`, runs the complete repository checks, commits the
+version change, creates the matching `v<version>` tag, and builds that tag.
 
-1. update `[package].version` in `Cargo.toml`;
-2. regenerate `Cargo.lock` and verify the `jkq` package entry has the same
-   version;
-3. run the complete repository checks;
-4. commit the version change before creating the matching `v<version>` tag.
-
-A release tag must match the package version with a `v` prefix. Release jobs
-build native Linux amd64, Linux arm64, and macOS arm64 archives, execute each
-binary as a smoke test, and attach each archive and its SHA-256 checksum to the
-GitHub release. GNU binaries are built on Ubuntu 26.04; build locally when
-compatibility with an older glibc-based system is required. `scripts/install.sh`
-installs supported release binaries after verifying their published checksums.
-There is no crates.io publication.
+A directly pushed release tag remains supported and must match the package
+version with a `v` prefix. Release jobs build native Linux amd64, Linux arm64,
+and macOS arm64 archives, execute each binary as a smoke test, and attach each
+archive and its SHA-256 checksum to the GitHub release. GNU binaries are built
+on Ubuntu 26.04; build locally when compatibility with an older glibc-based
+system is required. `scripts/install.sh` installs supported release binaries
+after verifying their published checksums. There is no crates.io publication.
 
 ## Tests
 
