@@ -87,7 +87,7 @@ fn consume(
         Arc::clone(&stats),
     );
     if config.stats {
-        eprintln!("jkq: stats {}", stats.report(started.elapsed()));
+        eprintln!("jkq: stats total {}", stats.report(started.elapsed()));
     }
     match result.map_err(AppError::from)? {
         Some(signal) => Err(AppError::Interrupted(signal)),

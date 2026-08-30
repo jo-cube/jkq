@@ -1069,6 +1069,17 @@ mod tests {
     }
 
     #[test]
+    fn statistics_are_opt_in_and_an_interval_enables_the_final_report() {
+        let default = resolve(&["jkq", "-b", "x", "-t", "t"]).unwrap();
+        assert!(!default.stats);
+        assert_eq!(default.stats_interval, None);
+
+        let periodic = resolve(&["jkq", "-b", "x", "-t", "t", "--stats-interval", "5m"]).unwrap();
+        assert!(periodic.stats);
+        assert_eq!(periodic.stats_interval, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
     fn help_describes_assignment_runtime_limits_and_output_modes() {
         let help = RawCli::command().render_long_help().to_string();
         assert!(help.contains("Partitions to consume; defaults to all topic partitions"));
