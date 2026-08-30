@@ -128,6 +128,13 @@ reference.
 
 stdout contains record data only. Diagnostics and statistics go to stderr.
 
+Formatting follows one of two paths:
+
+```text
+Kafka record -> action -> [--payload-format] -> -f -> stdout
+Kafka record -> action -> -J                    -> stdout
+```
+
 The default format is `%s\n`. `-f, --format` accepts these placeholders:
 
 | Placeholder | Value |
@@ -145,6 +152,11 @@ The default format is `%s\n`. `-f, --format` accepts these placeholders:
 | `%h` | source headers |
 | `%a` | emitted action: `tombstone`, `pass`, or `project` |
 | `%%` | literal `%` |
+
+The `-f` placeholder vocabulary and default consumer behavior are a superset
+of kcat's: jkq supports every kcat placeholder above and adds `%L` and `%a`.
+This guarantee does not include kcat's `-Z` null rendering or its permissive
+numeric and unknown escape handling.
 
 Format literals support `\n`, `\r`, `\t`, `\\`, and `\xNN`. Unsupported or
 incomplete placeholders and escapes fail before consumption.
@@ -199,7 +211,8 @@ known to be safe.
 ### JSON envelopes
 
 `-J, --json-envelope` writes one compact, newline-terminated JSON object per
-emitted record and cannot be combined with `-f`:
+emitted record and cannot be combined with `-f`. Its binary-safe schema is
+specific to jkq and is not schema-compatible with kcat's `-J`:
 
 ```json
 {"topic":"events","partition":0,"offset":42,"timestamp":null,"timestampType":null,"key":"key","keyEncoding":"utf8","keyLength":3,"headers":[],"action":"project","payload":"{\"id\":1}","payloadEncoding":"utf8","payloadLength":8}
