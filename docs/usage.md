@@ -502,10 +502,20 @@ used by the run.
 
 ## Statistics, Signals, and Exit Status
 
-`--stats` writes a final report to stderr. `--stats-interval` also writes
-periodic reports and accepts positive integer durations such as `500ms`, `5s`,
-and `1m`. `-q, --quiet` suppresses non-error diagnostics but not explicitly
+`--stats` writes a cumulative `jkq: stats total` report to stderr.
+`--stats-interval` also writes `jkq: stats window` reports containing only the
+activity since the previous report; it accepts positive integer durations such
+as `500ms`, `5s`, and `1m`. Supplying an interval implies the final cumulative
+report. `-q, --quiet` suppresses non-error diagnostics but not explicitly
 requested statistics.
+
+`admitted` is the total input-record count. `input_tombstones` and
+`input_bytes` describe those inputs; `dropped`, `generated_tombstones`,
+`passed`, and `projected` describe their actions. `invalid_json` and
+`evaluation_failures` count policy-handled as well as fatal transform issues.
+`output_records` and `output_bytes` count successful writes. `elapsed_ms` is
+the window length in a periodic report and the complete run time in the final
+report.
 
 The first `SIGINT` or `SIGTERM` stops admission, drains admitted records, and
 flushes stdout. A second termination signal exits immediately. A downstream

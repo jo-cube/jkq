@@ -160,6 +160,12 @@ Broken pipe is normal pipeline termination.
 For a JSON-value envelope, the writer inserts compact JSON bytes produced by
 the worker or projection and labels them with `payloadEncoding: "json"`.
 
+Statistics are disabled by default. Disabled counter updates return before any
+atomic operation. When `--stats-interval` is set, one reporter thread samples
+relaxed atomic counters and writes per-window differences to stderr; Kafka
+pollers and the output writer do no timer or reporting work. The final report
+uses the cumulative counters.
+
 ## Backpressure and Memory Accounting
 
 Shared atomic admission tracks global records and source bytes across all
