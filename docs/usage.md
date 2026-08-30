@@ -428,6 +428,12 @@ When predicates choose between pass and tombstone, omit `--project` unless the
 payload must change. Passing preserves the exact source payload and avoids
 projection serialization.
 
+Plans without a projection or JSON-value envelope can avoid materializing a
+JSONata value tree when every predicate uses plain scalar paths, comparisons,
+Boolean literals, and `and`/`or`. Other expressions and record shapes fall back
+automatically with the same semantics. Treat this as an optimization, not a
+reason to make an equivalent predicate harder to understand.
+
 When only selected metadata must be included in the payload, use
 [`--payload-format`](#payload-formatting) instead of a complete JSON envelope.
 The final format can then frame the exact generated payload length.
