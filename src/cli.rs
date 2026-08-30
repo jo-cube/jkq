@@ -67,24 +67,35 @@ pub struct RawCli {
     /// Project each surviving record with this JSONata expression
     #[arg(long)]
     project: Option<String>,
-    /// Format each non-tombstone payload before final output formatting
-    #[arg(long, value_name = "FORMAT", conflicts_with = "json_envelope")]
-    payload_format: Option<String>,
     /// Strict JSON object available as $vars
     #[arg(long, value_name = "OBJECT")]
     vars: Option<String>,
     /// Read the strict JSON object available as $vars from a file
     #[arg(long, value_name = "PATH", conflicts_with = "vars")]
     vars_file: Option<PathBuf>,
-    /// Kcat-style output format
-    #[arg(short = 'f', long, conflicts_with = "json_envelope")]
-    format: Option<String>,
-    /// Emit one JSON envelope per output record
+    /// Build each non-tombstone payload before final -f formatting
+    #[arg(long, value_name = "FORMAT", conflicts_with = "json_envelope")]
+    payload_format: Option<String>,
+    /// Format output with kcat-compatible placeholders
+    #[arg(
+        short = 'f',
+        long,
+        default_value = "%s\\n",
+        conflicts_with = "json_envelope"
+    )]
+    format: String,
+    /// Emit a binary-safe jkq JSON envelope instead of -f output
     #[arg(short = 'J', long, conflicts_with = "format")]
     json_envelope: bool,
-    /// Representation used for the envelope payload
-    #[arg(long, value_enum, requires = "json_envelope")]
-    envelope_payload: Option<EnvelopePayload>,
+    /// Payload representation for -J envelopes
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        default_value = "string",
+        requires = "json_envelope"
+    )]
+    envelope_payload: EnvelopePayload,
     /// Flush stdout after every output record
     #[arg(short = 'u', long)]
     unbuffered: bool,
@@ -158,7 +169,9 @@ pub enum KafkaErrorPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum EnvelopePayload {
+    /// Encode bytes as a UTF-8 or base64 string; does not force JSON parsing
     String,
+    /// Embed valid JSON; forces validation and compacts pass-through payloads
     Value,
 }
 
@@ -299,7 +312,7 @@ impl RawCli {
             explicit_end
         };
 
-        let envelope_payload = self.envelope_payload.unwrap_or(EnvelopePayload::String);
+        let envelope_payload = self.envelope_payload;
         if envelope_payload == EnvelopePayload::Value
             && self.on_invalid_json == Some(RawInvalidJsonPolicy::Pass)
         {
@@ -347,8 +360,7 @@ impl RawCli {
                     .map(CompiledFormat::compile)
                     .transpose()
                     .map_err(|error| format!("invalid --payload-format: {error}"))?,
-                format: CompiledFormat::compile(self.format.as_deref().unwrap_or("%s\\n"))
-                    .map_err(|error| error.to_string())?,
+                format: CompiledFormat::compile(&self.format).map_err(|error| error.to_string())?,
             }
         };
 
@@ -1057,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn help_describes_assignment_and_runtime_limits() {
+    fn help_describes_assignment_runtime_limits_and_output_modes() {
         let help = RawCli::command().render_long_help().to_string();
         assert!(help.contains("Partitions to consume; defaults to all topic partitions"));
         assert!(help.contains("Maximum admitted input records per partition"));
@@ -1068,6 +1080,13 @@ mod tests {
         assert!(help.contains("Drop source and predicate-generated tombstones before projection"));
         assert!(help.contains("Strict JSON object available as $vars"));
         assert!(help.contains("Read the strict JSON object available as $vars from a file"));
-        assert!(help.contains("Representation used for the envelope payload"));
+        assert!(help.contains("Build each non-tombstone payload before final -f formatting"));
+        assert!(help.contains("Format output with kcat-compatible placeholders"));
+        assert!(help.contains("[default: %s\\n]"));
+        assert!(help.contains("Emit a binary-safe jkq JSON envelope instead of -f output"));
+        assert!(help.contains("Payload representation for -J envelopes"));
+        assert!(help.contains("does not force JSON parsing"));
+        assert!(help.contains("forces validation and compacts pass-through payloads"));
+        assert!(help.contains("[default: string]"));
     }
 }
