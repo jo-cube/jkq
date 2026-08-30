@@ -67,6 +67,9 @@ pub struct RawCli {
     /// Project each surviving record with this JSONata expression
     #[arg(long)]
     project: Option<String>,
+    /// Format each non-tombstone payload before final output formatting
+    #[arg(long, value_name = "FORMAT", conflicts_with = "json_envelope")]
+    payload_format: Option<String>,
     /// Strict JSON object available as $vars
     #[arg(long, value_name = "OBJECT")]
     vars: Option<String>,
@@ -184,7 +187,10 @@ pub struct RuntimeLimits {
 
 #[derive(Debug)]
 pub enum OutputPlan {
-    Format(CompiledFormat),
+    Format {
+        payload_format: Option<CompiledFormat>,
+        format: CompiledFormat,
+    },
     Envelope(EnvelopePayload),
 }
 
@@ -216,7 +222,19 @@ pub struct RuntimeConfig {
 impl OutputPlan {
     pub fn requirements(&self) -> OutputRequirements {
         match self {
-            Self::Format(format) => format.requirements(),
+            Self::Format {
+                payload_format,
+                format,
+            } => {
+                let mut requirements = format.requirements();
+                if let Some(payload_format) = payload_format {
+                    let payload_requirements = payload_format.requirements();
+                    requirements.key |= payload_requirements.key;
+                    requirements.headers |= payload_requirements.headers;
+                    requirements.timestamp |= payload_requirements.timestamp;
+                }
+                requirements
+            }
             Self::Envelope(_) => OutputRequirements {
                 key: true,
                 headers: true,
@@ -322,10 +340,16 @@ impl RawCli {
         let output = if self.json_envelope {
             OutputPlan::Envelope(envelope_payload)
         } else {
-            OutputPlan::Format(
-                CompiledFormat::compile(self.format.as_deref().unwrap_or("%s\\n"))
+            OutputPlan::Format {
+                payload_format: self
+                    .payload_format
+                    .as_deref()
+                    .map(CompiledFormat::compile)
+                    .transpose()
+                    .map_err(|error| format!("invalid --payload-format: {error}"))?,
+                format: CompiledFormat::compile(self.format.as_deref().unwrap_or("%s\\n"))
                     .map_err(|error| error.to_string())?,
-            )
+            }
         };
 
         let mut kafka_properties = if let Some(path) = &self.config {
@@ -756,7 +780,19 @@ mod tests {
                 "--on-invalid-json",
                 "pass",
             ],
+            vec!["jkq", "-b", "x", "-t", "t", "-J", "--payload-format", "%s"],
             vec!["jkq", "-b", "x", "-t", "t", "-p", "0", "-f", "%z"],
+            vec![
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                "-p",
+                "0",
+                "--payload-format",
+                "%z",
+            ],
         ] {
             assert!(resolve(&arguments).is_err(), "{arguments:?}");
         }
@@ -869,6 +905,32 @@ mod tests {
             value.output,
             OutputPlan::Envelope(EnvelopePayload::Value)
         ));
+    }
+
+    #[test]
+    fn payload_format_adds_its_metadata_requirements_without_json_parsing() {
+        let config = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "--payload-format",
+            "%T:%h:%s",
+            "-f",
+            "%K:%k:%S:%s",
+        ])
+        .unwrap();
+
+        assert!(!config.transform.capabilities.parses_json);
+        assert_eq!(
+            config.output.requirements(),
+            OutputRequirements {
+                key: true,
+                headers: true,
+                timestamp: true,
+            }
+        );
     }
 
     #[test]

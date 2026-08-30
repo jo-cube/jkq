@@ -915,6 +915,7 @@ fn writer_loop(
         Some(RecordedFailure::Startup(message)) => Some(PipelineError::Runtime(message.clone())),
         _ => None,
     };
+    let mut payload_buffer = Vec::new();
     let ordered = !config.unordered && config.transform.capabilities.parses_json;
     for completion_batch in completion_rx {
         let Batch { consumer, items } = completion_batch;
@@ -948,9 +949,14 @@ fn writer_loop(
                             );
                         }
                         CompletionOutcome::Action(ref action) => {
-                            if let Err(error) =
-                                write_action(config, writer, &completion.source, action, &stats)
-                            {
+                            if let Err(error) = write_action(
+                                config,
+                                writer,
+                                &completion.source,
+                                action,
+                                &mut payload_buffer,
+                                &stats,
+                            ) {
                                 writer_failure(
                                     &mut failure,
                                     &first_failure,
@@ -1027,6 +1033,7 @@ fn write_action(
     writer: &mut impl Write,
     source: &SourceRecord,
     action: &Action,
+    payload_buffer: &mut Vec<u8>,
     stats: &Stats,
 ) -> io::Result<()> {
     let embeds_json = config.output.embeds_json();
@@ -1065,7 +1072,7 @@ fn write_action(
         ),
         Action::Project(bytes) => (Payload::Bytes(bytes), EmittedAction::Project),
     };
-    let output_record = OutputRecord {
+    let mut output_record = OutputRecord {
         topic: &config.topic,
         partition: source.partition,
         offset: source.offset,
@@ -1077,7 +1084,19 @@ fn write_action(
         action: emitted_action,
     };
     let output_bytes = match &config.output {
-        OutputPlan::Format(format) => format.write_to(&output_record, writer)?,
+        OutputPlan::Format {
+            payload_format,
+            format,
+        } => {
+            if let Some(payload_format) = payload_format
+                && !matches!(output_record.payload, Payload::Tombstone)
+            {
+                payload_buffer.clear();
+                payload_format.write_to(&output_record, payload_buffer)?;
+                output_record.payload = Payload::Bytes(payload_buffer);
+            }
+            format.write_to(&output_record, writer)?
+        }
         OutputPlan::Envelope(_) => output::write_envelope(&output_record, writer)?,
     };
     if config.unbuffered {
@@ -1263,6 +1282,7 @@ mod tests {
             &mut output,
             &source,
             &Action::Project(br#"{"id":1}"#.to_vec()),
+            &mut Vec::new(),
             &Stats::default(),
         )
         .unwrap();
@@ -1271,6 +1291,50 @@ mod tests {
             br#""action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":8}
 "#
         ));
+    }
+
+    #[test]
+    fn payload_format_updates_final_length_and_preserves_tombstones() {
+        let config = config(&[
+            "--payload-format",
+            r#"{"partition":%p,"offset":%o,"payload":%s}"#,
+            "-f",
+            "%k\\t%S\\t%s\\n",
+        ]);
+        let source = SourceRecord {
+            partition: 3,
+            offset: 42,
+            timestamp: None,
+            key: Some(b"id".to_vec()),
+            headers: Vec::new(),
+            payload_length: Some(8),
+        };
+        let mut output = Vec::new();
+        let mut payload_buffer = Vec::new();
+
+        write_action(
+            &config,
+            &mut output,
+            &source,
+            &Action::Project(br#"{"id":1}"#.to_vec()),
+            &mut payload_buffer,
+            &Stats::default(),
+        )
+        .unwrap();
+        write_action(
+            &config,
+            &mut output,
+            &source,
+            &Action::Tombstone,
+            &mut payload_buffer,
+            &Stats::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            b"id\t46\t{\"partition\":3,\"offset\":42,\"payload\":{\"id\":1}}\nid\t-1\t\n"
+        );
     }
 
     #[test]
