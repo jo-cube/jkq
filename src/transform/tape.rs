@@ -6,16 +6,19 @@ use jsonata_core::{
 };
 use simd_json::{Buffers, Tape, prelude::*, value::tape::Value};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TapeAction {
+#[derive(Debug, PartialEq)]
+pub(super) enum TapeResult {
     Drop,
     Tombstone,
     Pass,
+    Fallback(JValue),
+    Survivor(JValue),
 }
 
 pub(super) struct TapePlan {
     drops: Vec<Predicate>,
     tombstones: Vec<Predicate>,
+    needs_document: bool,
     scratch: RefCell<Scratch>,
 }
 
@@ -27,7 +30,8 @@ impl TapePlan {
         variables: Option<&JValue>,
         embeds_json: bool,
     ) -> Option<Self> {
-        if projection.is_some() || embeds_json {
+        let needs_document = projection.is_some() || embeds_json;
+        if needs_document && drops.is_empty() && tombstones.is_empty() {
             return None;
         }
         Some(Self {
@@ -39,11 +43,12 @@ impl TapePlan {
                 .iter()
                 .map(|expression| Predicate::compile(expression, variables))
                 .collect::<Option<_>>()?,
+            needs_document,
             scratch: RefCell::new(Scratch::default()),
         })
     }
 
-    pub(super) fn execute(&self, source: &[u8]) -> Option<TapeAction> {
+    pub(super) fn execute(&self, source: &[u8]) -> Option<TapeResult> {
         let mut scratch = self.scratch.borrow_mut();
         scratch.input.clear();
         scratch.input.extend_from_slice(source);
@@ -53,23 +58,35 @@ impl TapePlan {
             let Scratch { input, buffers, .. } = &mut *scratch;
             simd_json::fill_tape(input, buffers, &mut tape).is_ok()
         };
-        let action = parsed.then(|| self.evaluate(tape.as_value())).flatten();
+        if parsed {
+            // Deserialization consumes the tape without copying or parsing the source again.
+            return match self.evaluate(tape.as_value()) {
+                Some(TapeResult::Pass) if self.needs_document => {
+                    tape.deserialize().ok().map(TapeResult::Survivor)
+                }
+                Some(action) => {
+                    scratch.tape = Some(tape.reset());
+                    Some(action)
+                }
+                None => tape.deserialize().ok().map(TapeResult::Fallback),
+            };
+        }
         scratch.tape = Some(tape.reset());
-        action
+        None
     }
 
-    fn evaluate(&self, document: Value<'_, '_>) -> Option<TapeAction> {
+    fn evaluate(&self, document: Value<'_, '_>) -> Option<TapeResult> {
         for predicate in &self.drops {
             if predicate.evaluate(document)? {
-                return Some(TapeAction::Drop);
+                return Some(TapeResult::Drop);
             }
         }
         for predicate in &self.tombstones {
             if predicate.evaluate(document)? {
-                return Some(TapeAction::Tombstone);
+                return Some(TapeResult::Tombstone);
             }
         }
-        Some(TapeAction::Pass)
+        Some(TapeResult::Pass)
     }
 }
 

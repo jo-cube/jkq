@@ -8,7 +8,7 @@ use jsonata_core::{
 };
 
 use super::TransformPlan;
-use super::tape::{TapeAction, TapePlan};
+use super::tape::{TapePlan, TapeResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidJsonPolicy {
@@ -139,15 +139,15 @@ impl Worker {
             });
         }
 
-        if let Some(action) = self.tape.as_ref().and_then(|tape| tape.execute(&payload)) {
-            return Ok(Execution {
-                action: match action {
-                    TapeAction::Drop => Action::Drop,
-                    TapeAction::Tombstone => self.tombstone_action(),
-                    TapeAction::Pass => Action::PassThrough(PassPayload::Exact(payload)),
-                },
-                issue: None,
-            });
+        if let Some(result) = self.tape.as_ref().and_then(|tape| tape.execute(&payload)) {
+            let action = match result {
+                TapeResult::Drop => Ok(Action::Drop),
+                TapeResult::Tombstone => Ok(self.tombstone_action()),
+                TapeResult::Pass => Ok(Action::PassThrough(PassPayload::Exact(payload))),
+                TapeResult::Fallback(document) => self.evaluate(&document, payload),
+                TapeResult::Survivor(document) => self.project_or_pass(&document, payload),
+            };
+            return evaluation_result(action, policies.evaluation);
         }
 
         self.execute_jsonata(payload, policies)
@@ -171,23 +171,7 @@ impl Worker {
             }
         };
 
-        match self.evaluate(&document, payload) {
-            Ok(action) => Ok(Execution {
-                action,
-                issue: None,
-            }),
-            Err(error) => match policies.evaluation {
-                EvaluationPolicy::Fail => Err(error),
-                EvaluationPolicy::Drop => Ok(Execution {
-                    action: Action::Drop,
-                    issue: Some(ExecutionIssue::Evaluation),
-                }),
-                EvaluationPolicy::Tombstone => Ok(Execution {
-                    action: Action::Tombstone,
-                    issue: Some(ExecutionIssue::Evaluation),
-                }),
-            },
-        }
+        evaluation_result(self.evaluate(&document, payload), policies.evaluation)
     }
 
     fn evaluate(&self, document: &JValue, original: Vec<u8>) -> Result<Action, TransformError> {
@@ -201,6 +185,14 @@ impl Worker {
                 return Ok(self.tombstone_action());
             }
         }
+        self.project_or_pass(document, original)
+    }
+
+    fn project_or_pass(
+        &self,
+        document: &JValue,
+        original: Vec<u8>,
+    ) -> Result<Action, TransformError> {
         let Some(expression) = &self.projection else {
             if !self.embeds_json {
                 return Ok(Action::PassThrough(PassPayload::Exact(original)));
@@ -273,6 +265,29 @@ impl Worker {
 
 fn parsed(source: &str) -> AstNode {
     parser::parse(source).expect("startup validated JSONata expression")
+}
+
+fn evaluation_result(
+    result: Result<Action, TransformError>,
+    policy: EvaluationPolicy,
+) -> Result<Execution, TransformError> {
+    match result {
+        Ok(action) => Ok(Execution {
+            action,
+            issue: None,
+        }),
+        Err(error) => match policy {
+            EvaluationPolicy::Fail => Err(error),
+            EvaluationPolicy::Drop => Ok(Execution {
+                action: Action::Drop,
+                issue: Some(ExecutionIssue::Evaluation),
+            }),
+            EvaluationPolicy::Tombstone => Ok(Execution {
+                action: Action::Tombstone,
+                issue: Some(ExecutionIssue::Evaluation),
+            }),
+        },
+    }
 }
 
 fn invalid_json(
@@ -516,7 +531,7 @@ mod tests {
                 .tape
                 .as_ref()
                 .and_then(|tape| tape.execute(br#"{"valid":true}"#)),
-            Some(TapeAction::Pass)
+            Some(TapeResult::Pass)
         );
         let invalid = b"{ not json \xff".to_vec();
         for (policy, expected) in [
@@ -685,49 +700,49 @@ mod tests {
                 r#"kind = "ignore""#,
                 None,
                 br#"{"kind":"ignore"}"#.as_slice(),
-                TapeAction::Drop,
+                TapeResult::Drop,
             ),
             (
                 r#"kind = "ignore""#,
                 None,
                 br#"{"kind":"keep"}"#.as_slice(),
-                TapeAction::Pass,
+                TapeResult::Pass,
             ),
             (
                 "10 <= metrics.score",
                 None,
                 br#"{"metrics":{"score":10}}"#.as_slice(),
-                TapeAction::Drop,
+                TapeResult::Drop,
             ),
             (
                 "tenant != $vars.tenant",
                 Some(r#"{"tenant":"acme"}"#),
                 br#"{"tenant":"other"}"#.as_slice(),
-                TapeAction::Drop,
+                TapeResult::Drop,
             ),
             (
                 r#"(kind = "event" and active) or force = true"#,
                 None,
                 br#"{"kind":"event","active":true}"#.as_slice(),
-                TapeAction::Drop,
+                TapeResult::Drop,
             ),
             (
                 r#"status = "keep""#,
                 None,
                 br#"{"status":"drop","status":"keep"}"#.as_slice(),
-                TapeAction::Drop,
+                TapeResult::Drop,
             ),
             (
                 "value = 9007199254740992",
                 None,
                 br#"{"value":9007199254740993}"#.as_slice(),
-                TapeAction::Drop,
+                TapeResult::Drop,
             ),
             (
                 "missing != null",
                 None,
                 br#"{}"#.as_slice(),
-                TapeAction::Drop,
+                TapeResult::Drop,
             ),
         ] {
             let transform = plan(&[expression], &[], None, variables, false);
@@ -746,19 +761,111 @@ mod tests {
     }
 
     #[test]
-    fn tape_path_falls_back_when_jsonata_sequence_semantics_are_needed() {
+    fn tape_filters_preserve_projection_and_json_value_envelopes() {
+        for (projection, embeds_json) in
+            [(Some(r#"{"id": id, "text": text}"#), false), (None, true)]
+        {
+            let transform = plan(&["drop"], &["deleted"], projection, None, false);
+            let worker = Worker::new(&transform, embeds_json);
+            for input in [
+                br#"{"drop":true}"#.as_slice(),
+                br#"{"drop":false,"deleted":true}"#,
+                br#"{ "drop":false,"deleted":false,"id":9007199254740993,"text":"a\n\u00e9" }"#,
+                br#"{"drop":false,"deleted":false,"id":1,"id":2,"text":null}"#,
+                br#"{"drop":false,"deleted":false,"id":3}"#,
+            ] {
+                let result = worker.tape.as_ref().unwrap().execute(input).unwrap();
+                let expected = worker.execute_jsonata(input.to_vec(), FAIL);
+                match result {
+                    TapeResult::Drop => assert_eq!(expected.as_ref().unwrap().action, Action::Drop),
+                    TapeResult::Tombstone => {
+                        assert_eq!(expected.as_ref().unwrap().action, Action::Tombstone);
+                    }
+                    TapeResult::Survivor(document) => {
+                        assert_eq!(
+                            document,
+                            JValue::from_json_str(str::from_utf8(input).unwrap()).unwrap()
+                        );
+                    }
+                    _ => panic!("survivors must complete predicates on the tape"),
+                }
+                assert_eq!(worker.execute_report(Some(input.to_vec()), FAIL), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn tape_document_fallback_preserves_values_and_error_policies() {
         let transform = plan(&["items.active = true"], &[], None, None, false);
         let worker = Worker::new(&transform, false);
-        let input = br#"{"items":[{"active":true},{"active":false}]}"#;
+        assert!(matches!(
+            worker
+                .tape
+                .as_ref()
+                .unwrap()
+                .execute(br#"{"items":[{"active":true}]}"#),
+            Some(TapeResult::Fallback(_))
+        ));
+        for input in [
+            br#"{"items":[{"active":true},{"active":false}],"text":"\u00e9\n"}"#.as_slice(),
+            br#"{"items":{"active":true},"items":[{"active":false}]}"#,
+            br#"{"items":{"active":true}}"#,
+            br#"{"items":[{"active":true}],"bad":}"#,
+            b"\xff",
+        ] {
+            for invalid_json in [InvalidJsonPolicy::Fail, InvalidJsonPolicy::Pass] {
+                let policies = ErrorPolicies {
+                    invalid_json,
+                    ..FAIL
+                };
+                assert_eq!(
+                    worker.execute_report(Some(input.to_vec()), policies),
+                    worker.execute_jsonata(input.to_vec(), policies)
+                );
+            }
+        }
+        let transform = plan(&["items.active"], &[], None, None, false);
+        let worker = Worker::new(&transform, false);
+        for evaluation in [
+            EvaluationPolicy::Fail,
+            EvaluationPolicy::Drop,
+            EvaluationPolicy::Tombstone,
+        ] {
+            let policies = ErrorPolicies { evaluation, ..FAIL };
+            let input = br#"{"items":[{"active":true},{"active":false}]}"#;
+            assert_eq!(
+                worker.execute_report(Some(input.to_vec()), policies),
+                worker.execute_jsonata(input.to_vec(), policies)
+            );
+        }
+    }
 
-        assert_eq!(
-            worker.tape.as_ref().and_then(|tape| tape.execute(input)),
-            None
-        );
-        assert_eq!(
-            worker.execute_report(Some(input.to_vec()), FAIL),
-            worker.execute_jsonata(input.to_vec(), FAIL)
-        );
+    #[test]
+    fn tape_survivors_preserve_projection_error_policies() {
+        for projection in [
+            "missing",
+            "$error(\"projection failed\")",
+            r#"{"value": $sum}"#,
+        ] {
+            let transform = plan(&["drop = true"], &[], Some(projection), None, false);
+            let worker = Worker::new(&transform, false);
+            let input = br#"{"drop":false}"#;
+            assert!(matches!(
+                worker.tape.as_ref().unwrap().execute(input),
+                Some(TapeResult::Survivor(_))
+            ));
+            for evaluation in [
+                EvaluationPolicy::Fail,
+                EvaluationPolicy::Drop,
+                EvaluationPolicy::Tombstone,
+            ] {
+                let policies = ErrorPolicies { evaluation, ..FAIL };
+                assert_eq!(
+                    worker.execute_report(Some(input.to_vec()), policies),
+                    worker.execute_jsonata(input.to_vec(), policies)
+                );
+            }
+        }
     }
 
     #[test]
