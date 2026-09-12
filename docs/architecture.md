@@ -107,20 +107,30 @@ JSON, all safe to share across worker threads. Each worker parses its own
 JSONata ASTs and `$vars` value because jsonata-core values use `Rc` and are not
 `Send` or `Sync`.
 
-When a plan has no projection or JSON-value envelope and every action predicate
-uses supported scalar operations, the worker evaluates it directly on a
-validated simd-json tape. The supported subset is Boolean literals, plain input
-paths, scalar literals and scalar `$vars` paths, comparisons, and `and`/`or`.
+When every action predicate uses supported scalar operations, the worker
+evaluates predicates directly on a validated simd-json tape. The supported
+subset is Boolean literals, plain input paths, scalar literals and scalar
+`$vars` paths, comparisons, and `and`/`or`.
 Parser scratch and tape allocation are reused by that worker. Because simd-json
 unescapes strings in place, parsing uses a worker-local copy and leaves source
 bytes untouched for an eventual pass action.
 
-The tape evaluator declines expressions or record shapes that need full
-JSONata semantics, including functions, path filters, projections, container
-comparisons, and array-mapped paths. The worker then uses the normal
-jsonata-core path. A tape parse failure also falls back, preserving
-jsonata-core's accepted input and error handling. Fast-path selection never
-changes expression results or policies.
+Drop and tombstone results avoid constructing a JSONata value tree, including
+when surviving records require a projection or JSON-value envelope. Survivors
+that need a tree deserialize the validated tape directly into `JValue` and
+proceed to projection or serialization without repeating predicates. This
+consumes the tape allocation; the next record allocates a new tape while still
+reusing input and parser scratch buffers.
+
+The tape evaluator declines predicates or record shapes that need full JSONata
+semantics, including functions, path filters, container comparisons, and
+array-mapped paths. Unsupported predicates use the normal jsonata-core path.
+Unsupported record shapes deserialize the existing tape and evaluate the
+predicates with JSONata, avoiding a second source copy and parse. A tape parse
+or deserialization failure falls back to the normal parser, preserving
+jsonata-core's accepted input and error handling. Plans with only projection
+or JSON-value serialization continue to use the normal path. Fast-path
+selection never changes expression results or policies.
 
 The normal path validates UTF-8 and parses the payload once with
 `JValue::from_json_str`. The same worker-local document is used for all drop
