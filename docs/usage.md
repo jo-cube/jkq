@@ -290,7 +290,9 @@ validation, including for an otherwise identity transform.
 lines and lines beginning with `#` are ignored. `-X, --property key=value` is
 repeatable; later values replace earlier ones. Dedicated `-b` brokers take
 precedence over both. For `-X`, everything after the first `=` is the property
-value, including surrounding whitespace.
+value, including surrounding whitespace. Malformed properties report the
+required `key=value` syntax and, for config files, the path and line number;
+they do not echo the property contents.
 
 `jkq` owns these properties and rejects attempts to set them:
 

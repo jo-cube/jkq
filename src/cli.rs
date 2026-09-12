@@ -549,7 +549,7 @@ fn parse_nonnegative_i64(value: &str, label: &str) -> Result<i64, String> {
 fn parse_property(value: &str) -> Result<(&str, &str), String> {
     let (key, value) = value
         .split_once('=')
-        .ok_or_else(|| format!("property {value:?} must use key=value syntax"))?;
+        .ok_or_else(|| "property must use key=value syntax".to_owned())?;
     if key.trim().is_empty() {
         return Err("property key must not be empty".to_owned());
     }
@@ -1055,9 +1055,14 @@ mod tests {
     }
 
     #[test]
-    fn config_parser_reports_malformed_line_number() {
-        let error = parse_config("a=1\nmalformed\n").unwrap_err();
+    fn property_errors_keep_line_context_without_echoing_contents() {
+        let malformed = "sasl.password do-not-print";
+        let error = parse_config(&format!("a=1\n{malformed}\n")).unwrap_err();
         assert!(error.contains("line 2"));
+        assert!(!error.contains("do-not-print"));
+        let error = resolve(&["jkq", "-b", "x", "-t", "t", "-X", malformed]).unwrap_err();
+        assert!(error.contains("key=value"));
+        assert!(!error.contains("do-not-print"));
     }
 
     #[test]
