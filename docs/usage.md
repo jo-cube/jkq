@@ -483,6 +483,14 @@ connections and poller threads, so compare nearby values rather than assuming
 the partition count is the right setting. Adjust the in-flight limits only
 when measurements show worker starvation or excessive retained memory.
 
+If large-record runs pause for roughly a second between bursts, inspect
+librdkafka's prefetch limits (`queued.min.messages` and
+`queued.max.messages.kbytes`) and `fetch.queue.backoff.ms`. The Kafka client
+waits 1000 ms by default after a fetch queue exceeds its threshold. Compare
+`-X fetch.queue.backoff.ms=10` on a bounded range; shorter backoffs may increase
+CPU use. These prefetch limits are separate from jkq's source-byte admission
+budget.
+
 ### Validate a bounded slice first
 
 Use the same expressions, variables, output format, and Kafka properties that
