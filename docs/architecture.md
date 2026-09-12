@@ -223,6 +223,12 @@ Fixed ranges use exclusive end offsets. Snapshot boundaries are captured once
 and never extended. Completion means that the poller has stopped admitting the
 range and every admitted partition sequence has crossed its frontier.
 
+rdkafka 0.39 reports partition EOF without the event's offset. Fixed-end EOF
+handling therefore queries a fresh broker high watermark, which leaves the
+[future-end race documented in usage](usage.md#assignment-and-ranges). A
+compatible fix needs the actual EOF offset: the last delivered record alone
+cannot account for trailing compacted offsets or transaction control records.
+
 Global counts atomically stop all admission after the configured number of
 input records.
 Per-partition counts mark each partition complete independently after its
