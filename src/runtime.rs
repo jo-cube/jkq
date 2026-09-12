@@ -1073,7 +1073,7 @@ fn writer_loop(
             ),
         );
     }
-    if failure.is_none()
+    if !matches!(failure, Some(PipelineError::Output(_)))
         && let Err(error) = writer.flush()
     {
         writer_failure(
@@ -1528,6 +1528,18 @@ mod tests {
 
     #[test]
     fn ordered_writer_stops_at_first_fatal_result_and_releases_every_completion() {
+        struct FlushError(Vec<u8>);
+
+        impl Write for FlushError {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("flush failed"))
+            }
+        }
+
         let config = config(&["--drop-if", "false"]);
         let (completion_tx, completion_rx) = bounded(3);
         let (release_tx, release_rx) = bounded(3);
@@ -1545,7 +1557,7 @@ mod tests {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let first_failure = Arc::new(OnceLock::new());
-        let mut output = Vec::new();
+        let mut output = io::BufWriter::new(FlushError(Vec::new()));
         let error = writer_loop(
             &config,
             &mut output,
@@ -1560,7 +1572,7 @@ mod tests {
         assert!(
             matches!(error, PipelineError::Runtime(ref message) if message == "fatal transform")
         );
-        assert_eq!(output, b"a\n");
+        assert_eq!(output.get_ref().0, b"a\n");
         assert!(shutdown.load(Ordering::SeqCst));
         assert!(matches!(
             first_failure.get(),

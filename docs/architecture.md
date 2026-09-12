@@ -107,20 +107,30 @@ JSON, all safe to share across worker threads. Each worker parses its own
 JSONata ASTs and `$vars` value because jsonata-core values use `Rc` and are not
 `Send` or `Sync`.
 
-When a plan has no projection or JSON-value envelope and every action predicate
-uses supported scalar operations, the worker evaluates it directly on a
-validated simd-json tape. The supported subset is Boolean literals, plain input
-paths, scalar literals and scalar `$vars` paths, comparisons, and `and`/`or`.
+When every action predicate uses supported scalar operations, the worker
+evaluates predicates directly on a validated simd-json tape. The supported
+subset is Boolean literals, plain input paths, scalar literals and scalar
+`$vars` paths, comparisons, and `and`/`or`.
 Parser scratch and tape allocation are reused by that worker. Because simd-json
 unescapes strings in place, parsing uses a worker-local copy and leaves source
 bytes untouched for an eventual pass action.
 
-The tape evaluator declines expressions or record shapes that need full
-JSONata semantics, including functions, path filters, projections, container
-comparisons, and array-mapped paths. The worker then uses the normal
-jsonata-core path. A tape parse failure also falls back, preserving
-jsonata-core's accepted input and error handling. Fast-path selection never
-changes expression results or policies.
+Drop and tombstone results avoid constructing a JSONata value tree, including
+when surviving records require a projection or JSON-value envelope. Survivors
+that need a tree deserialize the validated tape directly into `JValue` and
+proceed to projection or serialization without repeating predicates. This
+consumes the tape allocation; the next record allocates a new tape while still
+reusing input and parser scratch buffers.
+
+The tape evaluator declines predicates or record shapes that need full JSONata
+semantics, including functions, path filters, container comparisons, and
+array-mapped paths. Unsupported predicates use the normal jsonata-core path.
+Unsupported record shapes deserialize the existing tape and evaluate the
+predicates with JSONata, avoiding a second source copy and parse. A tape parse
+or deserialization failure falls back to the normal parser, preserving
+jsonata-core's accepted input and error handling. Plans with only projection
+or JSON-value serialization continue to use the normal path. Fast-path
+selection never changes expression results or policies.
 
 The normal path validates UTF-8 and parses the payload once with
 `JValue::from_json_str`. The same worker-local document is used for all drop
@@ -223,16 +233,23 @@ Fixed ranges use exclusive end offsets. Snapshot boundaries are captured once
 and never extended. Completion means that the poller has stopped admitting the
 range and every admitted partition sequence has crossed its frontier.
 
+rdkafka 0.39 reports partition EOF without the event's offset. Fixed-end EOF
+handling therefore queries a fresh broker high watermark, which leaves the
+[future-end race documented in usage](usage.md#assignment-and-ranges). A
+compatible fix needs the actual EOF offset: the last delivered record alone
+cannot account for trailing compacted offsets or transaction control records.
+
 Global counts atomically stop all admission after the configured number of
 input records.
 Per-partition counts mark each partition complete independently after its
 limit; already admitted records still cross the normal completion frontier.
 
 The first fatal error wins. It triggers shared cancellation, closes the work
-path, and drains retained work. The ordered writer emits preceding in-order
-records, emits nothing after the first fatal result, and releases accounting
-for every completion. Poller, worker, and writer panics become pipeline
-failures rather than leaving another stage blocked.
+path, and drains retained work. The ordered writer emits and flushes preceding
+in-order records, emits nothing after the first fatal result, and releases
+accounting for every completion. A flush failure never replaces an earlier
+fatal error. Poller, worker, and writer panics become pipeline failures rather
+than leaving another stage blocked.
 
 The first termination signal stops admission and drains. signal-hook arms the
 second signal for immediate process exit, which also handles a poller, worker,

@@ -164,9 +164,14 @@ impl CompiledFormat {
                         b't' => literal.push(b'\t'),
                         b'\\' => literal.push(b'\\'),
                         b'x' => {
-                            let digits = source.get(cursor..cursor + 2).ok_or_else(|| {
-                                FormatError("'\\x' requires two hexadecimal digits".to_owned())
-                            })?;
+                            let digits = source
+                                .get(cursor..cursor + 2)
+                                .filter(|digits| {
+                                    digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                })
+                                .ok_or_else(|| {
+                                    FormatError("'\\x' requires two hexadecimal digits".to_owned())
+                                })?;
                             literal.push(u8::from_str_radix(digits, 16).map_err(|_| {
                                 FormatError("'\\x' requires two hexadecimal digits".to_owned())
                             })?);
@@ -620,7 +625,7 @@ mod tests {
 
     #[test]
     fn malformed_formats_fail_at_compile_time() {
-        for source in ["%z", "%", "\\q", "\\x0g", "\\x0"] {
+        for source in ["%z", "%", "\\q", "\\x0g", "\\x0", "\\x+1"] {
             assert!(CompiledFormat::compile(source).is_err(), "{source}");
         }
     }

@@ -27,8 +27,8 @@ failure is a command-line error and exits with status 2 before Kafka
 consumption. `--check` performs the same parsing and variable validation
 without creating a Kafka consumer.
 
-For each non-tombstone input record, `jkq` parses the payload into one
-jsonata-core value and reuses it while it:
+For each non-tombstone input record that needs JSON, `jkq` validates the
+payload and:
 
 1. evaluates `--drop-if` expressions in command-line order, dropping the
    record at the first Boolean `true`;
@@ -38,6 +38,10 @@ jsonata-core value and reuses it while it:
 3. evaluates `--project` for surviving records, when present;
 4. otherwise passes through the source payload, preserving its exact bytes
    unless `--envelope-payload value` requests compact JSON serialization.
+
+Workers reuse parsed input across expressions. Supported scalar predicates
+can avoid constructing a jsonata-core value tree; see
+[expression execution](architecture.md#expression-execution).
 
 Existing Kafka tombstones bypass JSON parsing and every expression. A
 source tombstone remains a tombstone by default and is dropped when

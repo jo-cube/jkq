@@ -481,6 +481,9 @@ fn offsets_for_timestamp(
         .into_iter()
         .map(|element| {
             let partition = element.partition();
+            element.error().map_err(|error| {
+                format!("cannot resolve timestamp {timestamp} for topic {topic} partition {partition}: {error}")
+            })?;
             let offset = timestamp_offset(
                 element.offset(),
                 watermarks[&partition].1,
@@ -589,6 +592,36 @@ mod tests {
                 "{start:?} {end:?}"
             );
         }
+    }
+
+    #[test]
+    fn timestamp_lookup_rejects_partition_errors() {
+        use rdkafka::mocking::MockCluster;
+
+        let cluster = MockCluster::new(1).unwrap();
+        cluster.create_topic("timestamp-errors", 1, 1).unwrap();
+        let consumer: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .create()
+            .unwrap();
+        consumer
+            .fetch_metadata(Some("timestamp-errors"), METADATA_TIMEOUT)
+            .unwrap();
+
+        // A mixed result can succeed overall while the missing partition fails.
+        let error = offsets_for_timestamp(
+            &consumer,
+            "timestamp-errors",
+            &[0, 1],
+            10,
+            &BTreeMap::from([(0, (0, 7)), (1, (0, 7))]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .starts_with("cannot resolve timestamp 10 for topic timestamp-errors partition 1:"),
+            "{error}"
+        );
     }
 
     #[test]

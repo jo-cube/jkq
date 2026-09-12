@@ -50,11 +50,12 @@ The default start is `beginning`. `-o, --offset` accepts:
 | `s@1720000000000` | first offset at or after this Unix timestamp in milliseconds |
 | `e@1720000000000` | exclusive timestamp end |
 
-A timestamp with no matching record resolves to the current high watermark.
-Absolute offsets are passed directly to Kafka. When a fixed end or snapshot is
-at or before the start, the partition is an empty range and completes without
-polling. Otherwise, an unavailable start is reported if Kafka rejects it;
-`jkq` does not reset it to the beginning or end.
+A successful timestamp lookup with no matching record resolves to the current
+high watermark. A failed partition lookup is a startup error, even with
+`--on-kafka-error continue`. Absolute offsets are passed directly to Kafka.
+When a fixed end or snapshot is at or before the start, the partition is an
+empty range and completes without polling. Otherwise, an unavailable start is
+reported if Kafka rejects it; `jkq` does not reset it to the beginning or end.
 
 `--end-offset <offset>` sets an exclusive offset end for every assigned
 partition. It cannot be combined with `e@...`.
@@ -74,6 +75,11 @@ Termination controls:
 
 `--snapshot` cannot be combined with an explicit end. All start and end
 positions apply to every assigned partition.
+
+Known limitation: an explicit end ahead of the current log can terminate early
+if producers append between EOF delivery and the subsequent watermark check.
+Use `--snapshot` to export records already retained at startup. See the
+[EOF handling constraint](architecture.md#termination-and-failure).
 
 ## Transforms
 
@@ -284,7 +290,9 @@ validation, including for an otherwise identity transform.
 lines and lines beginning with `#` are ignored. `-X, --property key=value` is
 repeatable; later values replace earlier ones. Dedicated `-b` brokers take
 precedence over both. For `-X`, everything after the first `=` is the property
-value, including surrounding whitespace.
+value, including surrounding whitespace. Malformed properties report the
+required `key=value` syntax and, for config files, the path and line number;
+they do not echo the property contents.
 
 `jkq` owns these properties and rejects attempts to set them:
 
@@ -428,11 +436,13 @@ When predicates choose between pass and tombstone, omit `--project` unless the
 payload must change. Passing preserves the exact source payload and avoids
 projection serialization.
 
-Plans without a projection or JSON-value envelope can avoid materializing a
-JSONata value tree when every predicate uses plain scalar paths, comparisons,
-Boolean literals, and `and`/`or`. Other expressions and record shapes fall back
-automatically with the same semantics. Treat this as an optimization, not a
-reason to make an equivalent predicate harder to understand.
+When every predicate uses plain scalar paths, comparisons, Boolean literals,
+and `and`/`or`, dropped and tombstoned records can avoid materializing a JSONata
+value tree, including before a projection or JSON-value envelope. Surviving
+records reuse the parsed input for projection or serialization. Other
+expressions and record shapes fall back automatically with the same semantics.
+Treat this as an optimization, not a reason to make an equivalent predicate
+harder to understand.
 
 When only selected metadata must be included in the payload, use
 [`--payload-format`](#payload-formatting) instead of a complete JSON envelope.
@@ -472,6 +482,14 @@ ordering across partitions. Additional consumers create more broker
 connections and poller threads, so compare nearby values rather than assuming
 the partition count is the right setting. Adjust the in-flight limits only
 when measurements show worker starvation or excessive retained memory.
+
+If large-record runs pause for roughly a second between bursts, inspect
+librdkafka's prefetch limits (`queued.min.messages` and
+`queued.max.messages.kbytes`) and `fetch.queue.backoff.ms`. The Kafka client
+waits 1000 ms by default after a fetch queue exceeds its threshold. Compare
+`-X fetch.queue.backoff.ms=10` on a bounded range; shorter backoffs may increase
+CPU use. These prefetch limits are separate from jkq's source-byte admission
+budget.
 
 ### Validate a bounded slice first
 
