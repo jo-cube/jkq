@@ -144,7 +144,10 @@ impl Worker {
                 TapeResult::Drop => Ok(Action::Drop),
                 TapeResult::Tombstone => Ok(self.tombstone_action()),
                 TapeResult::Pass => Ok(Action::PassThrough(PassPayload::Exact(payload))),
-                TapeResult::Fallback(document) => self.evaluate(&document, payload),
+                TapeResult::Fallback {
+                    document,
+                    completed_predicates,
+                } => self.evaluate(&document, payload, completed_predicates),
                 TapeResult::Survivor(document) => self.project_or_pass(&document, payload),
             };
             return evaluation_result(action, policies.evaluation);
@@ -171,16 +174,26 @@ impl Worker {
             }
         };
 
-        evaluation_result(self.evaluate(&document, payload), policies.evaluation)
+        evaluation_result(self.evaluate(&document, payload, 0), policies.evaluation)
     }
 
-    fn evaluate(&self, document: &JValue, original: Vec<u8>) -> Result<Action, TransformError> {
-        for (index, expression) in self.drops.iter().enumerate() {
+    fn evaluate(
+        &self,
+        document: &JValue,
+        original: Vec<u8>,
+        completed_predicates: usize,
+    ) -> Result<Action, TransformError> {
+        for (index, expression) in self.drops.iter().enumerate().skip(completed_predicates) {
             if self.predicate(expression, document, "drop predicate", index)? {
                 return Ok(Action::Drop);
             }
         }
-        for (index, expression) in self.tombstones.iter().enumerate() {
+        for (index, expression) in self
+            .tombstones
+            .iter()
+            .enumerate()
+            .skip(completed_predicates.saturating_sub(self.drops.len()))
+        {
             if self.predicate(expression, document, "tombstone predicate", index)? {
                 return Ok(self.tombstone_action());
             }
@@ -761,6 +774,86 @@ mod tests {
     }
 
     #[test]
+    fn tape_scalar_prefix_preserves_native_predicate_order_and_errors() {
+        for (drops, tombstones, expected, completed_predicates) in [
+            (
+                vec!["skip = true", "$error(\"native predicate\")", "true"],
+                vec!["true"],
+                TapeResult::Drop,
+                1,
+            ),
+            (
+                vec!["false"],
+                vec!["skip = true", "$error(\"native predicate\")", "true"],
+                TapeResult::Tombstone,
+                2,
+            ),
+        ] {
+            let transform = plan(
+                &drops,
+                &tombstones,
+                Some("$error(\"projection\")"),
+                None,
+                false,
+            );
+            let worker = Worker::new(&transform, false);
+            let tape = worker.tape.as_ref().expect("retain the scalar prefix");
+            assert_eq!(tape.execute(br#"{"skip":true}"#), Some(expected));
+            assert!(matches!(
+                tape.execute(br#"{"skip":false}"#),
+                Some(TapeResult::Fallback { completed_predicates: count, .. })
+                    if count == completed_predicates
+            ));
+            for input in [
+                br#"{ "skip":true }"#.as_slice(),
+                br#"{"skip":false}"#,
+                br#"{"skip":true,"skip":false}"#,
+                br#"{"skip":[true]}"#,
+                br#"{"skip":true,"invalid":}"#,
+            ] {
+                for evaluation in [
+                    EvaluationPolicy::Fail,
+                    EvaluationPolicy::Drop,
+                    EvaluationPolicy::Tombstone,
+                ] {
+                    let policies = ErrorPolicies { evaluation, ..FAIL };
+                    assert_eq!(
+                        worker.execute_report(Some(input.to_vec()), policies),
+                        worker.execute_jsonata(input.to_vec(), policies)
+                    );
+                }
+            }
+        }
+        let transform = plan(&["$exists(missing)", "true"], &[], None, None, false);
+        assert!(Worker::new(&transform, false).tape.is_none());
+    }
+
+    #[test]
+    fn tape_mixed_predicates_preserve_survivor_payloads() {
+        for (projection, embeds_json) in [(None, false), (Some("$$.id"), false), (None, true)] {
+            let transform = plan(
+                &["skip = true", "$exists(blocked)"],
+                &["deleted = true"],
+                projection,
+                None,
+                true,
+            );
+            let worker = Worker::new(&transform, embeds_json);
+            for input in [
+                br#"{ "id":1, "text":"a\n\u00e9" }"#.as_slice(),
+                br#"{"id":2,"deleted":true}"#,
+                br#"{"id":3,"blocked":false}"#,
+                br#"{"id":4}"#,
+            ] {
+                assert_eq!(
+                    worker.execute_report(Some(input.to_vec()), FAIL),
+                    worker.execute_jsonata(input.to_vec(), FAIL)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tape_filters_preserve_projection_and_json_value_envelopes() {
         for (projection, embeds_json) in
             [(Some(r#"{"id": id, "text": text}"#), false), (None, true)]
@@ -804,7 +897,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .execute(br#"{"items":[{"active":true}]}"#),
-            Some(TapeResult::Fallback(_))
+            Some(TapeResult::Fallback { .. })
         ));
         for input in [
             br#"{"items":[{"active":true},{"active":false}],"text":"\u00e9\n"}"#.as_slice(),
