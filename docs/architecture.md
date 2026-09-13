@@ -107,8 +107,8 @@ JSON, all safe to share across worker threads. Each worker parses its own
 JSONata ASTs and `$vars` value because jsonata-core values use `Rc` and are not
 `Send` or `Sync`.
 
-When every action predicate uses supported scalar operations, the worker
-evaluates predicates directly on a validated simd-json tape. The supported
+When action predicates begin with supported scalar operations, the worker
+evaluates that prefix directly on a validated simd-json tape. The supported
 subset is Boolean literals, plain input paths, scalar literals and scalar
 `$vars` paths, comparisons, and `and`/`or`.
 Parser scratch and tape allocation are reused by that worker. Because simd-json
@@ -117,19 +117,23 @@ bytes untouched for an eventual pass action.
 
 Drop and tombstone results avoid constructing a JSONata value tree, including
 when surviving records require a projection or JSON-value envelope. Survivors
-that need a tree deserialize the validated tape directly into `JValue` and
-proceed to projection or serialization without repeating predicates. This
-consumes the tape allocation; the next record allocates a new tape while still
-reusing input and parser scratch buffers.
+that finish all predicates on the tape and need a tree deserialize the
+validated tape directly into `JValue` and proceed to projection or serialization
+without repeating predicates. This consumes the tape allocation; the next
+record allocates a new tape while still reusing input and parser scratch buffers.
 
 The tape evaluator declines predicates or record shapes that need full JSONata
 semantics, including functions, path filters, container comparisons, and
-array-mapped paths. Unsupported predicates use the normal jsonata-core path.
-Unsupported record shapes deserialize the existing tape and evaluate the
-predicates with JSONata, avoiding a second source copy and parse. A tape parse
-or deserialization failure falls back to the normal parser, preserving
-jsonata-core's accepted input and error handling. Plans with only projection
-or JSON-value serialization continue to use the normal path. Fast-path
+array-mapped paths. On the first unsupported predicate or record shape, the
+worker deserializes the existing tape and resumes JSONata evaluation at that
+predicate. Completed scalar predicates are not repeated. This avoids another
+source copy, parse, and evaluation of the prefix while preserving predicate
+order and error locations.
+A plan whose first predicate is unsupported uses the normal jsonata-core path
+directly, since it cannot discard records before constructing the value tree.
+A tape parse or deserialization failure falls back to the normal parser,
+preserving jsonata-core's accepted input and error handling. Plans with only
+projection or JSON-value serialization continue to use the normal path. Fast-path
 selection never changes expression results or policies.
 
 The normal path validates UTF-8 and parses the payload once with
@@ -181,7 +185,9 @@ action into one reused buffer before applying the final output format. Final
 `%s`, `%S`, and `%R` therefore operate on the exact generated payload without
 putting Kafka metadata into JSONata. Drops produce no bytes, tombstones bypass
 payload formatting, and `%L` continues to report the source payload length.
-Broken pipe is normal pipeline termination.
+JSON envelope strings use simd-json's streaming serializer; output accounting
+and I/O error kinds, including broken pipe, are preserved. Broken pipe is normal
+pipeline termination.
 For a JSON-value envelope, the writer inserts compact JSON bytes produced by
 the worker or projection and labels them with `payloadEncoding: "json"`.
 

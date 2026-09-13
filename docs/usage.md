@@ -441,8 +441,9 @@ and `and`/`or`, dropped and tombstoned records can avoid materializing a JSONata
 value tree, including before a projection or JSON-value envelope. Surviving
 records reuse the parsed input for projection or serialization. Other
 expressions and record shapes fall back automatically with the same semantics.
-Treat this as an optimization, not a reason to make an equivalent predicate
-harder to understand.
+An initial sequence of supported scalar predicates retains this optimization
+even when later predicates need full JSONata evaluation. Treat this as an
+optimization, not a reason to make an equivalent predicate harder to understand.
 
 When only selected metadata must be included in the payload, use
 [`--payload-format`](#payload-formatting) instead of a complete JSON envelope.

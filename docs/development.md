@@ -158,8 +158,9 @@ The direct runtime dependencies are deliberately limited to:
 `jsonata-core` is the sole expression language implementation and is used
 through its public `parser`, `evaluator`, and `value` APIs. jkq also depends on
 the same pinned simd-json version through its public tape API to avoid building
-a `JValue` tree for supported scalar-only action plans. Do not use
-jsonata-core's `_bench` module or other internal APIs.
+a `JValue` tree for supported scalar predicates, and its public serializer for
+JSON envelope strings. Do not use jsonata-core's `_bench` module or other
+internal APIs.
 
 Before adding another dependency, confirm that the standard library or an
 existing dependency is insufficient and that the new dependency removes
