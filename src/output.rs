@@ -312,15 +312,15 @@ fn write_decimal(
     value: impl fmt::Display,
     written: &mut usize,
 ) -> io::Result<()> {
-    write!(&mut DecimalWriter { output, written }, "{value}")
+    write!(&mut CountingWriter { output, written }, "{value}")
 }
 
-struct DecimalWriter<'a, W> {
+struct CountingWriter<'a, W> {
     output: &'a mut W,
     written: &'a mut usize,
 }
 
-impl<W: Write> Write for DecimalWriter<'_, W> {
+impl<W: Write> Write for CountingWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let count = self.output.write(bytes)?;
         *self.written = self
@@ -432,21 +432,18 @@ fn write_bytes_fields(
             write_bytes(output, b"null", written)?;
             None
         }
-        Some(bytes) => {
-            write_bytes(output, b"\"", written)?;
-            let encoding = match std::str::from_utf8(bytes) {
-                Ok(value) => {
-                    write_json_string_contents(output, value, written)?;
-                    "utf8"
-                }
-                Err(_) => {
-                    write_base64(output, bytes, written)?;
-                    "base64"
-                }
-            };
-            write_bytes(output, b"\"", written)?;
-            Some(encoding)
-        }
+        Some(bytes) => Some(match std::str::from_utf8(bytes) {
+            Ok(value) => {
+                write_json_string(output, value, written)?;
+                "utf8"
+            }
+            Err(_) => {
+                write_bytes(output, b"\"", written)?;
+                write_base64(output, bytes, written)?;
+                write_bytes(output, b"\"", written)?;
+                "base64"
+            }
+        }),
     };
     write_bytes(output, b",\"", written)?;
     write_bytes(output, name.as_bytes(), written)?;
@@ -465,58 +462,13 @@ fn write_bytes_fields(
 }
 
 fn write_json_string(output: &mut impl Write, value: &str, written: &mut usize) -> io::Result<()> {
-    write_bytes(output, b"\"", written)?;
-    write_json_string_contents(output, value, written)?;
-    write_bytes(output, b"\"", written)
-}
-
-fn write_json_string_contents(
-    output: &mut impl Write,
-    value: &str,
-    written: &mut usize,
-) -> io::Result<()> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = value.as_bytes();
-    let mut start = 0;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        let escaped = match byte {
-            b'"' => Some(b"\\\"".as_slice()),
-            b'\\' => Some(b"\\\\".as_slice()),
-            b'\x08' => Some(b"\\b".as_slice()),
-            b'\x0c' => Some(b"\\f".as_slice()),
-            b'\n' => Some(b"\\n".as_slice()),
-            b'\r' => Some(b"\\r".as_slice()),
-            b'\t' => Some(b"\\t".as_slice()),
-            0..=0x1f => {
-                if start != index {
-                    write_bytes(output, &bytes[start..index], written)?;
-                }
-                write_bytes(
-                    output,
-                    &[
-                        b'\\',
-                        b'u',
-                        b'0',
-                        b'0',
-                        HEX[(byte >> 4) as usize],
-                        HEX[(byte & 15) as usize],
-                    ],
-                    written,
-                )?;
-                start = index + 1;
-                None
-            }
-            _ => None,
-        };
-        if let Some(escaped) = escaped {
-            if start != index {
-                write_bytes(output, &bytes[start..index], written)?;
-            }
-            write_bytes(output, escaped, written)?;
-            start = index + 1;
+    // The generic simd-json error conversion loses the original I/O error kind.
+    simd_json::to_writer(CountingWriter { output, written }, value).map_err(|error| {
+        match error.error() {
+            simd_json::ErrorType::Io(error) => io::Error::new(error.kind(), error.to_string()),
+            _ => io::Error::other(error),
         }
-    }
-    write_bytes(output, &bytes[start..], written)
+    })
 }
 
 fn write_base64(output: &mut impl Write, input: &[u8], written: &mut usize) -> io::Result<()> {
@@ -665,6 +617,46 @@ mod tests {
             br#"{"topic":"events","partition":3,"offset":42,"timestamp":null,"timestampType":null,"key":null,"keyEncoding":null,"keyLength":-1,"headers":[],"action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":12}
 "#
         );
+    }
+
+    #[test]
+    fn json_strings_preserve_control_characters_and_long_unicode_spans() {
+        let controls = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\"\\/é🎉";
+        let escaped = r#"\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f\"\\/é🎉"#;
+        for prefix in [String::new(), "é".repeat(31), "data".repeat(2048)] {
+            let mut output = Vec::new();
+            let mut written = 0;
+            write_json_string(
+                &mut output,
+                &format!("{prefix}{controls}{prefix}"),
+                &mut written,
+            )
+            .unwrap();
+            assert_eq!(output, format!("\"{prefix}{escaped}{prefix}\"").as_bytes());
+            assert_eq!(written, output.len());
+        }
+    }
+
+    #[test]
+    fn json_string_writes_preserve_io_errors() {
+        struct FailedWriter(io::ErrorKind);
+        impl Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "sink failed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::Other,
+        ] {
+            let error = write_json_string(&mut FailedWriter(kind), "value", &mut 0).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "sink failed");
+        }
     }
 
     #[test]
