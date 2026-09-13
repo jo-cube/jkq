@@ -11,13 +11,16 @@ pub(super) enum TapeResult {
     Drop,
     Tombstone,
     Pass,
-    Fallback(JValue),
+    Fallback {
+        document: JValue,
+        completed_predicates: usize,
+    },
     Survivor(JValue),
 }
 
 pub(super) struct TapePlan {
-    drops: Vec<Predicate>,
-    tombstones: Vec<Predicate>,
+    drops: Vec<Option<Predicate>>,
+    tombstones: Vec<Option<Predicate>>,
     needs_document: bool,
     scratch: RefCell<Scratch>,
 }
@@ -34,15 +37,24 @@ impl TapePlan {
         if needs_document && drops.is_empty() && tombstones.is_empty() {
             return None;
         }
+        let drops: Vec<_> = drops
+            .iter()
+            .map(|expression| Predicate::compile(expression, variables))
+            .collect();
+        let tombstones: Vec<_> = tombstones
+            .iter()
+            .map(|expression| Predicate::compile(expression, variables))
+            .collect();
+        if drops
+            .first()
+            .or(tombstones.first())
+            .is_some_and(Option::is_none)
+        {
+            return None;
+        }
         Some(Self {
-            drops: drops
-                .iter()
-                .map(|expression| Predicate::compile(expression, variables))
-                .collect::<Option<_>>()?,
-            tombstones: tombstones
-                .iter()
-                .map(|expression| Predicate::compile(expression, variables))
-                .collect::<Option<_>>()?,
+            drops,
+            tombstones,
             needs_document,
             scratch: RefCell::new(Scratch::default()),
         })
@@ -61,32 +73,48 @@ impl TapePlan {
         if parsed {
             // Deserialization consumes the tape without copying or parsing the source again.
             return match self.evaluate(tape.as_value()) {
-                Some(TapeResult::Pass) if self.needs_document => {
+                Ok(TapeResult::Pass) if self.needs_document => {
                     tape.deserialize().ok().map(TapeResult::Survivor)
                 }
-                Some(action) => {
+                Ok(action) => {
                     scratch.tape = Some(tape.reset());
                     Some(action)
                 }
-                None => tape.deserialize().ok().map(TapeResult::Fallback),
+                Err(completed_predicates) => {
+                    tape.deserialize()
+                        .ok()
+                        .map(|document| TapeResult::Fallback {
+                            document,
+                            completed_predicates,
+                        })
+                }
             };
         }
         scratch.tape = Some(tape.reset());
         None
     }
 
-    fn evaluate(&self, document: Value<'_, '_>) -> Option<TapeResult> {
-        for predicate in &self.drops {
-            if predicate.evaluate(document)? {
-                return Some(TapeResult::Drop);
+    // Err identifies the first unresolved predicate, counting drops before tombstones.
+    fn evaluate(&self, document: Value<'_, '_>) -> Result<TapeResult, usize> {
+        for (index, predicate) in self.drops.iter().enumerate() {
+            if predicate
+                .as_ref()
+                .and_then(|predicate| predicate.evaluate(document))
+                .ok_or(index)?
+            {
+                return Ok(TapeResult::Drop);
             }
         }
-        for predicate in &self.tombstones {
-            if predicate.evaluate(document)? {
-                return Some(TapeResult::Tombstone);
+        for (index, predicate) in self.tombstones.iter().enumerate() {
+            if predicate
+                .as_ref()
+                .and_then(|predicate| predicate.evaluate(document))
+                .ok_or(self.drops.len() + index)?
+            {
+                return Ok(TapeResult::Tombstone);
             }
         }
-        Some(TapeResult::Pass)
+        Ok(TapeResult::Pass)
     }
 }
 
