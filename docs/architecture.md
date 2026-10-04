@@ -110,7 +110,11 @@ JSONata ASTs and `$vars` value because jsonata-core values use `Rc` and are not
 When action predicates begin with supported scalar operations, the worker
 evaluates that prefix directly on a validated simd-json tape. The supported
 subset is Boolean literals, plain input paths, scalar literals and scalar
-`$vars` paths, comparisons, and `and`/`or`.
+`$vars` paths, comparisons, and `and`/`or`. Object `$lookup` calls into
+`$vars` also use this path when the key is a string or a concatenation of
+strings and the result is scalar. Lookup objects reuse the worker-local
+variable tree; non-string keys or components, array paths, and container
+results fall back to native evaluation.
 Parser scratch and tape allocation are reused by that worker. Because simd-json
 unescapes strings in place, parsing uses a worker-local copy and leaves source
 bytes untouched for an eventual pass action.
@@ -123,9 +127,9 @@ without repeating predicates. This consumes the tape allocation; the next
 record allocates a new tape while still reusing input and parser scratch buffers.
 
 The tape evaluator declines predicates or record shapes that need full JSONata
-semantics, including functions, path filters, container comparisons, and
-array-mapped paths. On the first unsupported predicate or record shape, the
-worker deserializes the existing tape and resumes JSONata evaluation at that
+semantics, including other function calls, assignments, path filters,
+container comparisons, and array-mapped paths. On the first unsupported
+predicate or record shape, the worker deserializes the existing tape and resumes JSONata evaluation at that
 predicate. Completed scalar predicates are not repeated. This avoids another
 source copy, parse, and evaluation of the prefix while preserving predicate
 order and error locations.

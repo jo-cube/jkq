@@ -774,6 +774,137 @@ mod tests {
     }
 
     #[test]
+    fn tape_lookup_matches_native_for_string_keys_and_scalar_results() {
+        let variables = r#"{"rules":{"acme:42":true,"a:b:c:d":true,"acme:é":false,"":null,"number":3,"text":"yes"}}"#;
+        for (expression, input, expected) in [
+            (
+                r#"$lookup($vars.rules, tenant & ":" & account) = true"#,
+                r#"{"tenant":"acme","account":"42"}"#,
+                TapeResult::Tombstone,
+            ),
+            (
+                r#"$lookup($vars.rules, tenant & ":" & account) = true"#,
+                r#"{"tenant":"acme","account":"missing"}"#,
+                TapeResult::Pass,
+            ),
+            (
+                r#"$lookup($vars.rules, tenant & ":" & account) = false"#,
+                r#"{"tenant":"acme","account":"42","account":"\u00e9"}"#,
+                TapeResult::Tombstone,
+            ),
+            (
+                r#"$lookup($vars.rules, (a & ":" & b) & ":" & c & ":" & d) = true"#,
+                r#"{"a":"a","b":"b","c":"c","d":"d"}"#,
+                TapeResult::Tombstone,
+            ),
+            (
+                r#"$lookup($vars.rules, key) = null"#,
+                r#"{"key":""}"#,
+                TapeResult::Tombstone,
+            ),
+            (
+                r#"$lookup($vars.rules, key) = null"#,
+                r#"{"key":"absent"}"#,
+                TapeResult::Tombstone,
+            ),
+            (
+                r#"$lookup($vars.rules, key) >= 3"#,
+                r#"{"key":"number"}"#,
+                TapeResult::Tombstone,
+            ),
+            (
+                r#"$lookup($vars.rules, key) = "yes""#,
+                r#"{"key":"text"}"#,
+                TapeResult::Tombstone,
+            ),
+            (
+                r#"$lookup($vars, "absent") != true"#,
+                r#"{}"#,
+                TapeResult::Tombstone,
+            ),
+        ] {
+            let transform = plan(&[], &[expression], None, Some(variables), false);
+            let worker = Worker::new(&transform, false);
+            assert_eq!(
+                worker
+                    .tape
+                    .as_ref()
+                    .and_then(|tape| tape.execute(input.as_bytes())),
+                Some(expected),
+                "{expression}"
+            );
+            assert_eq!(
+                worker.execute_report(Some(input.as_bytes().to_vec()), FAIL),
+                worker.execute_jsonata(input.as_bytes().to_vec(), FAIL),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn tape_lookup_fallback_preserves_native_semantics_and_survivors() {
+        let variables = r#"{"rules":{"acme:42":true,"acme:":false,"acme:null":[true],"acme:object":{"value":true}}}"#;
+        let expression = r#"$lookup($vars.rules, tenant & ":" & account) = true"#;
+        for (projection, embeds_json) in [(None, false), (Some("$$.id"), false), (None, true)] {
+            let transform = plan(
+                &["skip = true"],
+                &[expression],
+                projection,
+                Some(variables),
+                false,
+            );
+            let worker = Worker::new(&transform, embeds_json);
+            for input in [
+                r#"{ "id":1,"tenant":"acme","account":"42" }"#,
+                r#"{ "id":2,"tenant":"acme","account":"other" }"#,
+                r#"{"id":3,"tenant":"acme","account":42}"#,
+                r#"{"id":4,"tenant":"acme","account":null}"#,
+                r#"{"id":5,"tenant":"acme"}"#,
+                r#"{"id":6,"tenant":["acme"],"account":["42"]}"#,
+                r#"{"id":7,"tenant":"acme","account":"object"}"#,
+                r#"{"skip":true,"tenant":[],"account":{}}"#,
+                r#"{"tenant":"acme","account":"42","invalid":}"#,
+            ] {
+                assert_eq!(
+                    worker.execute_report(Some(input.as_bytes().to_vec()), FAIL),
+                    worker.execute_jsonata(input.as_bytes().to_vec(), FAIL),
+                    "{input}"
+                );
+            }
+        }
+        for expression in [
+            r#"$lookup($vars.rules, key) = true"#,
+            r#"$lookup($vars.rules, key)"#,
+            r#"$lookup($vars.rules) = true"#,
+            r#"$lookup($vars.rules.missing, key) = true"#,
+            r#"$lookup([ $vars.rules ], key) = true"#,
+            r#"($lookup := function($o, $k) { false }; $lookup($vars.rules, key) = true)"#,
+        ] {
+            let transform = plan(&[], &[expression], None, Some(variables), false);
+            let worker = Worker::new(&transform, false);
+            for input in [
+                r#"{"key":"acme:42"}"#,
+                r#"{"key":42}"#,
+                r#"{"key":["acme:42"]}"#,
+                r#"{}"#,
+            ] {
+                for evaluation in [
+                    EvaluationPolicy::Fail,
+                    EvaluationPolicy::Drop,
+                    EvaluationPolicy::Tombstone,
+                ] {
+                    let policies = ErrorPolicies { evaluation, ..FAIL };
+                    assert_eq!(
+                        worker.execute_report(Some(input.as_bytes().to_vec()), policies),
+                        worker.execute_jsonata(input.as_bytes().to_vec(), policies),
+                        "{expression}: {input}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tape_scalar_prefix_preserves_native_predicate_order_and_errors() {
         for (drops, tombstones, expected, completed_predicates) in [
             (

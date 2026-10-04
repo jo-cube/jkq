@@ -211,6 +211,7 @@ impl Predicate {
 enum Operand {
     Input(Vec<String>),
     Literal(Literal),
+    Lookup { object: JValue, key: Vec<Self> },
 }
 
 impl Operand {
@@ -221,6 +222,19 @@ impl Operand {
             AstNode::Boolean(value) => Some(Self::Literal(Literal::Boolean(*value))),
             AstNode::Null => Some(Self::Literal(Literal::Null)),
             AstNode::Path { steps } => path_operand(steps, variables),
+            AstNode::Block(expressions) if expressions.len() == 1 => {
+                Self::compile(&expressions[0], variables)
+            }
+            AstNode::Function {
+                name,
+                args,
+                is_builtin: true,
+            } if name == "lookup" && args.len() == 2 => {
+                let object = variable_object(&args[0], variables?)?.clone();
+                let mut key = Vec::new();
+                key_parts(&args[1], variables, &mut key)?;
+                Some(Self::Lookup { object, key })
+            }
             AstNode::Variable(name) if name.is_empty() => Some(Self::Input(Vec::new())),
             _ => None,
         }
@@ -230,8 +244,72 @@ impl Operand {
         match self {
             Self::Input(path) => value_at(document, path),
             Self::Literal(value) => Some(value.as_scalar()),
+            Self::Lookup { object, key } => {
+                let mut joined = String::new();
+                for part in key {
+                    let Scalar::String(value) = part.value(document)? else {
+                        return None;
+                    };
+                    joined.push_str(value);
+                }
+                // jsonata-core's object lookup returns null for a missing key.
+                match object.get(&joined).unwrap_or(&JValue::Null) {
+                    JValue::Null => Some(Scalar::Null),
+                    JValue::Bool(value) => Some(Scalar::Boolean(*value)),
+                    JValue::Number(value) => Some(Scalar::Number(*value)),
+                    JValue::String(value) => Some(Scalar::String(value)),
+                    _ => None,
+                }
+            }
         }
     }
+}
+
+fn key_parts(
+    expression: &AstNode,
+    variables: Option<&JValue>,
+    parts: &mut Vec<Operand>,
+) -> Option<()> {
+    match expression {
+        AstNode::Binary {
+            op: BinaryOp::Concatenate,
+            lhs,
+            rhs,
+        } => {
+            key_parts(lhs, variables, parts)?;
+            key_parts(rhs, variables, parts)
+        }
+        AstNode::Block(expressions) if expressions.len() == 1 => {
+            key_parts(&expressions[0], variables, parts)
+        }
+        _ => {
+            parts.push(Operand::compile(expression, variables)?);
+            Some(())
+        }
+    }
+}
+
+fn variable_object<'a>(expression: &AstNode, variables: &'a JValue) -> Option<&'a JValue> {
+    let mut value = variables;
+    match expression {
+        AstNode::Variable(name) if name == "vars" => {}
+        AstNode::Path { steps } => {
+            let (first, rest) = steps.split_first()?;
+            if !matches!(&first.node, AstNode::Variable(name) if name == "vars")
+                || !plain_step(first)
+            {
+                return None;
+            }
+            for name in names(rest)? {
+                if !matches!(value, JValue::Object(_)) {
+                    return None;
+                }
+                value = value.get(&name)?;
+            }
+        }
+        _ => return None,
+    }
+    matches!(value, JValue::Object(_)).then_some(value)
 }
 
 enum Literal {

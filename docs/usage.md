@@ -452,6 +452,18 @@ An initial sequence of supported scalar predicates retains this optimization
 even when later predicates need full JSONata evaluation. Treat this as an
 optimization, not a reason to make an equivalent predicate harder to understand.
 
+The same optimization supports object lookups into `$vars` with string keys,
+including concatenated string attributes:
+
+```sh
+--tombstone-if '$lookup($vars.blacklist, tenant & ":" & account) = true'
+```
+
+Keys may combine more than two string attributes. Non-string components,
+array-mapped paths, and container-valued lookup results use native JSONata
+instead. Blocks with assignments and other function calls also retain native
+evaluation. This does not change expression results or error policies.
+
 When only selected metadata must be included in the payload, use
 [`--payload-format`](#payload-formatting) instead of a complete JSON envelope.
 The final format can then frame the exact generated payload length.
