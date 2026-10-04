@@ -11,7 +11,9 @@ On the 16 GiB LZ4 scan, changing only this property increased median throughput
 by 51% with four consumers and 3.4 times with eight. This is workload dependent:
 Zstandard decoding limited the slower workload, where the property was neutral.
 No batch adapter, separate partition queues, payload pool, or sharding feature
-was retained.
+was retained in this initial investigation. The subsequent
+[bounded range-sharding milestone](kafka-range-sharding.md) implements and
+measures opt-in unordered subranges.
 
 ## Environment and method
 

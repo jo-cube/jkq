@@ -36,8 +36,32 @@ or commit offsets; a configured `group.id` is only passed to librdkafka.
 
 `--consumers <n>` distributes the selected partitions round-robin across up to
 `n` directly assigned Kafka consumers. The default is one, values must be
-between 1 and 128, and jkq never creates more consumers than assigned
-partitions. Each partition remains owned by one consumer for the complete run.
+between 1 and 128. By default, jkq never creates more consumers than assigned
+partitions, and each partition has one consumer for the complete run.
+
+For bounded scans with too few partitions to use the requested consumers,
+`--range-sharding` splits each partition's offset interval into disjoint
+half-open subranges. It requires `--unordered` and `--snapshot` or a fixed end
+boundary. Ordered runs retain their existing behavior.
+
+```sh
+jkq -b localhost:9092 -t events -p 0 --snapshot \
+  --range-sharding --unordered --consumers 4 -f '%p:%o:%s\n'
+```
+
+The total consumer count is at most `--consumers`. Extra consumers are divided
+as evenly as possible across the selected partitions, then each interval is
+split numerically. Small or empty ranges and the per-partition admission limit
+can reduce that count. Offset gaps from compaction are allowed; shards may
+have unequal amounts of work. Each retained record belongs to exactly one
+subrange, but records from different subranges may appear in any order.
+
+Sharded boundaries must already lie within the startup watermarks; a future
+end is rejected. `--count-per-partition` is unsupported with range sharding.
+`-c` still caps admitted records globally, selecting an unordered subset of the
+ranges. Sharding adds independent Kafka clients and can increase broker load
+and native prefetch memory. Measure two or four consumers first; more is not
+always faster. See the [range-sharding measurements](kafka-range-sharding.md).
 
 The default start is `beginning`. `-o, --offset` accepts:
 
@@ -333,10 +357,12 @@ prefetch properties retain librdkafka's defaults unless supplied explicitly.
 
 ## Parallelism and Memory
 
-`--consumers <n>` controls Kafka polling parallelism across partitions. Each
-active consumer has its own poller thread and direct partition assignment.
-Use more than one only when multiple partitions are selected; it cannot
-parallelize a single partition.
+`--consumers <n>` controls Kafka polling parallelism across partitions, or
+across bounded subranges with `--range-sharding`. Each active consumer has its
+own poller thread and direct partition assignment.
+Without range sharding, extra consumers help only when multiple partitions
+are selected. With range sharding, each consumer has its own fetch,
+decompression, and native prefetch queue, even for one source partition.
 
 `-j, --jobs` controls JSON compute workers. The default is available CPU
 parallelism minus two, with a minimum of one. Identity transforms bypass the
@@ -362,7 +388,9 @@ expressions and are outside this source-byte budget.
 
 All three limits must be positive. `--max-inflight-per-partition` cannot exceed
 `--max-inflight-records`. Global record and byte limits apply across all Kafka
-consumers, while the per-partition limit remains local to each partition.
+consumers, while the per-partition limit bounds each partition. With range
+sharding, that limit is divided into fixed allowances across its subranges;
+their sum never exceeds the original limit. A small limit therefore caps shard concurrency.
 
 A source record larger than the byte budget may run alone. When admission
 limits are reached, the affected poller stops requesting records from its

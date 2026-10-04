@@ -114,6 +114,9 @@ pub struct RawCli {
     /// Number of Kafka consumers
     #[arg(long, default_value_t = 1)]
     consumers: usize,
+    /// Split bounded partition ranges across consumers; requires --unordered
+    #[arg(long)]
+    range_sharding: bool,
     /// Emit records in completion order
     #[arg(long)]
     unordered: bool,
@@ -218,6 +221,7 @@ pub struct RuntimeConfig {
     pub exit_at_end: bool,
     pub jobs: usize,
     pub consumers: usize,
+    pub range_sharding: bool,
     pub unordered: bool,
     pub limits: RuntimeLimits,
     pub transform: TransformPlan,
@@ -312,6 +316,22 @@ impl RawCli {
             explicit_end
         };
 
+        if self.range_sharding {
+            if !self.unordered {
+                return Err("--range-sharding requires --unordered".to_owned());
+            }
+            if end.is_none() {
+                return Err(
+                    "--range-sharding requires --snapshot or a fixed end boundary".to_owned(),
+                );
+            }
+            if self.count_per_partition.is_some() {
+                return Err(
+                    "--range-sharding cannot be combined with --count-per-partition".to_owned(),
+                );
+            }
+        }
+
         let envelope_payload = self.envelope_payload;
         if envelope_payload == EnvelopePayload::Value
             && self.on_invalid_json == Some(RawInvalidJsonPolicy::Pass)
@@ -403,6 +423,7 @@ impl RawCli {
             count_per_partition: self.count_per_partition,
             jobs,
             consumers: self.consumers,
+            range_sharding: self.range_sharding,
             unordered: self.unordered,
             limits: RuntimeLimits {
                 max_inflight_records: self.max_inflight_records,
@@ -659,6 +680,57 @@ mod tests {
         let config =
             resolve(&["jkq", "-b", "localhost", "-t", "events", "--consumers", "3"]).unwrap();
         assert_eq!(config.consumers, 3);
+    }
+
+    #[test]
+    fn range_sharding_requires_unordered_fixed_bounds_and_no_partition_count() {
+        let base = ["jkq", "-b", "x", "-t", "events", "--range-sharding"];
+        for (extra, expected) in [
+            (vec!["--snapshot"], "requires --unordered"),
+            (vec!["--unordered", "-e"], "fixed end boundary"),
+            (
+                vec!["--unordered", "--snapshot", "--count-per-partition", "1"],
+                "cannot be combined",
+            ),
+        ] {
+            assert!(
+                resolve(&[base.as_slice(), extra.as_slice()].concat())
+                    .unwrap_err()
+                    .contains(expected)
+            );
+        }
+        for boundary in [
+            vec!["--snapshot"],
+            vec!["--end-offset", "100"],
+            vec!["-o", "e@1000"],
+        ] {
+            let config = resolve(
+                &[
+                    base.as_slice(),
+                    &["--unordered", "--consumers", "4"],
+                    boundary.as_slice(),
+                ]
+                .concat(),
+            )
+            .unwrap();
+            assert!(config.range_sharding);
+            assert!(config.exit_at_end);
+        }
+        assert!(
+            !resolve(&[
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "events",
+                "--unordered",
+                "--snapshot",
+                "--consumers",
+                "4"
+            ])
+            .unwrap()
+            .range_sharding
+        );
     }
 
     #[test]

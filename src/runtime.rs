@@ -624,7 +624,7 @@ fn poll_loop(
     first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> Option<i32> {
     let partitions = input.assigned_partitions();
-    let mut admission = Admission::new(&partitions, config.limits.max_inflight_per_partition);
+    let mut admission = Admission::new(&partitions, input.max_inflight_per_partition());
     let mut dispatcher = Some(dispatcher);
     let mut pending: Option<OwnedRecord> = None;
     let mut stopping = false;

@@ -27,9 +27,21 @@ pub struct OwnedRecord {
     pub retained_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PartitionRange {
+    partition: i32,
+    start: Offset,
+    end_exclusive: Option<i64>,
+}
+
+struct ConsumerAssignment {
+    ranges: Vec<PartitionRange>,
+    max_inflight_per_partition: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PartitionState {
-    end_exclusive: Option<i64>,
+    range: PartitionRange,
     done: bool,
 }
 
@@ -44,6 +56,7 @@ pub struct KafkaInput {
     topic: String,
     partitions: BTreeMap<i32, PartitionState>,
     remaining_partitions: usize,
+    max_inflight_per_partition: usize,
     requirements: OutputRequirements,
     exit_at_end: bool,
     error_policy: KafkaErrorPolicy,
@@ -57,9 +70,10 @@ impl KafkaInput {
             Some(partitions) => partitions.clone(),
             None => fetch_topic_partitions(&consumer, &config.topic)?,
         };
-        let watermarks = watermarks_required(&config.start, config.end.as_ref())
-            .then(|| fetch_watermarks(&consumer, &config.topic, &partitions))
-            .transpose()?;
+        let watermarks = (config.range_sharding
+            || watermarks_required(&config.start, config.end.as_ref()))
+        .then(|| fetch_watermarks(&consumer, &config.topic, &partitions))
+        .transpose()?;
         let timestamp_starts = match config.start {
             StartPosition::TimestampMillis(timestamp) => Some(offsets_for_timestamp(
                 &consumer,
@@ -131,63 +145,77 @@ impl KafkaInput {
             None => None,
         };
 
-        let partition_shards = shard_partitions(&partitions, config.consumers);
-        let mut consumers = Vec::with_capacity(partition_shards.len());
+        let ranges = partitions
+            .iter()
+            .map(|partition| PartitionRange {
+                partition: *partition,
+                start: starts[partition],
+                end_exclusive: fixed_ends.as_ref().map(|ends| ends[partition]),
+            })
+            .collect::<Vec<_>>();
+        if config.range_sharding {
+            for range in &ranges {
+                let (low, high) =
+                    watermarks.as_ref().expect("sharding needs watermarks")[&range.partition];
+                let (Offset::Offset(start), Some(end)) = (range.start, range.end_exclusive) else {
+                    return Err("range sharding requires resolved fixed boundaries".to_owned());
+                };
+                if end > high || (start < end && (start < low || start > high)) {
+                    return Err(format!(
+                        "cannot shard {} partition {} range [{start}, {end}): outside startup watermarks [{low}, {high})",
+                        config.topic, range.partition
+                    ));
+                }
+            }
+        }
+        let assignments = consumer_assignments(
+            &ranges,
+            config.consumers,
+            config.range_sharding,
+            config.limits.max_inflight_per_partition,
+        )?;
+        let mut consumers = Vec::with_capacity(assignments.len());
         consumers.push(consumer);
-        for _ in 1..partition_shards.len() {
+        for _ in 1..assignments.len() {
             consumers.push(create_consumer(config)?);
         }
-
         consumers
             .into_iter()
-            .zip(partition_shards)
-            .map(|(consumer, partitions)| {
-                Self::assign(config, consumer, &partitions, &starts, fixed_ends.as_ref())
-            })
+            .zip(assignments)
+            .map(|(consumer, assignment)| Self::assign(config, consumer, assignment))
             .collect()
     }
 
     fn assign(
         config: &RuntimeConfig,
         consumer: BaseConsumer,
-        assigned: &[i32],
-        starts: &BTreeMap<i32, Offset>,
-        fixed_ends: Option<&BTreeMap<i32, i64>>,
+        assignment: ConsumerAssignment,
     ) -> Result<Self, String> {
-        let mut assignment = TopicPartitionList::with_capacity(assigned.len());
-        for partition in assigned {
-            assignment
-                .add_partition_offset(&config.topic, *partition, starts[partition])
-                .map_err(|error| assignment_error(&config.topic, *partition, error))?;
+        let mut partitions = TopicPartitionList::with_capacity(assignment.ranges.len());
+        for range in &assignment.ranges {
+            partitions
+                .add_partition_offset(&config.topic, range.partition, range.start)
+                .map_err(|error| assignment_error(&config.topic, range.partition, error))?;
         }
         consumer
-            .assign(&assignment)
+            .assign(&partitions)
             .map_err(|error| format!("cannot assign topic {}: {error}", config.topic))?;
-        let partitions = assigned
-            .iter()
-            .map(|partition| {
-                let start = starts[partition];
-                let end_exclusive = fixed_ends.map(|boundaries| boundaries[partition]);
-                let done = match (start, end_exclusive) {
-                    (Offset::Offset(start), Some(end)) => start >= end,
-                    _ => false,
-                };
-                (
-                    *partition,
-                    PartitionState {
-                        end_exclusive,
-                        done,
-                    },
-                )
+        let partitions = assignment
+            .ranges
+            .into_iter()
+            .map(|range| {
+                let done = matches!((range.start, range.end_exclusive),
+                    (Offset::Offset(start), Some(end)) if start >= end);
+                (range.partition, PartitionState { range, done })
             })
             .collect::<BTreeMap<_, _>>();
         let remaining_partitions = partitions.values().filter(|state| !state.done).count();
-
         let input = Self {
             consumer,
             topic: config.topic.clone(),
             partitions,
             remaining_partitions,
+            max_inflight_per_partition: assignment.max_inflight_per_partition,
             requirements: config.output.requirements(),
             exit_at_end: config.exit_at_end,
             error_policy: config.kafka_error,
@@ -202,6 +230,10 @@ impl KafkaInput {
             input.pause(partition)?;
         }
         Ok(input)
+    }
+
+    pub(crate) fn max_inflight_per_partition(&self) -> usize {
+        self.max_inflight_per_partition
     }
 
     pub(crate) fn assigned_partitions(&self) -> Vec<i32> {
@@ -251,6 +283,7 @@ impl KafkaInput {
             return Ok(PollEvent::Idle);
         }
         if state
+            .range
             .end_exclusive
             .is_some_and(|end| message.offset() >= end)
         {
@@ -259,6 +292,9 @@ impl KafkaInput {
             return Ok(PollEvent::Idle);
         }
 
+        if matches!(state.range.start, Offset::Offset(start) if message.offset() < start) {
+            return Ok(PollEvent::Idle);
+        }
         let retained_bytes = retained_bytes(&message, self.requirements)?;
         let record = OwnedRecord {
             partition,
@@ -296,7 +332,7 @@ impl KafkaInput {
         let Some(state) = self.partitions.get(&partition).copied() else {
             return Ok(());
         };
-        let should_finish = match state.end_exclusive {
+        let should_finish = match state.range.end_exclusive {
             Some(end) => {
                 self.consumer
                     .fetch_watermarks(&self.topic, partition, METADATA_TIMEOUT)
@@ -342,13 +378,57 @@ impl KafkaInput {
     }
 }
 
-fn shard_partitions(partitions: &[i32], consumer_count: usize) -> Vec<Vec<i32>> {
-    let shard_count = consumer_count.min(partitions.len());
-    let mut shards = vec![Vec::new(); shard_count];
-    for (index, partition) in partitions.iter().enumerate() {
-        shards[index % shard_count].push(*partition);
+fn consumer_assignments(
+    ranges: &[PartitionRange],
+    consumers: usize,
+    range_sharding: bool,
+    max_inflight_per_partition: usize,
+) -> Result<Vec<ConsumerAssignment>, String> {
+    if !range_sharding || consumers <= ranges.len() {
+        let mut assignments = (0..consumers.min(ranges.len()))
+            .map(|_| ConsumerAssignment {
+                ranges: Vec::new(),
+                max_inflight_per_partition,
+            })
+            .collect::<Vec<_>>();
+        for (index, range) in ranges.iter().enumerate() {
+            let consumer = index % assignments.len();
+            assignments[consumer].ranges.push(*range);
+        }
+        return Ok(assignments);
     }
-    shards
+    let mut assignments = Vec::new();
+    for (index, range) in ranges.iter().enumerate() {
+        let (Offset::Offset(start), Some(end)) = (range.start, range.end_exclusive) else {
+            return Err("range sharding requires resolved fixed boundaries".to_owned());
+        };
+        let width = end.saturating_sub(start).max(0);
+        let requested = consumers / ranges.len() + usize::from(index < consumers % ranges.len());
+        let count = requested
+            .min(usize::try_from(width).unwrap_or(usize::MAX).max(1))
+            .min(max_inflight_per_partition);
+        let divisor =
+            i64::try_from(count).map_err(|_| "range shard count exceeds i64".to_owned())?;
+        let mut next = start;
+        for shard in 0..divisor {
+            let shard_end = if width == 0 {
+                end
+            } else {
+                next + width / divisor + i64::from(shard < width % divisor)
+            };
+            assignments.push(ConsumerAssignment {
+                ranges: vec![PartitionRange {
+                    partition: range.partition,
+                    start: Offset::Offset(next),
+                    end_exclusive: Some(shard_end),
+                }],
+                // Static allowances sum to at most the original partition budget.
+                max_inflight_per_partition: max_inflight_per_partition / count,
+            });
+            next = shard_end;
+        }
+    }
+    Ok(assignments)
 }
 
 fn retained_bytes(
@@ -570,13 +650,83 @@ mod tests {
         }
     }
 
+    fn range(partition: i32, start: i64, end: i64) -> PartitionRange {
+        PartitionRange {
+            partition,
+            start: Offset::Offset(start),
+            end_exclusive: Some(end),
+        }
+    }
+
     #[test]
     fn partitions_are_distributed_across_available_consumers() {
-        assert_eq!(
-            shard_partitions(&[0, 1, 2, 3, 4, 5], 4),
-            [vec![0, 4], vec![1, 5], vec![2], vec![3]]
-        );
-        assert_eq!(shard_partitions(&[0, 1], 4), [vec![0], vec![1]]);
+        let ranges = [range(0, 0, 100), range(1, 0, 100), range(2, 0, 100)];
+        for (count, expected) in [
+            (1, vec![vec![0, 1, 2]]),
+            (2, vec![vec![0, 2], vec![1]]),
+            (8, vec![vec![0], vec![1], vec![2]]),
+        ] {
+            let assignments = consumer_assignments(&ranges, count, false, 8).unwrap();
+            assert_eq!(
+                assignments
+                    .iter()
+                    .map(|a| a.ranges.iter().map(|r| r.partition).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                assignments
+                    .iter()
+                    .all(|a| a.max_inflight_per_partition == 8)
+            );
+        }
+    }
+
+    #[test]
+    fn range_shards_are_disjoint_half_open_and_share_the_partition_budget() {
+        for (start, end, consumers, limit) in [
+            (10, 21, 4, 10),
+            (0, 2, 8, 8),
+            (100, 100, 8, 8),
+            (100, 99, 8, 8),
+            (i64::MAX - 10, i64::MAX, 8, 8),
+            (0, 100, 8, 2),
+        ] {
+            let assignments =
+                consumer_assignments(&[range(3, start, end)], consumers, true, limit).unwrap();
+            let mut next = start;
+            for assignment in &assignments {
+                let shard = assignment.ranges[0];
+                assert_eq!(shard.partition, 3);
+                assert_eq!(shard.start, Offset::Offset(next));
+                next = shard.end_exclusive.unwrap();
+                assert!(assignment.max_inflight_per_partition > 0);
+            }
+            assert_eq!(next, end);
+            assert!(
+                assignments
+                    .iter()
+                    .map(|a| a.max_inflight_per_partition)
+                    .sum::<usize>()
+                    <= limit
+            );
+            for offset in [start, start.saturating_add(1), end.saturating_sub(1), end] {
+                let owners = assignments.iter().filter(|a| matches!(a.ranges[0].start, Offset::Offset(s) if offset >= s && offset < a.ranges[0].end_exclusive.unwrap())).count();
+                assert_eq!(owners, usize::from(offset >= start && offset < end));
+            }
+        }
+        let assignments =
+            consumer_assignments(&[range(0, 0, 100), range(1, 10, 50)], 5, true, 8).unwrap();
+        assert_eq!(assignments.len(), 5);
+        for (partition, expected) in [(0, 3), (1, 2)] {
+            assert_eq!(
+                assignments
+                    .iter()
+                    .filter(|a| a.ranges[0].partition == partition)
+                    .count(),
+                expected
+            );
+        }
     }
 
     #[test]

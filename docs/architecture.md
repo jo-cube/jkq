@@ -9,7 +9,7 @@ inside compute workers.
 CLI and Kafka properties
 → startup expression and output plans
 → partition discovery, direct assignment, and offset resolution
-→ one or more Kafka pollers with disjoint partition assignments
+→ one or more Kafka pollers with disjoint partition or bounded range assignments
 → bounded record batches through compute workers
 → batched completions and per-partition ordering
 → one output writer
@@ -55,8 +55,28 @@ Before polling, `jkq`:
 6. fetches watermarks only for ranges that need them, resolves partition
    starts and ends, and captures snapshot highs in that same watermark pass;
 7. distributes partitions across the requested number of consumers and
-   assigns each partition directly to exactly one;
+   assigns each partition directly to exactly one, unless explicit unordered
+   range sharding divides its bounded interval across independent consumers;
 8. installs the bounded pipeline.
+
+With `--range-sharding`, startup resolves explicit `PartitionRange` values:
+a source partition, a start offset, and an exclusive end offset. Sharding is
+permitted only with `--unordered` and a fixed end. Startup watermarks reject
+unavailable starts and ends beyond the retained log. If the consumer count
+exceeds partition count, extra consumers are divided evenly across partitions;
+each interval is split numerically into contiguous, non-overlapping ranges.
+Each range has one owner, and one consumer never owns two ranges of the same
+partition. Small spans and admission allowances cap the number of shards.
+Without this option, assignment and partition ordering are unchanged.
+
+No shared sequence or output frontier is needed between shards because output
+is explicitly unordered. Source offsets and partition identities remain
+unchanged. A record at or above its exclusive end finishes that range; EOF
+uses the existing watermark check. Sparse offsets need no special handling:
+each visible record falls into exactly one half-open range. A compacted tail
+with no visible records completes at EOF. Snapshots capture their ends once
+before creating any shard clients; later appends cannot extend them. Concurrent
+retention/compaction can still remove records, as in an unsharded scan.
 
 A startup failure cannot produce partial record output. `--check` exits after
 local plan validation and does not create a consumer.
@@ -205,8 +225,12 @@ uses the cumulative counters.
 
 Shared atomic admission tracks global records and source bytes across all
 consumers. Each poller separately tracks its partition sequences and
-per-partition records. The byte charge covers owned bytes copied from the source
-record:
+per-partition records. Range sharding divides the configured per-partition
+limit into fixed local allowances whose sum is at most that limit. Global
+record and source-byte admission remain shared, and releases return to the
+range owner. `--count-per-partition` is rejected with sharding because local
+sequences count one range; the global count remains shared. The byte charge
+covers owned bytes copied from the source record:
 
 - payload;
 - key, when required;
