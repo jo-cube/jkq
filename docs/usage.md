@@ -324,6 +324,13 @@ above.
 
 There is no implicit configuration-file discovery.
 
+jkq sets `fetch.queue.backoff.ms=100` unless the property is supplied through
+`-F` or `-X`. This shortens the delay before a partition can fetch again after
+its prefetch queue crosses a threshold, avoiding long idle periods after the
+application drains that queue. Use `-X fetch.queue.backoff.ms=1000` for a longer
+retry interval, or measure nearby values for your workload. Other fetch and
+prefetch properties retain librdkafka's defaults unless supplied explicitly.
+
 ## Parallelism and Memory
 
 `--consumers <n>` controls Kafka polling parallelism across partitions. Each
@@ -487,10 +494,28 @@ when measurements show worker starvation or excessive retained memory.
 If large-record runs pause for roughly a second between bursts, inspect
 librdkafka's prefetch limits (`queued.min.messages` and
 `queued.max.messages.kbytes`) and `fetch.queue.backoff.ms`. The Kafka client
-waits 1000 ms by default after a fetch queue exceeds its threshold. Compare
-`-X fetch.queue.backoff.ms=10` on a bounded range; shorter backoffs may increase
-CPU use. These prefetch limits are separate from jkq's source-byte admission
-budget.
+uses the [configured queue backoff](#kafka-configuration) after a fetch queue
+exceeds its threshold. Compare nearby backoff values on a bounded range;
+shorter backoffs may increase CPU use. These prefetch limits are separate from
+jkq's source-byte admission budget.
+
+For ingestion measurements, omit expressions and use `-f ''` to remove stdout
+volume. Keep the offset range and Kafka properties fixed, then compare
+`--consumers 1`, `2`, `4`, and `8` when enough partitions are available. Each
+consumer has independent librdkafka fetch and decompression threads, queues,
+and broker connections. Prefetch memory therefore grows with consumer count.
+
+Larger `fetch.message.max.bytes` can reduce fetch overhead, but also increase
+prefetch memory and trigger queue backoff. Compare a nearby value such as
+`-X fetch.message.max.bytes=8388608` before making it permanent. Increasing
+`queued.max.messages.kbytes` alone does not help when fetch queues are empty.
+
+A short range ending exactly at the log high includes EOF watermark queries.
+Measure a range ending inside the retained log as well, so termination latency
+does not distort sustained ingestion throughput. `fetch.wait.max.ms` can delay
+those queries behind an outstanding empty fetch. See the
+[Kafka throughput investigation](kafka-throughput-investigation.md) for measured
+examples and the rejected polling experiments.
 
 ### Validate a bounded slice first
 

@@ -375,7 +375,14 @@ fn retained_bytes(
 }
 
 fn create_consumer(config: &RuntimeConfig) -> Result<BaseConsumer, String> {
+    consumer_config(config)
+        .create()
+        .map_err(client_creation_error)
+}
+
+fn consumer_config(config: &RuntimeConfig) -> ClientConfig {
     let mut client = ClientConfig::new();
+    client.set("fetch.queue.backoff.ms", "100");
     for (key, value) in &config.kafka_properties {
         client.set(key, value);
     }
@@ -387,7 +394,7 @@ fn create_consumer(config: &RuntimeConfig) -> Result<BaseConsumer, String> {
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("enable.partition.eof", "true");
-    client.create().map_err(client_creation_error)
+    client
 }
 
 fn client_creation_error(error: KafkaError) -> String {
@@ -537,6 +544,31 @@ fn watermark_error(topic: &str, partition: i32, error: KafkaError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_queue_backoff_default_preserves_explicit_overrides() {
+        use clap::Parser;
+
+        for (property, expected) in [
+            (None, "100"),
+            (Some("fetch.queue.backoff.ms=0"), "0"),
+            (Some("fetch.queue.backoff.ms=10"), "10"),
+            (Some("fetch.queue.backoff.ms=1000"), "1000"),
+        ] {
+            let mut arguments = vec!["jkq", "-b", "localhost:9092", "-t", "events"];
+            if let Some(property) = property {
+                arguments.extend(["-X", property]);
+            }
+            let config = crate::cli::RawCli::try_parse_from(arguments)
+                .unwrap()
+                .resolve()
+                .unwrap();
+            assert_eq!(
+                consumer_config(&config).get("fetch.queue.backoff.ms"),
+                Some(expected)
+            );
+        }
+    }
 
     #[test]
     fn partitions_are_distributed_across_available_consumers() {
