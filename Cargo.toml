@@ -11,4 +11,4 @@ crossbeam-channel = "0.5.16"
 jsonata-core = "=2.2.7"
 rdkafka = { version = "0.39.0", default-features = false, features = ["libz", "ssl-vendored", "zstd"] }
 signal-hook = "0.4.4"
-simd-json = "=0.17.3"
+simd-json = "=0.18.1"
