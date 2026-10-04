@@ -461,6 +461,190 @@ mod tests {
     }
 
     #[test]
+    fn range_sharding_preserves_boundaries_metadata_and_tombstones_under_backpressure() {
+        let fixture = Fixture::new("range-sharding", 2);
+        for partition in [0, 1] {
+            for offset in 0..12 {
+                let payload = format!("{{\"id\":{offset},\"pad\":\"{}\"}}", "x".repeat(512));
+                let value = match offset {
+                    3 => None,
+                    7 => Some(b"".as_slice()),
+                    _ => Some(payload.as_bytes()),
+                };
+                fixture.produce(
+                    partition,
+                    value,
+                    Some(b"key"),
+                    100 + offset,
+                    Some(OwnedHeaders::new().insert(KafkaHeader {
+                        key: "trace",
+                        value: Some(b"abc".as_slice()),
+                    })),
+                );
+            }
+        }
+        for processing in [
+            vec![],
+            vec!["--on-invalid-json", "pass"],
+            vec!["--project", "id", "--on-invalid-json", "pass"],
+        ] {
+            let base = [
+                "-o",
+                "2",
+                "--end-offset",
+                "11",
+                "--unordered",
+                "--max-inflight-records",
+                "4",
+                "--max-inflight-per-partition",
+                "2",
+                "--max-inflight-bytes",
+                "16",
+                "-j",
+                "2",
+                "-f",
+                "%p:%o:%T:%k:%h:%S:%s\\n",
+            ];
+            let config = fixture.config(&[base.as_slice(), processing.as_slice()].concat());
+            let sharded = fixture.config(
+                &[
+                    base.as_slice(),
+                    processing.as_slice(),
+                    &["--range-sharding", "--consumers", "8"],
+                ]
+                .concat(),
+            );
+            let inputs = KafkaInput::prepare(&sharded).unwrap();
+            assert_eq!(inputs.len(), 4); // Two admission slots per partition cap concurrency.
+            let mut actual = Vec::new();
+            let mut signals = SignalControl::install().unwrap();
+            consume(&sharded, inputs, &mut actual, &mut signals).unwrap();
+            let mut expected = Vec::new();
+            run_with_writer(&config, &mut expected).unwrap();
+            let sorted = |bytes: Vec<u8>| {
+                let mut lines = bytes
+                    .split(|b| *b == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(<[u8]>::to_vec)
+                    .collect::<Vec<_>>();
+                lines.sort_unstable();
+                lines
+            };
+            let actual = sorted(actual);
+            assert_eq!(actual.len(), 18);
+            assert_eq!(actual, sorted(expected));
+        }
+    }
+
+    #[test]
+    fn sharded_snapshot_excludes_later_records_and_global_count_is_shared() {
+        let fixture = Fixture::new("sharded-snapshot", 1);
+        for offset in 0..9 {
+            fixture.produce(0, Some(offset.to_string().as_bytes()), None, offset, None);
+        }
+        let config = fixture.config(&[
+            "--snapshot",
+            "--range-sharding",
+            "--unordered",
+            "--consumers",
+            "4",
+            "-f",
+            "%o\\n",
+        ]);
+        let inputs = KafkaInput::prepare(&config).unwrap();
+        assert_eq!(inputs.len(), 4);
+        fixture.produce(0, Some(b"later"), None, 100, None);
+        let mut output = Vec::new();
+        let mut signals = SignalControl::install().unwrap();
+        consume(&config, inputs, &mut output, &mut signals).unwrap();
+        let mut offsets = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|s| s.parse::<i64>().unwrap())
+            .collect::<Vec<_>>();
+        offsets.sort_unstable();
+        assert_eq!(offsets, (0..9).collect::<Vec<_>>());
+        let counted = fixture.config(&[
+            "--snapshot",
+            "--range-sharding",
+            "--unordered",
+            "--consumers",
+            "4",
+            "-c",
+            "5",
+            "-f",
+            "%o\\n",
+        ]);
+        let mut output = Vec::new();
+        run_with_writer(&counted, &mut output).unwrap();
+        let mut offsets = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets.len(), 5);
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), 5);
+    }
+
+    #[test]
+    fn a_sharded_transform_failure_stops_and_releases_other_ranges() {
+        let fixture = Fixture::new("sharded-failure", 1);
+        for payload in [b"{}".as_slice(), b"invalid", b"{}", b"{}"] {
+            fixture.produce(0, Some(payload), None, 0, None);
+        }
+        let config = fixture.config(&[
+            "--snapshot",
+            "--range-sharding",
+            "--unordered",
+            "--consumers",
+            "4",
+            "--on-invalid-json",
+            "fail",
+            "--max-inflight-records",
+            "4",
+            "--max-inflight-per-partition",
+            "4",
+            "--max-inflight-bytes",
+            "2",
+        ]);
+        let error = run_with_writer(&config, Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("partition 0 offset 1"), "{error}");
+    }
+
+    #[test]
+    fn range_sharding_handles_empty_snapshots_and_rejects_future_boundaries() {
+        let fixture = Fixture::new("empty-shards", 1);
+        let empty = fixture.config(&[
+            "--snapshot",
+            "--range-sharding",
+            "--unordered",
+            "--consumers",
+            "8",
+        ]);
+        let mut output = Vec::new();
+        run_with_writer(&empty, &mut output).unwrap();
+        assert!(output.is_empty());
+        let future = fixture.config(&[
+            "--end-offset",
+            "10",
+            "--range-sharding",
+            "--unordered",
+            "--consumers",
+            "4",
+        ]);
+        assert!(
+            KafkaInput::prepare(&future)
+                .err()
+                .unwrap()
+                .contains("outside startup watermarks")
+        );
+    }
+
+    #[test]
     fn jsonata_projection_runs_through_the_mock_kafka_pipeline() {
         let fixture = Fixture::new("jsonata-pipeline", 1);
         fixture.produce(0, Some(b"{}"), None, 0, None);

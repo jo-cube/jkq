@@ -36,8 +36,32 @@ or commit offsets; a configured `group.id` is only passed to librdkafka.
 
 `--consumers <n>` distributes the selected partitions round-robin across up to
 `n` directly assigned Kafka consumers. The default is one, values must be
-between 1 and 128, and jkq never creates more consumers than assigned
-partitions. Each partition remains owned by one consumer for the complete run.
+between 1 and 128. By default, jkq never creates more consumers than assigned
+partitions, and each partition has one consumer for the complete run.
+
+For bounded scans with too few partitions to use the requested consumers,
+`--range-sharding` splits each partition's offset interval into disjoint
+half-open subranges. It requires `--unordered` and `--snapshot` or a fixed end
+boundary. Ordered runs retain their existing behavior.
+
+```sh
+jkq -b localhost:9092 -t events -p 0 --snapshot \
+  --range-sharding --unordered --consumers 4 -f '%p:%o:%s\n'
+```
+
+The total consumer count is at most `--consumers`. Extra consumers are divided
+as evenly as possible across the selected partitions, then each interval is
+split numerically. Small or empty ranges and the per-partition admission limit
+can reduce that count. Offset gaps from compaction are allowed; shards may
+have unequal amounts of work. Each retained record belongs to exactly one
+subrange, but records from different subranges may appear in any order.
+
+Sharded boundaries must already lie within the startup watermarks; a future
+end is rejected. `--count-per-partition` is unsupported with range sharding.
+`-c` still caps admitted records globally, selecting an unordered subset of the
+ranges. Sharding adds independent Kafka clients and can increase broker load
+and native prefetch memory. Measure two or four consumers first; more is not
+always faster. See the [range-sharding measurements](kafka-range-sharding.md).
 
 The default start is `beginning`. `-o, --offset` accepts:
 
@@ -324,12 +348,21 @@ above.
 
 There is no implicit configuration-file discovery.
 
+jkq sets `fetch.queue.backoff.ms=100` unless the property is supplied through
+`-F` or `-X`. This shortens the delay before a partition can fetch again after
+its prefetch queue crosses a threshold, avoiding long idle periods after the
+application drains that queue. Use `-X fetch.queue.backoff.ms=1000` for a longer
+retry interval, or measure nearby values for your workload. Other fetch and
+prefetch properties retain librdkafka's defaults unless supplied explicitly.
+
 ## Parallelism and Memory
 
-`--consumers <n>` controls Kafka polling parallelism across partitions. Each
-active consumer has its own poller thread and direct partition assignment.
-Use more than one only when multiple partitions are selected; it cannot
-parallelize a single partition.
+`--consumers <n>` controls Kafka polling parallelism across partitions, or
+across bounded subranges with `--range-sharding`. Each active consumer has its
+own poller thread and direct partition assignment.
+Without range sharding, extra consumers help only when multiple partitions
+are selected. With range sharding, each consumer has its own fetch,
+decompression, and native prefetch queue, even for one source partition.
 
 `-j, --jobs` controls JSON compute workers. The default is available CPU
 parallelism minus two, with a minimum of one. Identity transforms bypass the
@@ -355,7 +388,9 @@ expressions and are outside this source-byte budget.
 
 All three limits must be positive. `--max-inflight-per-partition` cannot exceed
 `--max-inflight-records`. Global record and byte limits apply across all Kafka
-consumers, while the per-partition limit remains local to each partition.
+consumers, while the per-partition limit bounds each partition. With range
+sharding, that limit is divided into fixed allowances across its subranges;
+their sum never exceeds the original limit. A small limit therefore caps shard concurrency.
 
 A source record larger than the byte budget may run alone. When admission
 limits are reached, the affected poller stops requesting records from its
@@ -445,6 +480,18 @@ An initial sequence of supported scalar predicates retains this optimization
 even when later predicates need full JSONata evaluation. Treat this as an
 optimization, not a reason to make an equivalent predicate harder to understand.
 
+The same optimization supports object lookups into `$vars` with string keys,
+including concatenated string attributes:
+
+```sh
+--tombstone-if '$lookup($vars.blacklist, tenant & ":" & account) = true'
+```
+
+Keys may combine more than two string attributes. Non-string components,
+array-mapped paths, and container-valued lookup results use native JSONata
+instead. Blocks with assignments and other function calls also retain native
+evaluation. This does not change expression results or error policies.
+
 When only selected metadata must be included in the payload, use
 [`--payload-format`](#payload-formatting) instead of a complete JSON envelope.
 The final format can then frame the exact generated payload length.
@@ -487,10 +534,28 @@ when measurements show worker starvation or excessive retained memory.
 If large-record runs pause for roughly a second between bursts, inspect
 librdkafka's prefetch limits (`queued.min.messages` and
 `queued.max.messages.kbytes`) and `fetch.queue.backoff.ms`. The Kafka client
-waits 1000 ms by default after a fetch queue exceeds its threshold. Compare
-`-X fetch.queue.backoff.ms=10` on a bounded range; shorter backoffs may increase
-CPU use. These prefetch limits are separate from jkq's source-byte admission
-budget.
+uses the [configured queue backoff](#kafka-configuration) after a fetch queue
+exceeds its threshold. Compare nearby backoff values on a bounded range;
+shorter backoffs may increase CPU use. These prefetch limits are separate from
+jkq's source-byte admission budget.
+
+For ingestion measurements, omit expressions and use `-f ''` to remove stdout
+volume. Keep the offset range and Kafka properties fixed, then compare
+`--consumers 1`, `2`, `4`, and `8` when enough partitions are available. Each
+consumer has independent librdkafka fetch and decompression threads, queues,
+and broker connections. Prefetch memory therefore grows with consumer count.
+
+Larger `fetch.message.max.bytes` can reduce fetch overhead, but also increase
+prefetch memory and trigger queue backoff. Compare a nearby value such as
+`-X fetch.message.max.bytes=8388608` before making it permanent. Increasing
+`queued.max.messages.kbytes` alone does not help when fetch queues are empty.
+
+A short range ending exactly at the log high includes EOF watermark queries.
+Measure a range ending inside the retained log as well, so termination latency
+does not distort sustained ingestion throughput. `fetch.wait.max.ms` can delay
+those queries behind an outstanding empty fetch. See the
+[Kafka throughput investigation](kafka-throughput-investigation.md) for measured
+examples and the rejected polling experiments.
 
 ### Validate a bounded slice first
 

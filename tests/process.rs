@@ -236,3 +236,86 @@ fn second_termination_signal_forces_a_blocked_writer_to_exit() {
     assert_eq!(output.status.code(), Some(143));
     stderr_reader.join().unwrap();
 }
+
+#[test]
+fn range_sharding_drains_on_signal_and_treats_broken_pipe_as_success() {
+    let fixture = Fixture::new("sharded-signal");
+    let payload = vec![b'x'; 64 * 1024];
+    for _ in 0..32 {
+        fixture.produce(&payload);
+    }
+    let args = [
+        "--snapshot",
+        "--range-sharding",
+        "--unordered",
+        "--consumers",
+        "4",
+        "--stats-interval",
+        "100ms",
+        "--max-inflight-records",
+        "4",
+        "--max-inflight-per-partition",
+        "4",
+        "-f",
+        "%o:%s\\n",
+    ];
+    let child = fixture
+        .command()
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut child, stderr_reader, _lines) = wait_until_polling(child);
+    let mut stdout = child.stdout.take().unwrap();
+    let mut first = [0];
+    stdout.read_exact(&mut first).unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut bytes = vec![first[0]];
+    stdout.read_to_end(&mut bytes).unwrap();
+    let output = wait(child);
+    assert_eq!(output.status.code(), Some(143));
+    let stderr = stderr_reader.join().unwrap();
+    let stderr = String::from_utf8_lossy(&stderr);
+    let total = stderr
+        .lines()
+        .find(|line| line.contains("stats total admitted="))
+        .unwrap();
+    let admitted = total
+        .split("admitted=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let mut offsets = bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split(|b| *b == b':').next().unwrap().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(offsets.len(), admitted);
+    offsets.sort_unstable();
+    offsets.dedup();
+    assert_eq!(offsets.len(), admitted);
+    assert!(admitted > 0 && admitted <= 32);
+
+    let mut child = fixture
+        .command()
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = wait(child);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("error"));
+}

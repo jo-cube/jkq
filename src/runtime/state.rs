@@ -35,7 +35,7 @@ impl SharedAdmission {
     pub fn try_reserve(&self, bytes: usize) -> bool {
         if self
             .records
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |records| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |records| {
                 (records < self.limits.max_inflight_records).then_some(records + 1)
             })
             .is_err()
@@ -44,7 +44,7 @@ impl SharedAdmission {
         }
         if self
             .bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(bytes).filter(|total| {
                     *total <= self.limits.max_inflight_bytes
                         || (current == 0 && bytes > self.limits.max_inflight_bytes)
@@ -57,7 +57,7 @@ impl SharedAdmission {
         }
         if self.count_limit.is_some_and(|limit| {
             self.admitted
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |admitted| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |admitted| {
                     (admitted < limit).then_some(admitted + 1)
                 })
                 .is_err()
@@ -71,12 +71,12 @@ impl SharedAdmission {
 
     pub fn release(&self, records: usize, bytes: usize) -> Result<(), String> {
         self.records
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(records)
             })
             .map_err(|_| "shared in-flight record accounting underflow".to_owned())?;
         self.bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(bytes)
             })
             .map_err(|_| "shared retained-byte accounting underflow".to_owned())?;
