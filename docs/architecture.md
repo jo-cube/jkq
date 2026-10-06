@@ -26,28 +26,27 @@ src/main.rs                process exit behavior
 src/cli.rs                 parsing, validation, config, startup plans
 src/app.rs                 process IO, signals, pipeline assembly
 src/kafka.rs               assignment, offsets, polling, owned records
-src/transform/mod.rs       startup expression source plan and validation
-src/transform/jsonata.rs   worker-local expression execution and actions
-src/transform/tape.rs      conservative scalar-predicate fast path
+src/transform/mod.rs       shared compiled expressions and variable validation
+src/transform/jsonata.rs   jx evaluation, serialization, and record actions
 src/runtime.rs             poller, workers, writer, shutdown, statistics
 src/runtime/state.rs       admission and completion-frontier state
 src/output.rs              compiled formats and JSON envelopes
 tests/process.rs           Unix process and signal behavior
 ```
 
-The transform modules use jsonata-core's public parser, evaluator, context, and
-value APIs. They use simd-json's public tape API for the scalar-predicate fast
-path.
+The transform modules use jx's public compilation, shared-input preparation,
+immutable binding, and compact serialization APIs. simd-json is used only to
+serialize JSON envelope strings.
 
 ## Startup
 
 Before polling, `jkq`:
 
 1. parses and validates the CLI and librdkafka properties;
-2. reads an optional `--vars-file`, parses every expression, and
+2. reads an optional `--vars-file`, compiles every expression, and
    validates the strict JSON `$vars` object;
-3. stores only expression source and variable JSON in the shared transform
-   plan;
+3. stores immutable compiled `jx::Expression` values with shared compile-time
+   `$vars` bindings in the transform plan;
 4. compiles the optional payload format and final output format, combining
    their metadata requirements;
 5. creates a consumer and discovers all topic partitions when none were
@@ -122,65 +121,39 @@ batched.
 
 ## Expression Execution
 
-The startup plan contains `String` expression sources and optional variable
-JSON, all safe to share across worker threads. Each worker parses its own
-JSONata ASTs and `$vars` value because jsonata-core values use `Rc` and are not
-`Send` or `Sync`.
+The startup plan contains immutable compiled `jx::Expression` values shared
+across all workers. `$vars` is validated and captured once as an immutable
+`jx::OwnedValue` bound through `CompileOptions::constant_binding`. Reusing the
+compile options shares its storage across expressions; workers require no
+per-record binding setup.
 
-When action predicates begin with supported scalar operations, the worker
-evaluates that prefix directly on a validated simd-json tape. The supported
-subset is Boolean literals, plain input paths, scalar literals and scalar
-`$vars` paths, comparisons, and `and`/`or`. Object `$lookup` calls into
-`$vars` also use this path when the key is a string or a concatenation of
-strings and the result is scalar. Lookup objects reuse the worker-local
-variable tree; non-string keys or components, array paths, and container
-results fall back to native evaluation.
-Parser scratch and tape allocation are reused by that worker. Because simd-json
-unescapes strings in place, parsing uses a worker-local copy and leaves source
-bytes untouched for an eventual pass action.
+Before workers start, one `jx::InputPlan` borrows the compiled expressions
+in drop, tombstone, then projection order. Workers share this immutable plan.
+Each required payload is prepared once: jx validates the complete input and
+captures eligible bounded static paths during that traversal. Predicates and
+projection evaluate through stable indices with independent state. Unsupported
+expressions and deferred array paths use jx's ordinary evaluation fallback;
+immutable `$vars` reads can participate in those captures. There is no tape,
+mutable parsing copy, worker AST compilation, input tree, or jkq acquisition
+cache or fallback evaluator. jx owns acquisition and expression semantics.
 
-Drop and tombstone results avoid constructing a JSONata value tree, including
-when surviving records require a projection or JSON-value envelope. Survivors
-that finish all predicates on the tape and need a tree deserialize the
-validated tape directly into `JValue` and proceed to projection or serialization
-without repeating predicates. This consumes the tape allocation; the next
-record allocates a new tape while still reusing input and parser scratch buffers.
+Predicates run in command-line order and require exactly one Boolean result.
+Drop and tombstone actions short-circuit later expressions. Projection consumes
+all results before publishing a completion: no results are an error, one
+result is one JSON value, and multiple results form one array payload. Explicit
+arrays remain single values. Lazy evaluation and serialization failures follow
+`--on-eval-error` without publishing a partial projection.
 
-The tape evaluator declines predicates or record shapes that need full JSONata
-semantics, including other function calls, assignments, path filters,
-container comparisons, and array-mapped paths. On the first unsupported
-predicate or record shape, the worker deserializes the existing tape and resumes JSONata evaluation at that
-predicate. Completed scalar predicates are not repeated. This avoids another
-source copy, parse, and evaluation of the prefix while preserving predicate
-order and error locations.
-A plan whose first predicate is unsupported uses the normal jsonata-core path
-directly, since it cannot discard records before constructing the value tree.
-A tape parse or deserialization failure falls back to the normal parser,
-preserving jsonata-core's accepted input and error handling. Plans with only
-projection or JSON-value serialization continue to use the normal path. Fast-path
-selection never changes expression results or policies.
+Borrowed results serialize directly with `Value::write_compact` into a worker
+byte buffer, without detached values or an intermediate JSON string. A
+JSON-value pass uses `RawJson::write_compact` and retains source byte length.
+After successful serialization, the worker transfers the output buffer into
+the action and recycles the consumed source allocation as its next output
+buffer. That retained allocation is worker scratch outside the source-byte
+admission budget. Exact pass actions transfer the original bytes unchanged.
 
-The normal path validates UTF-8 and parses the payload once with
-`JValue::from_json_str`. The same worker-local document is used for all drop
-predicates, tombstone predicates, and the optional projection. With
-`--envelope-payload value`, a surviving pass serializes that document once,
-retains the source byte length for envelope metadata, and releases the source
-buffer. The writer never parses payload JSON.
-
-jsonata-core's `Evaluator` retains its first parent/root value. jkq therefore
-does not reuse evaluators: it creates a fresh `Context` and `Evaluator` for
-every expression evaluation and binds the worker-local `$vars` value into that
-context. This prevents a root document, assignment, lambda, or other context
-state from leaking between expressions or input records.
-
-Predicates run in command-line order and must return a Boolean. Projection
-results are checked recursively for `Undefined` and non-JSON internal values,
-then serialized through `JValue::to_json_string`. jsonata-core result sequences
-remain one value and therefore one jkq output record.
-
-jsonata-core 2.2.7 does not expose its bytecode compiler as a stable production
-Rust API. Workers therefore use the public AST evaluator. jkq does not use the
-feature-gated internal `_bench` facade.
+See [expression-language.md](expression-language.md) for native jx serialization
+and missing-value behavior.
 
 Existing Kafka tombstones bypass all JSONata work. They remain tombstones by
 default and become drops when `--drop-tombstones` is set. Records selected by
@@ -236,9 +209,8 @@ covers owned bytes copied from the source record:
 - key, when required;
 - header names and header values, when required.
 
-The charge intentionally excludes worker-local parser scratch and tape, the
-parsed value tree, evaluation intermediates, projected output, the writer-local
-payload-format buffer, and compact pass output for a JSON-value envelope. It
+The charge intentionally excludes the worker-local output buffer, evaluation
+intermediates, projected output, the writer-local payload-format buffer, and compact pass output for a JSON-value envelope. It
 also excludes librdkafka's internal prefetch queue, which follows librdkafka's
 own configuration. Those allocations depend on the input, formats,
 expressions, and Kafka client settings. Bounded channels,
