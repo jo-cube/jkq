@@ -1086,7 +1086,7 @@ mod tests {
             "--vars-file",
             &path_text,
             "--project",
-            "$vars.tenant",
+            "$vars",
             "--check",
         ]);
         fs::write(&path, "[]").unwrap();
@@ -1104,7 +1104,20 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let config = valid.unwrap();
-        assert_eq!(config.transform.variables.as_deref(), Some(source));
+        let mut bytes = Vec::new();
+        config
+            .transform
+            .projection
+            .as_ref()
+            .unwrap()
+            .evaluate(b"null")
+            .unwrap()
+            .single()
+            .unwrap()
+            .unwrap()
+            .write_compact(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, source.as_bytes());
         assert!(
             invalid
                 .unwrap_err()

@@ -1,7 +1,6 @@
-use jsonata_core::{parser, value::JValue};
+use jx::{CompileOptions, Expression, InputPlan, OwnedValue, ValueType};
 
 pub mod jsonata;
-mod tape;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanCapabilities {
@@ -10,12 +9,22 @@ pub struct PlanCapabilities {
 
 #[derive(Clone, Debug)]
 pub struct TransformPlan {
-    pub drops: Vec<String>,
-    pub tombstones: Vec<String>,
+    pub drops: Vec<Expression>,
+    pub tombstones: Vec<Expression>,
     pub drop_tombstones: bool,
-    pub projection: Option<String>,
-    pub variables: Option<String>,
+    pub projection: Option<Expression>,
     pub capabilities: PlanCapabilities,
+}
+
+impl TransformPlan {
+    pub fn input_plan(&self) -> InputPlan<'_> {
+        InputPlan::new(
+            self.drops
+                .iter()
+                .chain(&self.tombstones)
+                .chain(&self.projection),
+        )
+    }
 }
 
 pub fn build_plan(
@@ -26,32 +35,36 @@ pub fn build_plan(
     variables: Option<&str>,
     force_json_validation: bool,
 ) -> Result<TransformPlan, String> {
-    if let Some(source) = variables {
-        let value = JValue::from_json_str(source)
-            .map_err(|error| format!("$vars input must be a valid JSON object: {error}"))?;
-        if !value.is_object() {
-            return Err("$vars input must be a JSON object".to_owned());
-        }
-    }
-
-    for (category, sources) in [
-        ("drop predicate", drops),
-        ("tombstone predicate", tombstones),
-    ] {
-        for (index, source) in sources.iter().enumerate() {
-            parse_expression(source, &format!("{category} #{}", index + 1))?;
-        }
-    }
-    if let Some(source) = projection {
-        parse_expression(source, "projection")?;
-    }
-
+    let variables = variables
+        .map(|source| {
+            let value = OwnedValue::from_json(source.as_bytes())
+                .map_err(|error| format!("$vars input must be a valid JSON object: {error}"))?;
+            if value.as_value().value_type() != ValueType::Object {
+                return Err("$vars input must be a JSON object".to_owned());
+            }
+            Ok(value)
+        })
+        .transpose()?;
+    let options = match variables {
+        Some(value) => CompileOptions::default().constant_binding("vars", value),
+        None => CompileOptions::default(),
+    };
+    let predicates = |sources: &[String], category: &str| {
+        sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                compile_expression(&options, source, &format!("{category} #{}", index + 1))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
     Ok(TransformPlan {
-        drops: drops.to_vec(),
-        tombstones: tombstones.to_vec(),
+        drops: predicates(drops, "drop predicate")?,
+        tombstones: predicates(tombstones, "tombstone predicate")?,
         drop_tombstones,
-        projection: projection.map(str::to_owned),
-        variables: variables.map(str::to_owned),
+        projection: projection
+            .map(|source| compile_expression(&options, source, "projection"))
+            .transpose()?,
         capabilities: PlanCapabilities {
             parses_json: force_json_validation
                 || !drops.is_empty()
@@ -61,13 +74,14 @@ pub fn build_plan(
     })
 }
 
-fn parse_expression(source: &str, category: &str) -> Result<(), String> {
-    parser::parse(source).map(|_| ()).map_err(|error| {
-        format!(
-            "{category} JSONata parse error: {}",
-            error.display_message()
-        )
-    })
+fn compile_expression(
+    options: &CompileOptions,
+    source: &str,
+    category: &str,
+) -> Result<Expression, String> {
+    options
+        .compile(source)
+        .map_err(|error| format!("{category} JSONata compile error: {error}"))
 }
 
 #[cfg(test)]
@@ -95,14 +109,12 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(error.contains("drop predicate #1 JSONata parse error"));
+        assert!(error.contains("drop predicate #1 JSONata compile error"));
     }
 
     #[test]
-    fn jsonata_core_object_regex_parse_deviation_is_visible() {
-        let error =
-            build_plan(&[], &[], false, Some(r#"{"value": /x/}"#), None, false).unwrap_err();
-        assert!(error.contains("projection JSONata parse error"));
+    fn regex_object_values_compile_before_record_serialization() {
+        build_plan(&[], &[], false, Some(r#"{"value": /x/}"#), None, false).unwrap();
     }
 
     #[test]

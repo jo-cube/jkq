@@ -454,6 +454,7 @@ pub fn run_pipeline(
     let first_failure = Arc::new(OnceLock::new());
     let shared_admission = Arc::new(SharedAdmission::new(config.limits, config.count_limit));
     let transforms_json = config.transform.capabilities.parses_json;
+    let input_plan = config.transform.input_plan();
 
     let signal = thread::scope(|scope| {
         let (stats_stop_tx, stats_reporter) = if let Some(interval) = config.stats_interval {
@@ -526,6 +527,7 @@ pub fn run_pipeline(
         let mut workers = Vec::with_capacity(if transforms_json { config.jobs } else { 0 });
         if transforms_json {
             for index in 0..config.jobs {
+                let input_plan = &input_plan;
                 let receiver = work_rx.clone();
                 let sender = completion_tx.clone();
                 let worker_stats = Arc::clone(&stats);
@@ -535,7 +537,7 @@ pub fn run_pipeline(
                     .name(format!("jkq-worker-{index}"))
                     .spawn_scoped(scope, move || {
                         guard_thread(&worker_shutdown, &worker_failure, "compute worker", || {
-                            worker_loop(config, receiver, sender, worker_stats)
+                            worker_loop(config, input_plan, receiver, sender, worker_stats)
                         });
                     }) {
                     Ok(worker) => workers.push(worker),
@@ -907,11 +909,13 @@ fn admit(
 
 fn worker_loop(
     config: &RuntimeConfig,
+    input_plan: &jx::InputPlan<'_>,
     work_rx: Receiver<Batch<WorkItem>>,
     completion_tx: Sender<Batch<Completion>>,
     stats: Arc<Stats>,
 ) {
-    let worker = jsonata::Worker::new(&config.transform, config.output.embeds_json());
+    let mut worker =
+        jsonata::Worker::new(&config.transform, input_plan, config.output.embeds_json());
     for work_batch in work_rx {
         let Batch { consumer, items } = work_batch;
         let mut completions = Vec::with_capacity(items.len());
