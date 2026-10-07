@@ -9,12 +9,62 @@ use rdkafka::{
 };
 
 use crate::{
-    cli::{EndPosition, KafkaErrorPolicy, MAX_ASSIGNED_PARTITIONS, RuntimeConfig, StartPosition},
+    cli::{
+        EndPosition, KafkaErrorPolicy, MAX_ASSIGNED_PARTITIONS, RuntimeConfig, RuntimeLimits,
+        StartPosition,
+    },
     output::{Header, OutputRequirements, Timestamp, TimestampType},
 };
 
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+pub(crate) const MAX_REUSABLE_PAYLOAD_CAPACITY: usize = 16 * 1024;
+const MAX_SPARE_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+pub(crate) struct PayloadBuffers {
+    free: Vec<Vec<u8>>,
+    capacity: usize,
+    max_records: usize,
+    max_bytes: usize,
+    max_buffer_capacity: usize,
+}
+
+impl PayloadBuffers {
+    pub(crate) fn new(limits: RuntimeLimits) -> Self {
+        Self {
+            free: Vec::new(),
+            capacity: 0,
+            max_records: limits.max_inflight_records,
+            max_bytes: limits.max_inflight_bytes.min(MAX_SPARE_PAYLOAD_BYTES),
+            max_buffer_capacity: limits.max_inflight_bytes.min(MAX_REUSABLE_PAYLOAD_CAPACITY),
+        }
+    }
+
+    fn copy(&mut self, source: &[u8]) -> Vec<u8> {
+        if source.len() > self.max_buffer_capacity {
+            return source.to_vec();
+        }
+        let mut buffer = self.free.pop().unwrap_or_default();
+        self.capacity -= buffer.capacity();
+        buffer.extend_from_slice(source);
+        buffer
+    }
+
+    pub(crate) fn recycle(&mut self, mut buffer: Vec<u8>) {
+        let capacity = buffer.capacity();
+        if capacity == 0
+            || capacity > self.max_buffer_capacity
+            || self.free.len() == self.max_records
+            || capacity > self.max_bytes - self.capacity
+        {
+            return;
+        }
+        buffer.clear();
+        self.capacity += capacity;
+        self.free.push(buffer);
+    }
+}
 
 #[derive(Debug)]
 pub struct OwnedRecord {
@@ -52,6 +102,7 @@ pub enum PollEvent {
 }
 
 pub struct KafkaInput {
+    pub(crate) payload_buffers: PayloadBuffers,
     consumer: BaseConsumer,
     topic: String,
     partitions: BTreeMap<i32, PartitionState>,
@@ -211,6 +262,7 @@ impl KafkaInput {
             .collect::<BTreeMap<_, _>>();
         let remaining_partitions = partitions.values().filter(|state| !state.done).count();
         let input = Self {
+            payload_buffers: PayloadBuffers::new(config.limits),
             consumer,
             topic: config.topic.clone(),
             partitions,
@@ -322,7 +374,9 @@ impl KafkaInput {
             } else {
                 Vec::new()
             },
-            payload: message.payload().map(<[u8]>::to_vec),
+            payload: message
+                .payload()
+                .map(|bytes| self.payload_buffers.copy(bytes)),
             retained_bytes,
         };
         Ok(PollEvent::Record(record))
@@ -727,6 +781,69 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn recycled_payloads_keep_storage_and_replace_every_source_byte() {
+        let mut buffers = PayloadBuffers::new(RuntimeLimits {
+            max_inflight_records: 2,
+            max_inflight_bytes: 64,
+            max_inflight_per_partition: 2,
+        });
+        let mut original = Vec::with_capacity(32);
+        original.extend_from_slice(b"previous contents");
+        let storage = original.as_ptr();
+        buffers.recycle(original);
+        let copied = buffers.copy(b"new");
+        assert_eq!(copied, b"new");
+        assert_eq!(copied.as_ptr(), storage);
+        assert_eq!(copied.capacity(), 32);
+        assert_eq!(buffers.capacity, 0);
+        buffers.recycle(copied);
+        assert!(buffers.copy(b"").is_empty());
+    }
+
+    #[test]
+    fn spare_payloads_obey_record_capacity_and_byte_limits() {
+        let limits = RuntimeLimits {
+            max_inflight_records: 2,
+            max_inflight_bytes: 64,
+            max_inflight_per_partition: 2,
+        };
+        let mut buffers = PayloadBuffers::new(limits);
+        for _ in 0..3 {
+            buffers.recycle(Vec::with_capacity(1));
+        }
+        assert_eq!(buffers.free.len(), 2);
+        assert_eq!(buffers.capacity, 2);
+
+        let mut buffers = PayloadBuffers::new(limits);
+        buffers.recycle(Vec::with_capacity(32));
+        buffers.recycle(Vec::with_capacity(32));
+        buffers.recycle(Vec::with_capacity(1));
+        assert_eq!(buffers.free.len(), 2);
+        assert_eq!(buffers.capacity, 64);
+
+        let mut buffers = PayloadBuffers::new(RuntimeLimits {
+            max_inflight_records: 10000,
+            max_inflight_bytes: 256 * 1024 * 1024,
+            max_inflight_per_partition: 10000,
+        });
+        for _ in 0..10000 {
+            buffers.recycle(Vec::with_capacity(1024));
+        }
+        assert_eq!(buffers.capacity, MAX_SPARE_PAYLOAD_BYTES);
+        let retained = buffers.free.len();
+        buffers.recycle(Vec::with_capacity(MAX_REUSABLE_PAYLOAD_CAPACITY + 1));
+        buffers.recycle(Vec::new());
+        assert_eq!(buffers.free.len(), retained);
+
+        let large = vec![b'x'; MAX_REUSABLE_PAYLOAD_CAPACITY + 1];
+        assert_eq!(buffers.copy(&large), large);
+        assert_eq!(buffers.free.len(), retained);
+        let mut buffers = PayloadBuffers::new(limits);
+        buffers.recycle(Vec::with_capacity(65));
+        assert!(buffers.free.is_empty());
     }
 
     #[test]

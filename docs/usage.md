@@ -388,7 +388,11 @@ admission budget for owned source record bytes and copied source metadata: the
 payload, key, header names, and header values required by the output plan. It
 does not account for worker output buffers, evaluation intermediates, or
 projected output. Those allocations depend on the input and
-expressions and are outside this source-byte budget.
+expressions and are outside this source-byte budget. Payload reuse retains
+capacities up to 16 KiB; spare capacity and vector growth can exceed logical
+source length. Each poller also
+retains at most 1 MiB of cleared spare payload storage, bounded further by the
+record limit; both capacity thresholds shrink with a smaller byte budget.
 
 All three limits must be positive. `--max-inflight-per-partition` cannot exceed
 `--max-inflight-records`. Global record and byte limits apply across all Kafka

@@ -19,7 +19,7 @@ use signal_hook::{
 
 use crate::{
     cli::{OutputPlan, RuntimeConfig},
-    kafka::{KafkaInput, OwnedRecord, PollEvent},
+    kafka::{KafkaInput, MAX_REUSABLE_PAYLOAD_CAPACITY, OwnedRecord, PayloadBuffers, PollEvent},
     output::{self, EmittedAction, Header, OutputRecord, Payload, Timestamp},
     transform::jsonata::{self, Action, ExecutionIssue, PassPayload, TransformError},
 };
@@ -332,6 +332,8 @@ struct SourceRecord {
 
 #[derive(Debug)]
 struct Completion {
+    // Unused source storage from drops, tombstones, and failures.
+    spare_payload: Option<Vec<u8>>,
     consumer: usize,
     partition: i32,
     sequence: u64,
@@ -404,6 +406,7 @@ impl PollerBuffer {
                             partition,
                             sequence,
                             retained_bytes,
+                            spare_payload: None,
                             source: SourceRecord {
                                 partition,
                                 offset,
@@ -642,7 +645,12 @@ fn poll_loop(
 
     loop {
         while let Ok(releases) = release_rx.try_recv() {
-            if let Err(error) = release_batch(&mut admission, &shared_admission, releases) {
+            if let Err(error) = release_batch(
+                &mut admission,
+                &shared_admission,
+                &mut input.payload_buffers,
+                releases,
+            ) {
                 runtime_failure(&first_failure, &shutdown, error);
             }
         }
@@ -724,7 +732,12 @@ fn poll_loop(
         }
         match release_rx.recv_timeout(CONTROL_POLL) {
             Ok(releases) => {
-                if let Err(error) = release_batch(&mut admission, &shared_admission, releases) {
+                if let Err(error) = release_batch(
+                    &mut admission,
+                    &shared_admission,
+                    &mut input.payload_buffers,
+                    releases,
+                ) {
                     runtime_failure(&first_failure, &shutdown, error);
                 }
             }
@@ -747,6 +760,7 @@ fn poll_loop(
 fn release_batch(
     admission: &mut Admission,
     shared: &SharedAdmission,
+    payload_buffers: &mut PayloadBuffers,
     releases: Vec<Release>,
 ) -> Result<(), String> {
     let records = releases.len();
@@ -757,6 +771,9 @@ fn release_batch(
     })?;
     for release in releases {
         admission.release(release.partition)?;
+        if let Some(payload) = release.payload {
+            payload_buffers.recycle(payload);
+        }
     }
     shared.release(records, bytes)
 }
@@ -845,8 +862,15 @@ fn worker_loop(
     completion_tx: Sender<CompletionBatch>,
     stats: Arc<Stats>,
 ) {
-    let mut worker =
-        jsonata::Worker::new(&config.transform, input_plan, config.output.embeds_json());
+    let mut worker = jsonata::Worker::new(
+        &config.transform,
+        input_plan,
+        config.output.embeds_json(),
+        config
+            .limits
+            .max_inflight_bytes
+            .min(MAX_REUSABLE_PAYLOAD_CAPACITY),
+    );
     for work_batch in work_rx {
         let RecordBatch { consumer, items } = work_batch;
         let mut completions = Vec::with_capacity(items.len());
@@ -858,13 +882,13 @@ fn worker_loop(
                 timestamp,
                 key,
                 headers,
-                payload,
+                mut payload,
                 retained_bytes,
             } = record;
             let source_tombstone = payload.is_none();
             let payload_length = payload.as_ref().map(Vec::len);
             let result = catch_unwind(AssertUnwindSafe(|| {
-                worker.execute_report(payload, config.errors)
+                worker.execute_report(&mut payload, config.errors)
             }));
             let outcome = match result {
                 Ok(Ok(execution)) => {
@@ -888,6 +912,7 @@ fn worker_loop(
                 partition,
                 sequence,
                 retained_bytes,
+                spare_payload: payload,
                 source: SourceRecord {
                     partition,
                     offset,
@@ -937,7 +962,7 @@ fn writer_loop(
             if ordered {
                 if let Err((message, completion)) = orderer.insert(completion, &mut ready) {
                     let completion = *completion;
-                    release(&mut releases, &completion);
+                    release(&mut releases, completion);
                     writer_failure(
                         &mut failure,
                         &first_failure,
@@ -978,7 +1003,7 @@ fn writer_loop(
                         }
                     }
                 }
-                release(&mut releases, &completion);
+                release(&mut releases, completion);
             }
         }
         if !releases.is_empty() {
@@ -991,7 +1016,7 @@ fn writer_loop(
         let mut releases = (0..release_txs.len())
             .map(|_| Vec::new())
             .collect::<Vec<_>>();
-        for completion in &pending {
+        for completion in pending {
             release(&mut releases[completion.consumer], completion);
         }
         for (release_tx, releases) in release_txs.iter().zip(releases) {
@@ -1032,10 +1057,17 @@ fn writer_failure(
     shutdown.store(true, Ordering::SeqCst);
 }
 
-fn release(releases: &mut Vec<Release>, completion: &Completion) {
+fn release(releases: &mut Vec<Release>, completion: Completion) {
+    let payload = match completion.outcome {
+        CompletionOutcome::Action(Action::PassThrough(PassPayload::Exact(bytes)))
+        | CompletionOutcome::Action(Action::PassThrough(PassPayload::Json { bytes, .. }))
+        | CompletionOutcome::Action(Action::Project(bytes)) => Some(bytes),
+        _ => completion.spare_payload,
+    };
     releases.push(Release {
         partition: completion.partition,
         retained_bytes: completion.retained_bytes,
+        payload,
     });
 }
 
@@ -1130,6 +1162,7 @@ mod tests {
             partition,
             sequence,
             retained_bytes: bytes,
+            spare_payload: None,
             source: SourceRecord {
                 partition,
                 offset: i64::try_from(sequence).unwrap(),
@@ -1468,7 +1501,13 @@ mod tests {
             assert!(shared.try_reserve(bytes));
             admission.reserve(0).unwrap();
         }
-        release_batch(&mut admission, &shared, releases).unwrap();
+        release_batch(
+            &mut admission,
+            &shared,
+            &mut PayloadBuffers::new(limits),
+            releases,
+        )
+        .unwrap();
         assert_eq!(admission.total_records, 0);
         assert!(shared.try_reserve(6));
         assert!(!shared.try_reserve(1));
@@ -1590,5 +1629,207 @@ mod tests {
             first.get(),
             Some(RecordedFailure::Runtime(message)) if message == "Kafka poll thread panicked"
         ));
+    }
+
+    #[test]
+    fn pass_storage_returns_only_after_the_writer_uses_the_original_bytes() {
+        struct CheckingWriter<'a> {
+            releases: &'a Receiver<Vec<Release>>,
+            bytes: Vec<u8>,
+        }
+        impl Write for CheckingWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(self.releases.is_empty());
+                self.bytes.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let config = config(&["-f", "%s"]);
+        let (completion_tx, completion_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let source = b"{ \"exact\" : 1 }\n";
+        completion_tx
+            .send(CompletionBatch {
+                consumer: 0,
+                items: vec![completion(0, 0, source.len(), pass(source))],
+            })
+            .unwrap();
+        drop(completion_tx);
+        let mut writer = CheckingWriter {
+            releases: &release_rx,
+            bytes: Vec::new(),
+        };
+        writer_loop(
+            &config,
+            &mut writer,
+            completion_rx,
+            vec![release_tx],
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Stats::default()),
+            Arc::new(OnceLock::new()),
+        )
+        .unwrap();
+        assert_eq!(writer.bytes, source);
+        let releases = release_rx.iter().flatten().collect::<Vec<_>>();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].retained_bytes, source.len());
+        assert_eq!(releases[0].payload.as_deref(), Some(source.as_slice()));
+    }
+
+    #[test]
+    fn transformed_drops_tombstones_and_fatal_records_return_storage_and_credit_once() {
+        let mut config = config(&[
+            "--drop-if",
+            "id = 'drop'",
+            "--tombstone-if",
+            "id = 'delete'",
+            "--project",
+            "id = 'fail' ? $error('fail') : id",
+            "-f",
+            "%S:%s\\n",
+        ]);
+        config.limits.max_inflight_records = 5;
+        config.limits.max_inflight_per_partition = 5;
+        let input_plan = config.transform.input_plan();
+        let (work_tx, work_rx) = bounded(1);
+        let (completion_tx, completion_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let inputs = [
+            Some(br#"{"id":"drop"}"#.as_slice()),
+            Some(br#"{"id":"delete"}"#.as_slice()),
+            Some(br#"{"id":"project"}"#.as_slice()),
+            Some(br#"{"id":"fail"}"#.as_slice()),
+            None,
+        ];
+        let mut admission = Admission::new(&[0], config.limits.max_inflight_per_partition);
+        let shared = SharedAdmission::new(config.limits, None);
+        let mut bytes = 0;
+        let items = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let retained_bytes = source.map_or(0, <[u8]>::len);
+                bytes += retained_bytes;
+                assert!(shared.try_reserve(retained_bytes));
+                let sequence = admission.reserve(0).unwrap();
+                WorkItem {
+                    sequence,
+                    record: OwnedRecord {
+                        partition: 0,
+                        offset: i64::try_from(index).unwrap(),
+                        timestamp: None,
+                        key: None,
+                        headers: Vec::new(),
+                        payload: source.map(|source| {
+                            let mut buffer = Vec::with_capacity(128);
+                            buffer.extend_from_slice(source);
+                            buffer
+                        }),
+                        retained_bytes,
+                    },
+                }
+            })
+            .collect();
+        work_tx.send(RecordBatch { consumer: 0, items }).unwrap();
+        drop(work_tx);
+        worker_loop(
+            &config,
+            &input_plan,
+            work_rx,
+            completion_tx,
+            Arc::new(Stats::default()),
+        );
+        let mut output = Vec::new();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        assert!(
+            writer_loop(
+                &config,
+                &mut output,
+                completion_rx,
+                vec![release_tx],
+                Arc::clone(&shutdown),
+                Arc::new(Stats::default()),
+                Arc::new(OnceLock::new())
+            )
+            .is_err()
+        );
+        assert_eq!(output, b"-1:\n9:\"project\"\n");
+        assert!(shutdown.load(Ordering::SeqCst));
+        let releases = release_rx.iter().flatten().collect::<Vec<_>>();
+        assert_eq!(releases.len(), 5);
+        assert_eq!(
+            releases
+                .iter()
+                .filter(|release| release.payload.is_some())
+                .count(),
+            4
+        );
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| release.retained_bytes)
+                .sum::<usize>(),
+            bytes
+        );
+        release_batch(
+            &mut admission,
+            &shared,
+            &mut PayloadBuffers::new(config.limits),
+            releases,
+        )
+        .unwrap();
+        assert_eq!(admission.total_records, 0);
+        assert!(shared.try_reserve(config.limits.max_inflight_bytes));
+        for _ in 1..5 {
+            assert!(shared.try_reserve(0));
+        }
+        assert!(!shared.try_reserve(0));
+    }
+
+    #[test]
+    fn cancellation_output_failure_and_ordering_gaps_release_payload_storage() {
+        struct BrokenPipe;
+        impl Write for BrokenPipe {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for (cancelled, sequence) in [(false, 0), (true, 0), (false, 1)] {
+            let config = config(&["--drop-if", "false", "-f", "%s"]);
+            let (completion_tx, completion_rx) = bounded(1);
+            let (release_tx, release_rx) = bounded(1);
+            completion_tx
+                .send(CompletionBatch {
+                    consumer: 0,
+                    items: vec![completion(0, sequence, 4, pass(b"data"))],
+                })
+                .unwrap();
+            drop(completion_tx);
+            let first = Arc::new(OnceLock::new());
+            let shutdown = Arc::new(AtomicBool::new(cancelled));
+            if cancelled {
+                thread_start_failure(&first, &shutdown, "poller", io::Error::other("cancelled"));
+            }
+            assert!(
+                writer_loop(
+                    &config,
+                    &mut BrokenPipe,
+                    completion_rx,
+                    vec![release_tx],
+                    shutdown,
+                    Arc::new(Stats::default()),
+                    first
+                )
+                .is_err()
+            );
+            let releases = release_rx.iter().flatten().collect::<Vec<_>>();
+            assert_eq!(releases.len(), 1);
+            assert_eq!(releases[0].payload.as_deref(), Some(b"data".as_slice()));
+        }
     }
 }

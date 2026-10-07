@@ -79,8 +79,8 @@ fn json_value_pass_compacts_payload_and_retains_source_length() {
     let transform = plan(&[], &[], None, None, true);
     let source = b"{\n  \"a\": 1\n}";
     let input_plan = transform.input_plan();
-    let execution = Worker::new(&transform, &input_plan, true)
-        .execute_report(Some(source.to_vec()), FAIL)
+    let execution = Worker::new(&transform, &input_plan, true, usize::MAX)
+        .execute_report(&mut Some(source.to_vec()), FAIL)
         .unwrap();
 
     assert_eq!(
@@ -180,9 +180,9 @@ fn invalid_json_policies_preserve_exact_pass_bytes() {
         ),
     ] {
         let input_plan = transform.input_plan();
-        let result = Worker::new(&transform, &input_plan, false)
+        let result = Worker::new(&transform, &input_plan, false, usize::MAX)
             .execute_report(
-                Some(invalid.clone()),
+                &mut Some(invalid.clone()),
                 ErrorPolicies {
                     invalid_json: policy,
                     evaluation: EvaluationPolicy::Fail,
@@ -204,9 +204,9 @@ fn evaluation_errors_and_undefined_follow_policy() {
             (EvaluationPolicy::Tombstone, Action::Tombstone),
         ] {
             let input_plan = transform.input_plan();
-            let result = Worker::new(&transform, &input_plan, false)
+            let result = Worker::new(&transform, &input_plan, false, usize::MAX)
                 .execute_report(
-                    Some(b"{}".to_vec()),
+                    &mut Some(b"{}".to_vec()),
                     ErrorPolicies {
                         invalid_json: InvalidJsonPolicy::Fail,
                         evaluation: policy,
@@ -345,7 +345,7 @@ fn nested_vars_and_lookup_are_shared_across_record_actions() {
         false,
     );
     let input_plan = transform.input_plan();
-    let mut worker = Worker::new(&transform, &input_plan, false);
+    let mut worker = Worker::new(&transform, &input_plan, false, usize::MAX);
     for (input, expected) in [
         (r#"{"tenant":"other","state":"deleted"}"#, Action::Drop),
         (r#"{"tenant":"acme","state":"blocked"}"#, Action::Drop),
@@ -361,7 +361,7 @@ fn nested_vars_and_lookup_are_shared_across_record_actions() {
     ] {
         assert_eq!(
             worker
-                .execute_report(Some(input.as_bytes().to_vec()), FAIL)
+                .execute_report(&mut Some(input.as_bytes().to_vec()), FAIL)
                 .unwrap()
                 .action,
             expected,
@@ -384,11 +384,11 @@ fn vars_shadowing_closures_and_eval_keep_native_lexical_state() {
     ] {
         let transform = plan(&[], &[], Some(expression), Some(r#"{"n":3}"#), false);
         let input_plan = transform.input_plan();
-        let mut worker = Worker::new(&transform, &input_plan, false);
+        let mut worker = Worker::new(&transform, &input_plan, false, usize::MAX);
         for _ in 0..3 {
             assert_eq!(
                 worker
-                    .execute_report(Some(br#"{"code":"$vars.n"}"#.to_vec()), FAIL)
+                    .execute_report(&mut Some(br#"{"code":"$vars.n"}"#.to_vec()), FAIL)
                     .unwrap()
                     .action,
                 Action::Project(expected.as_bytes().to_vec()),
@@ -402,14 +402,14 @@ fn vars_shadowing_closures_and_eval_keep_native_lexical_state() {
 fn evaluator_root_and_assignments_do_not_leak_between_records() {
     let transform = plan(&[], &[], Some("($seen := id; $seen)"), None, false);
     let input_plan = transform.input_plan();
-    let mut worker = Worker::new(&transform, &input_plan, false);
+    let mut worker = Worker::new(&transform, &input_plan, false, usize::MAX);
     for (input, expected) in [
         (br#"{"id":1}"#.as_slice(), b"1".as_slice()),
         (br#"{"id":2}"#.as_slice(), b"2".as_slice()),
     ] {
         assert_eq!(
             worker
-                .execute_report(Some(input.to_vec()), FAIL)
+                .execute_report(&mut Some(input.to_vec()), FAIL)
                 .unwrap()
                 .action,
             Action::Project(expected.to_vec())
@@ -464,9 +464,9 @@ fn late_projection_failures_never_publish_partial_results() {
             EvaluationPolicy::Tombstone,
         ] {
             let input_plan = transform.input_plan();
-            let mut worker = Worker::new(&transform, &input_plan, false);
+            let mut worker = Worker::new(&transform, &input_plan, false, usize::MAX);
             let result = worker.execute_report(
-                Some(bad.to_vec()),
+                &mut Some(bad.to_vec()),
                 ErrorPolicies {
                     evaluation: policy,
                     ..FAIL
@@ -496,7 +496,7 @@ fn late_projection_failures_never_publish_partial_results() {
             }
             assert_eq!(
                 worker
-                    .execute_report(Some(br#"{"rows":[{"n":4}]}"#.to_vec()), FAIL)
+                    .execute_report(&mut Some(br#"{"rows":[{"n":4}]}"#.to_vec()), FAIL)
                     .unwrap()
                     .action,
                 Action::Project(b"16".to_vec())
@@ -515,11 +515,11 @@ fn expression_bindings_assignments_and_roots_are_independent() {
         false,
     );
     let input_plan = transform.input_plan();
-    let mut worker = Worker::new(&transform, &input_plan, false);
+    let mut worker = Worker::new(&transform, &input_plan, false, usize::MAX);
     for id in [1, 2, 1] {
         assert_eq!(
             worker
-                .execute_report(Some(format!(r#"{{"id":{id}}}"#).into_bytes()), FAIL)
+                .execute_report(&mut Some(format!(r#"{{"id":{id}}}"#).into_bytes()), FAIL)
                 .unwrap()
                 .action,
             Action::Project(format!(r#"{{"id":{id},"tenant":"acme"}}"#).into_bytes())
@@ -642,8 +642,8 @@ fn compact_serialization_preserves_borrowed_tokens_and_native_results() {
     );
     let transform = plan(&[], &[], None, None, true);
     let input_plan = transform.input_plan();
-    let result = Worker::new(&transform, &input_plan, true)
-        .execute_report(Some(input.to_vec()), FAIL)
+    let result = Worker::new(&transform, &input_plan, true, usize::MAX)
+        .execute_report(&mut Some(input.to_vec()), FAIL)
         .unwrap();
     assert_eq!(
         result.action,
@@ -681,11 +681,11 @@ fn evaluated_pass_preserves_every_source_byte() {
     let source = br#"{ "id": 1.00, "deleted": false, "text": "\u0061" }
 "#;
     let input_plan = transform.input_plan();
-    let mut worker = Worker::new(&transform, &input_plan, false);
+    let mut worker = Worker::new(&transform, &input_plan, false, usize::MAX);
     for _ in 0..2 {
         assert_eq!(
             worker
-                .execute_report(Some(source.to_vec()), FAIL)
+                .execute_report(&mut Some(source.to_vec()), FAIL)
                 .unwrap()
                 .action,
             Action::PassThrough(PassPayload::Exact(source.to_vec()))
@@ -743,7 +743,7 @@ fn shared_nested_paths_preserve_actions_duplicates_missing_and_arrays() {
         false,
     );
     let input_plan = transform.input_plan();
-    let mut worker = Worker::new(&transform, &input_plan, false);
+    let mut worker = Worker::new(&transform, &input_plan, false, usize::MAX);
     for (source, expected) in [
         (r#"{"user":{"id":"drop"}}"#, Action::Drop),
         (r#"{"user":{"id":"delete","blocked":true}}"#, Action::Drop),
@@ -763,7 +763,7 @@ fn shared_nested_paths_preserve_actions_duplicates_missing_and_arrays() {
     ] {
         assert_eq!(
             worker
-                .execute_report(Some(source.as_bytes().to_vec()), FAIL)
+                .execute_report(&mut Some(source.as_bytes().to_vec()), FAIL)
                 .unwrap()
                 .action,
             expected,
@@ -810,8 +810,8 @@ fn shared_predicates_and_json_value_pass_serialize_the_complete_root() {
     let transform = plan(&["id = 0"], &["deleted = true"], None, None, true);
     let input_plan = transform.input_plan();
     let source = br#" { "id":1, "id":2, "deleted":false, "unused": [3, 4] } "#;
-    let result = Worker::new(&transform, &input_plan, true)
-        .execute_report(Some(source.to_vec()), FAIL)
+    let result = Worker::new(&transform, &input_plan, true, usize::MAX)
+        .execute_report(&mut Some(source.to_vec()), FAIL)
         .unwrap();
     assert_eq!(
         result.action,
@@ -820,4 +820,69 @@ fn shared_predicates_and_json_value_pass_serialize_the_complete_root() {
             source_length: source.len(),
         })
     );
+}
+
+#[test]
+fn projection_recycles_source_storage_without_retaining_oversized_capacity() {
+    let transform = plan(&[], &[], Some("id"), None, false);
+    let input_plan = transform.input_plan();
+    let mut worker = Worker::new(&transform, &input_plan, false, 128);
+    for capacity in [128, 129, 128] {
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(br#"{"id":1}"#);
+        let mut source = Some(bytes);
+        assert_eq!(
+            worker.execute_report(&mut source, FAIL).unwrap().action,
+            Action::Project(b"1".to_vec())
+        );
+        assert!(source.is_none());
+        assert_eq!(
+            worker.output.capacity(),
+            if capacity <= 128 { capacity } else { 0 }
+        );
+        assert!(worker.output.is_empty());
+    }
+}
+
+#[test]
+fn unused_source_storage_survives_actions_and_evaluation_failures() {
+    for (drops, tombstones, projection, source_bytes, policies) in [
+        (vec!["true"], vec![], None, b"{}".as_slice(), FAIL),
+        (vec![], vec!["true"], None, b"{}".as_slice(), FAIL),
+        (
+            vec![],
+            vec![],
+            Some("$error('fail')"),
+            b"{}".as_slice(),
+            FAIL,
+        ),
+        (
+            vec![],
+            vec![],
+            Some("($error('late'))"),
+            b"{}".as_slice(),
+            ErrorPolicies {
+                evaluation: EvaluationPolicy::Drop,
+                ..FAIL
+            },
+        ),
+        (vec![], vec![], Some("1"), b"invalid".as_slice(), FAIL),
+        (
+            vec![],
+            vec![],
+            Some("1"),
+            b"invalid".as_slice(),
+            ErrorPolicies {
+                invalid_json: InvalidJsonPolicy::Tombstone,
+                ..FAIL
+            },
+        ),
+    ] {
+        let transform = plan(&drops, &tombstones, projection, None, false);
+        let input_plan = transform.input_plan();
+        let mut source = Some(source_bytes.to_vec());
+        let _ =
+            Worker::new(&transform, &input_plan, false, 128).execute_report(&mut source, policies);
+        assert_eq!(source.as_deref(), Some(source_bytes));
+    }
 }

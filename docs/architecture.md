@@ -123,7 +123,12 @@ Project(compact JSON bytes)
 Every admitted record produces one completion, including drops and fatal
 transform results. This lets the partition completion frontier advance and
 releases source-byte accounting exactly once even though channel handoffs are
-batched.
+batched. The same release returns payload storage to its owning poller after
+writing or discarding the action. Each poller keeps cleared spare vectors, capped
+at the admitted-record limit and 1 MiB of total capacity; individual capacities
+over 16 KiB are discarded. Both capacity limits shrink to a smaller source-byte
+budget. Spare storage is outside logical source-byte accounting. No native
+Kafka message is retained across threads.
 
 ## Expression Execution
 
@@ -155,8 +160,12 @@ byte buffer, without detached values or an intermediate JSON string. A
 JSON-value pass uses `RawJson::write_compact` and retains source byte length.
 After successful serialization, the worker transfers the output buffer into
 the action and recycles the consumed source allocation as its next output
-buffer. That retained allocation is worker scratch outside the source-byte
-admission budget. Exact pass actions transfer the original bytes unchanged.
+buffer, provided its capacity fits the same 16 KiB/source-budget threshold.
+Oversized source allocations are discarded instead of becoming persistent
+scratch. Serialized output returns through the writer's release and can become
+source storage again, completing the same reuse cycle. Worker scratch is outside
+the source-byte admission budget. Exact pass actions transfer the original
+bytes unchanged; drops and failures retain unused source storage until release.
 
 See [expression-language.md](expression-language.md) for native jx serialization
 and missing-value behavior.

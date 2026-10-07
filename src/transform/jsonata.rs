@@ -78,35 +78,44 @@ pub(crate) struct Worker<'a> {
     input_plan: &'a InputPlan<'a>,
     embeds_json: bool,
     output: Vec<u8>,
+    max_recycled_capacity: usize,
 }
 
 impl<'a> Worker<'a> {
-    pub fn new(plan: &'a TransformPlan, input_plan: &'a InputPlan<'a>, embeds_json: bool) -> Self {
+    pub fn new(
+        plan: &'a TransformPlan,
+        input_plan: &'a InputPlan<'a>,
+        embeds_json: bool,
+        max_recycled_capacity: usize,
+    ) -> Self {
         Self {
             plan,
             input_plan,
             embeds_json,
             output: Vec::new(),
+            max_recycled_capacity,
         }
     }
 
     pub fn execute_report(
         &mut self,
-        payload: Option<Vec<u8>>,
+        source: &mut Option<Vec<u8>>,
         policies: ErrorPolicies,
     ) -> Result<Execution, TransformError> {
-        let Some(mut payload) = payload else {
+        let Some(payload) = source.as_ref() else {
             return evaluation_result(Ok(self.tombstone_action()), policies.evaluation);
         };
         if !self.plan.capabilities.parses_json {
             return evaluation_result(
-                Ok(Action::PassThrough(PassPayload::Exact(payload))),
+                Ok(Action::PassThrough(PassPayload::Exact(
+                    source.take().expect("source payload"),
+                ))),
                 policies.evaluation,
             );
         }
-        let input = match self.input_plan.prepare(&payload) {
+        let input = match self.input_plan.prepare(payload) {
             Ok(input) => input,
-            Err(error) => return invalid_json(policies.invalid_json, payload, error.to_string()),
+            Err(error) => return invalid_json(policies.invalid_json, source, error.to_string()),
         };
         match self.evaluate_predicates(&input) {
             Ok(Some(action)) => return evaluation_result(Ok(action), policies.evaluation),
@@ -134,7 +143,9 @@ impl<'a> Worker<'a> {
             )
         } else {
             return evaluation_result(
-                Ok(Action::PassThrough(PassPayload::Exact(payload))),
+                Ok(Action::PassThrough(PassPayload::Exact(
+                    source.take().expect("source payload"),
+                ))),
                 policies.evaluation,
             );
         };
@@ -146,8 +157,13 @@ impl<'a> Worker<'a> {
             );
         }
         // Results no longer borrow the source. Recycle its allocation for the next output.
-        payload.clear();
-        let bytes = mem::replace(&mut self.output, payload);
+        let mut payload = source.take().expect("source payload");
+        let bytes = if payload.capacity() <= self.max_recycled_capacity {
+            payload.clear();
+            mem::replace(&mut self.output, payload)
+        } else {
+            mem::take(&mut self.output)
+        };
         let action = if self.plan.projection.is_some() {
             Action::Project(bytes)
         } else {
@@ -265,7 +281,7 @@ fn evaluation_result(
 
 fn invalid_json(
     policy: InvalidJsonPolicy,
-    original: Vec<u8>,
+    original: &mut Option<Vec<u8>>,
     message: String,
 ) -> Result<Execution, TransformError> {
     match policy {
@@ -279,7 +295,9 @@ fn invalid_json(
             issue: Some(ExecutionIssue::InvalidJson),
         }),
         InvalidJsonPolicy::Pass => Ok(Execution {
-            action: Action::PassThrough(PassPayload::Exact(original)),
+            action: Action::PassThrough(PassPayload::Exact(
+                original.take().expect("source payload"),
+            )),
             issue: Some(ExecutionIssue::InvalidJson),
         }),
     }
@@ -298,12 +316,12 @@ fn evaluation_error(category: &str, index: Option<usize>, message: String) -> Tr
 #[cfg(test)]
 fn execute(
     plan: &TransformPlan,
-    payload: Option<Vec<u8>>,
+    mut payload: Option<Vec<u8>>,
     policies: ErrorPolicies,
 ) -> Result<Action, TransformError> {
     let input_plan = plan.input_plan();
-    Worker::new(plan, &input_plan, false)
-        .execute_report(payload, policies)
+    Worker::new(plan, &input_plan, false, usize::MAX)
+        .execute_report(&mut payload, policies)
         .map(|execution| execution.action)
 }
 
