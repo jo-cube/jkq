@@ -958,8 +958,8 @@ fn writer_loop(
         let mut releases = Vec::with_capacity(items.len());
         for completion in items {
             debug_assert_eq!(completion.consumer, consumer);
-            ready.clear();
-            if ordered {
+            let direct = if ordered {
+                ready.clear();
                 if let Err((message, completion)) = orderer.insert(completion, &mut ready) {
                     let completion = *completion;
                     release(&mut releases, completion);
@@ -970,10 +970,11 @@ fn writer_loop(
                         PipelineError::Runtime(message),
                     );
                 }
+                None
             } else {
-                ready.push(completion);
-            }
-            for completion in ready.drain(..) {
+                Some(completion)
+            };
+            for completion in direct.into_iter().chain(ready.drain(..)) {
                 if failure.is_none() {
                     match completion.outcome {
                         CompletionOutcome::Fatal(ref message) => {
@@ -1578,7 +1579,7 @@ mod tests {
 
     #[test]
     fn unordered_writer_emits_completion_arrival_order() {
-        let config = config(&["--unordered", "-f", "%o\\n"]);
+        let config = config(&["--unordered", "--drop-if", "false", "-f", "%o\\n"]);
         let (completion_tx, completion_rx) = bounded(2);
         let (release_tx, release_rx) = bounded(2);
         completion_tx
@@ -1606,6 +1607,72 @@ mod tests {
 
         assert_eq!(output, b"1\n0\n");
         assert_eq!(release_rx.iter().flatten().count(), 2);
+    }
+
+    #[test]
+    fn unordered_fatal_result_releases_all_storage_and_suppresses_later_output() {
+        let config = config(&["--unordered", "--drop-if", "false", "-f", "%S:%s\\n"]);
+        let (completion_tx, completion_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let mut dropped = completion(0, 5, 4, Action::Drop);
+        dropped.spare_payload = Some(b"drop".to_vec());
+        let mut tombstone = completion(0, 2, 6, Action::Tombstone);
+        tombstone.spare_payload = Some(b"delete".to_vec());
+        let mut fatal = fatal_completion(0, 0, 4);
+        fatal.spare_payload = Some(b"fail".to_vec());
+        completion_tx
+            .send(CompletionBatch {
+                consumer: 0,
+                items: vec![
+                    completion(0, 9, 1, pass(b"a")),
+                    dropped,
+                    tombstone,
+                    fatal,
+                    completion(0, 1, 8, Action::Project(b"late".to_vec())),
+                ],
+            })
+            .unwrap();
+        drop(completion_tx);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut output = Vec::new();
+        let error = writer_loop(
+            &config,
+            &mut output,
+            completion_rx,
+            vec![release_tx],
+            Arc::clone(&shutdown),
+            Arc::new(Stats::default()),
+            Arc::new(OnceLock::new()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PipelineError::Runtime(ref message) if message == "fatal transform")
+        );
+        assert_eq!(output, b"1:a\n-1:\n");
+        assert!(shutdown.load(Ordering::SeqCst));
+        let releases = release_rx.iter().flatten().collect::<Vec<_>>();
+        assert_eq!(releases.len(), 5);
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| release.retained_bytes)
+                .sum::<usize>(),
+            23
+        );
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| release.payload.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(b"a".as_slice()),
+                Some(b"drop".as_slice()),
+                Some(b"delete".as_slice()),
+                Some(b"fail".as_slice()),
+                Some(b"late".as_slice())
+            ]
+        );
     }
 
     #[test]
