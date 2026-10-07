@@ -1,5 +1,9 @@
 # Kafka throughput investigation
 
+This is a historical investigation. Its `-j`/worker-count examples describe
+an earlier CLI; evaluator parallelism is now automatic. See
+[the current runtime controls](usage.md#parallelism-and-memory).
+
 Measured on 2026-10-04, against jkq 0.10.1 at
 `cb733cd8db1a06282a580aba51a439fe7b2e4106`, with the working tree's existing
 expression changes present. Those changes are bypassed by the identity workload.

@@ -364,9 +364,13 @@ Without range sharding, extra consumers help only when multiple partitions
 are selected. With range sharding, each consumer has its own fetch,
 decompression, and native prefetch queue, even for one source partition.
 
-`-j, --jobs` controls JSON compute workers. The default is available CPU
-parallelism minus two, with a minimum of one. Identity transforms bypass the
-worker pool. Values must be between 1 and 1024.
+JSON evaluation uses an automatic shared evaluator pool, including parallel
+records from the same partition. There is no `--jobs` option. With `cpus` from
+Rust's available parallelism and `pollers` the actual active consumer count,
+the pool size is `max(1, ceil(cpus / 2), cpus - pollers - 1)`, capped by the
+global admitted-record limit. This leaves an allowance for polling and output
+without shrinking evaluation below half the available CPUs. Identity runs
+bypass the pool.
 
 Output remains ordered within each partition. `--unordered` emits transformed
 records as workers complete and removes that guarantee.
@@ -404,7 +408,7 @@ owned source-byte accounting remain bounded.
 
 High-throughput runs benefit most from keeping the work per input record
 predictable. Build with `--release`, test against representative records, and
-change one setting at a time rather than assuming that more workers or larger
+change one setting at a time rather than assuming that more consumers or larger
 buffers will help.
 
 ### Use objects for large membership sets
@@ -501,12 +505,11 @@ encoding fields the downstream consumer does not use. JSON-value envelopes
 also compactly serialize pass-through payloads, so use that mode when the
 downstream consumer benefits from a typed JSON field.
 
-### Scale consumers with partitions, then tune workers
+### Scale consumers with partitions
 
-The default worker count leaves one CPU for Kafka polling and one for output.
-Measure nearby `--jobs` values with representative payloads and expressions;
-additional workers can increase contention after polling or output becomes the
-bottleneck.
+Evaluator parallelism is automatic. `--consumers` controls Kafka polling and
+native fetch/decompression capacity; additional consumers can help when
+partitions or range shards provide independent work.
 
 Keep the default per-partition ordering when later records update earlier
 records. Use `--unordered` only when completion order is acceptable. If polling

@@ -3,14 +3,14 @@
 `jkq` is a threaded Kafka JSON-processing pipeline around directly assigned
 librdkafka consumers. The design keeps Kafka ownership, record actions,
 ordering, and shutdown visible while isolating expression runtime values
-inside compute workers.
+inside an automatic evaluator pool.
 
 ```text
 CLI and Kafka properties
 → startup expression and output plans
 → partition discovery, direct assignment, and offset resolution
 → one or more Kafka pollers with disjoint partition or bounded range assignments
-→ bounded record batches through compute workers
+→ bounded record batches through a shared evaluator pool
 → batched completions and per-partition ordering
 → one output writer
 ```
@@ -18,6 +18,12 @@ CLI and Kafka properties
 Plans that neither evaluate expressions nor explicitly validate JSON bypass the
 worker pool. The poller sends pass-through and tombstone completions directly
 to the writer.
+
+Evaluator concurrency is internal, derived from Rust's available parallelism
+and the actual poller count; see [parallelism and memory](usage.md#parallelism-and-memory).
+Ordered records from one partition can be evaluated concurrently. Batching
+amortizes transport and credit updates; it does not bind a partition to one
+evaluator.
 
 ## Boundaries
 
@@ -216,7 +222,11 @@ own configuration. Those allocations depend on the input, formats,
 expressions, and Kafka client settings. Bounded channels,
 `--max-inflight-records`, `--max-inflight-per-partition`, and the owned
 source-byte admission budget bound queued source work. Batches do not admit
-records ahead of those limits.
+records ahead of those limits. Work and completion channels each hold at most
+`ceil(max-inflight-records / 64)` batches and block their producers when full.
+Release channels can hold up to `max-inflight-records` messages per poller:
+this allows the writer to return every admitted credit without waiting for a
+poller that is blocked sending work.
 
 Charges are released only after ordered write or drop. Slow output therefore
 propagates pressure back to Kafka, and the reorder buffer cannot hold more

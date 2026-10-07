@@ -441,8 +441,6 @@ mod tests {
             "-p",
             "0",
             "--snapshot",
-            "-j",
-            "2",
             "--max-inflight-records",
             "2",
             "--max-inflight-per-partition",
@@ -500,8 +498,6 @@ mod tests {
                 "2",
                 "--max-inflight-bytes",
                 "16",
-                "-j",
-                "2",
                 "-f",
                 "%p:%o:%T:%k:%h:%S:%s\\n",
             ];
