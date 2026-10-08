@@ -1,7 +1,9 @@
+mod fetch;
+
 use std::{collections::BTreeMap, time::Duration};
 
 use rdkafka::{
-    ClientConfig, Message,
+    ClientConfig,
     consumer::{BaseConsumer, Consumer},
     error::{KafkaError, RDKafkaErrorCode},
     message::{Headers, Timestamp as KafkaTimestamp},
@@ -103,7 +105,7 @@ pub enum PollEvent {
 
 pub struct KafkaInput {
     pub(crate) payload_buffers: PayloadBuffers,
-    consumer: BaseConsumer,
+    consumer: fetch::FetchConsumer,
     topic: String,
     partitions: BTreeMap<i32, PartitionState>,
     remaining_partitions: usize,
@@ -248,9 +250,7 @@ impl KafkaInput {
                 .add_partition_offset(&config.topic, range.partition, range.start)
                 .map_err(|error| assignment_error(&config.topic, range.partition, error))?;
         }
-        consumer
-            .assign(&partitions)
-            .map_err(|error| format!("cannot assign topic {}: {error}", config.topic))?;
+        let consumer = fetch::FetchConsumer::new(consumer, &config.topic, &partitions)?;
         let partitions = assignment
             .ranges
             .into_iter()
@@ -303,26 +303,29 @@ impl KafkaInput {
         let Some(result) = self.consumer.poll(timeout) else {
             return Ok(PollEvent::Idle);
         };
-        let message = match result {
-            Ok(message) => message,
-            Err(KafkaError::PartitionEOF(partition)) => {
-                self.handle_eof(partition)?;
-                return Ok(PollEvent::Idle);
-            }
-            Err(error) if error.rdkafka_error_code() == Some(RDKafkaErrorCode::AutoOffsetReset) => {
-                return Err(format!("Kafka offset error: {error}"));
-            }
-            Err(error @ KafkaError::MessageConsumptionFatal(_)) => {
-                return Err(format!("fatal Kafka consumer error: {error}"));
-            }
-            Err(error) if self.error_policy == KafkaErrorPolicy::Continue => {
-                if !self.quiet {
-                    eprintln!("jkq: Kafka record error: {error}");
+        if result.is_err() {
+            let error = result.err().expect("failed Kafka poll has an error");
+            return match error {
+                KafkaError::PartitionEOF(partition) => {
+                    self.handle_eof(partition)?;
+                    Ok(PollEvent::Idle)
                 }
-                return Ok(PollEvent::Idle);
-            }
-            Err(error) => return Err(format!("Kafka record error: {error}")),
-        };
+                error if error.rdkafka_error_code() == Some(RDKafkaErrorCode::AutoOffsetReset) => {
+                    Err(format!("Kafka offset error: {error}"))
+                }
+                error @ KafkaError::MessageConsumptionFatal(_) => {
+                    Err(format!("fatal Kafka consumer error: {error}"))
+                }
+                error if self.error_policy == KafkaErrorPolicy::Continue => {
+                    if !self.quiet {
+                        eprintln!("jkq: Kafka record error: {error}");
+                    }
+                    Ok(PollEvent::Idle)
+                }
+                error => Err(format!("Kafka record error: {error}")),
+            };
+        }
+        let message = result.unwrap();
 
         let partition = message.partition();
         let Some(state) = self.partitions.get(&partition).copied() else {
@@ -389,6 +392,7 @@ impl KafkaInput {
         let should_finish = match state.range.end_exclusive {
             Some(end) => {
                 self.consumer
+                    .consumer()
                     .fetch_watermarks(&self.topic, partition, METADATA_TIMEOUT)
                     .map_err(|error| watermark_error(&self.topic, partition, error))?
                     .1
@@ -427,6 +431,7 @@ impl KafkaInput {
         let mut partitions = TopicPartitionList::new();
         partitions.add_partition(&self.topic, partition);
         self.consumer
+            .consumer()
             .pause(&partitions)
             .map_err(|error| format!("cannot pause {} partition {partition}: {error}", self.topic))
     }
@@ -486,7 +491,7 @@ fn consumer_assignments(
 }
 
 fn retained_bytes(
-    message: &rdkafka::message::BorrowedMessage<'_>,
+    message: &fetch::NativeMessage<'_>,
     requirements: OutputRequirements,
 ) -> Result<usize, String> {
     let mut bytes = message.payload().map_or(0, <[u8]>::len);

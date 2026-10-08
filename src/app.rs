@@ -382,6 +382,33 @@ mod tests {
     }
 
     #[test]
+    fn range_and_count_boundaries_discard_native_read_ahead() {
+        let fixture = Fixture::new("native-read-ahead", 1);
+        for offset in 0..70 {
+            fixture.produce(0, Some(b"value"), None, offset, None);
+        }
+        for (arguments, expected) in [
+            (
+                vec!["-o", "7", "--end-offset", "12"],
+                b"7\n8\n9\n10\n11\n".as_slice(),
+            ),
+            (vec!["-o", "7", "-c", "2"], b"7\n8\n".as_slice()),
+            (
+                vec!["-o", "7", "--count-per-partition", "2"],
+                b"7\n8\n".as_slice(),
+            ),
+            (vec!["-o", "7", "--end-offset", "7"], b"".as_slice()),
+        ] {
+            let mut arguments = arguments;
+            arguments.extend(["-p", "0", "-f", "%o\\n"]);
+            let config = fixture.config(&arguments);
+            let mut output = Vec::new();
+            run_with_writer(&config, &mut output).unwrap();
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
     fn count_counts_drops_and_eof_drains_the_partition() {
         let fixture = Fixture::new("count-eof", 1);
         for value in 0..3 {

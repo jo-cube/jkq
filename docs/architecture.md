@@ -31,7 +31,8 @@ evaluator.
 src/main.rs                process exit behavior
 src/cli.rs                 parsing, validation, config, startup plans
 src/app.rs                 process IO, signals, pipeline assembly
-src/kafka.rs               assignment, offsets, polling, owned records
+src/kafka.rs               assignment, offsets, owned records
+src/kafka/fetch.rs         native fetch queue, batch extraction, message lifetime
 src/transform/mod.rs       shared compiled expressions and variable validation
 src/transform/jsonata.rs   jx evaluation, serialization, and record actions
 src/runtime.rs             poller, workers, writer, shutdown, statistics
@@ -94,9 +95,21 @@ are not assigned to the running process.
 
 ## Record Ownership
 
-librdkafka messages are borrowed. The poller copies the payload and only the
-source metadata required by either compiled format, then releases the borrowed
-message. It never mutates librdkafka-owned memory.
+Each consumer forwards its assigned partition fetch queues into one dedicated
+native queue before its initial assignment starts fetching. A fixed 32-slot
+reader extracts ready messages with `rd_kafka_consume_batch_queue`; it never
+consumes rust-rdkafka's combined event queue. Between refills,
+`BaseConsumer::poll(0)` services consumer errors and callbacks, including
+statistics. An empty fetch queue waits for one message for at most 100 ms,
+so a partial batch does not wait to fill. Assignment is fixed for the run;
+a new assignment requires a new reader and fresh forwarding.
+
+The poller copies the payload and only the source metadata required by either
+compiled format, then destroys the native message. It never mutates
+librdkafka-owned memory or sends native messages to evaluators. The reader
+owns its consumer and destroys pending messages and queue references before
+the client. Permanent range/count completion still pauses the partition;
+already extracted messages outside a completed range are discarded.
 
 Each admitted input gets a dense local partition sequence. Kafka offsets remain
 source metadata; the local sequence drives completion ordering even when
@@ -226,9 +239,12 @@ covers owned bytes copied from the source record:
 
 The charge intentionally excludes the worker-local output buffer, evaluation
 intermediates, projected output, the writer-local payload-format buffer, and compact pass output for a JSON-value envelope. It
-also excludes librdkafka's internal prefetch queue, which follows librdkafka's
-own configuration. Those allocations depend on the input, formats,
-expressions, and Kafka client settings. Bounded channels,
+also excludes librdkafka's native fetch queue, which follows librdkafka's
+prefetch configuration. Batch extraction retains at most 31 additional native
+messages per poller outside admission; their record sizes and shared native
+fetch buffers are not bounded by jkq's source-byte budget. The reader does
+not refill while an owned record waits for admission. Those allocations depend
+on the input, formats, expressions, and Kafka client settings. Bounded channels,
 `--max-inflight-records`, `--max-inflight-per-partition`, and the owned
 source-byte admission budget bound queued source work. Batches do not admit
 records ahead of those limits. Work and completion channels each hold at most
