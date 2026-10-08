@@ -1,5 +1,9 @@
 # Bounded Kafka range sharding
 
+This is a historical investigation. Its `-j`/worker-count examples describe
+an earlier CLI; evaluator parallelism is now automatic. See
+[the current runtime controls](usage.md#parallelism-and-memory).
+
 Measured on 2026-10-04 after the initial [Kafka throughput investigation](kafka-throughput-investigation.md).
 The retained implementation adds `--range-sharding`, requiring `--unordered`
 and a fixed end boundary. `--consumers` remains the upper bound on independent

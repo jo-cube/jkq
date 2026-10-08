@@ -1,14 +1,8 @@
-use std::{fmt, str};
+use std::{fmt, mem};
 
-use jsonata_core::{
-    ast::AstNode,
-    evaluator::{Context, Evaluator},
-    parser,
-    value::JValue,
-};
+use jx::{Evaluation, InputPlan, PreparedInput};
 
 use super::TransformPlan;
-use super::tape::{TapePlan, TapeResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidJsonPolicy {
@@ -79,205 +73,187 @@ impl fmt::Display for TransformError {
 
 impl std::error::Error for TransformError {}
 
-pub(crate) struct Worker {
-    parses_json: bool,
+pub(crate) struct Worker<'a> {
+    plan: &'a TransformPlan,
+    input_plan: &'a InputPlan<'a>,
     embeds_json: bool,
-    drop_tombstones: bool,
-    drops: Vec<AstNode>,
-    tombstones: Vec<AstNode>,
-    projection: Option<AstNode>,
-    variables: Option<JValue>,
-    tape: Option<TapePlan>,
+    output: Vec<u8>,
+    max_recycled_capacity: usize,
 }
 
-impl Worker {
-    pub fn new(plan: &TransformPlan, embeds_json: bool) -> Self {
-        let drops: Vec<_> = plan.drops.iter().map(|source| parsed(source)).collect();
-        let tombstones: Vec<_> = plan
-            .tombstones
-            .iter()
-            .map(|source| parsed(source))
-            .collect();
-        let projection = plan.projection.as_deref().map(parsed);
-        let variables = plan.variables.as_deref().map(|source| {
-            JValue::from_json_str(source).expect("startup validated JSONata variables")
-        });
-        let tape = TapePlan::new(
-            &drops,
-            &tombstones,
-            projection.as_ref(),
-            variables.as_ref(),
-            embeds_json,
-        );
+impl<'a> Worker<'a> {
+    pub fn new(
+        plan: &'a TransformPlan,
+        input_plan: &'a InputPlan<'a>,
+        embeds_json: bool,
+        max_recycled_capacity: usize,
+    ) -> Self {
         Self {
-            parses_json: plan.capabilities.parses_json,
+            plan,
+            input_plan,
             embeds_json,
-            drop_tombstones: plan.drop_tombstones,
-            drops,
-            tombstones,
-            projection,
-            variables,
-            tape,
+            output: Vec::new(),
+            max_recycled_capacity,
         }
     }
 
     pub fn execute_report(
-        &self,
-        payload: Option<Vec<u8>>,
+        &mut self,
+        source: &mut Option<Vec<u8>>,
         policies: ErrorPolicies,
     ) -> Result<Execution, TransformError> {
-        let Some(payload) = payload else {
-            return Ok(Execution {
-                action: self.tombstone_action(),
-                issue: None,
-            });
+        let Some(payload) = source.as_ref() else {
+            return evaluation_result(Ok(self.tombstone_action()), policies.evaluation);
         };
-        if !self.parses_json {
-            return Ok(Execution {
-                action: Action::PassThrough(PassPayload::Exact(payload)),
-                issue: None,
-            });
+        if !self.plan.capabilities.parses_json {
+            return evaluation_result(
+                Ok(Action::PassThrough(PassPayload::Exact(
+                    source.take().expect("source payload"),
+                ))),
+                policies.evaluation,
+            );
+        }
+        let input = match self.input_plan.prepare(payload) {
+            Ok(input) => input,
+            Err(error) => return invalid_json(policies.invalid_json, source, error.to_string()),
+        };
+        match self.evaluate_predicates(&input) {
+            Ok(Some(action)) => return evaluation_result(Ok(action), policies.evaluation),
+            Err(error) => return evaluation_result(Err(error), policies.evaluation),
+            Ok(None) => {}
         }
 
-        if let Some(result) = self.tape.as_ref().and_then(|tape| tape.execute(&payload)) {
-            let action = match result {
-                TapeResult::Drop => Ok(Action::Drop),
-                TapeResult::Tombstone => Ok(self.tombstone_action()),
-                TapeResult::Pass => Ok(Action::PassThrough(PassPayload::Exact(payload))),
-                TapeResult::Fallback {
-                    document,
-                    completed_predicates,
-                } => self.evaluate(&document, payload, completed_predicates),
-                TapeResult::Survivor(document) => self.project_or_pass(&document, payload),
-            };
-            return evaluation_result(action, policies.evaluation);
+        let source_length = payload.len();
+        self.output.clear();
+        let (result, category) = if self.plan.projection.is_some() {
+            (
+                input
+                    .evaluate(self.plan.drops.len() + self.plan.tombstones.len())
+                    .map_err(|error| error.to_string())
+                    .and_then(|evaluation| serialize_projection(evaluation, &mut self.output)),
+                "projection",
+            )
+        } else if self.embeds_json {
+            (
+                input
+                    .as_raw()
+                    .write_compact(&mut self.output)
+                    .map_err(|error| error.to_string()),
+                "envelope payload",
+            )
+        } else {
+            return evaluation_result(
+                Ok(Action::PassThrough(PassPayload::Exact(
+                    source.take().expect("source payload"),
+                ))),
+                policies.evaluation,
+            );
+        };
+        if let Err(message) = result {
+            self.output.clear();
+            return evaluation_result(
+                Err(evaluation_error(category, None, message)),
+                policies.evaluation,
+            );
         }
-
-        self.execute_jsonata(payload, policies)
+        // Results no longer borrow the source. Recycle its allocation for the next output.
+        let mut payload = source.take().expect("source payload");
+        let bytes = if payload.capacity() <= self.max_recycled_capacity {
+            payload.clear();
+            mem::replace(&mut self.output, payload)
+        } else {
+            mem::take(&mut self.output)
+        };
+        let action = if self.plan.projection.is_some() {
+            Action::Project(bytes)
+        } else {
+            Action::PassThrough(PassPayload::Json {
+                bytes,
+                source_length,
+            })
+        };
+        evaluation_result(Ok(action), policies.evaluation)
     }
 
-    fn execute_jsonata(
+    fn evaluate_predicates(
         &self,
-        payload: Vec<u8>,
-        policies: ErrorPolicies,
-    ) -> Result<Execution, TransformError> {
-        let source = match str::from_utf8(&payload) {
-            Ok(source) => source,
-            Err(error) => {
-                return invalid_json(policies.invalid_json, payload, error.to_string());
-            }
-        };
-        let document = match JValue::from_json_str(source) {
-            Ok(document) => document,
-            Err(error) => {
-                return invalid_json(policies.invalid_json, payload, error.to_string());
-            }
-        };
-
-        evaluation_result(self.evaluate(&document, payload, 0), policies.evaluation)
-    }
-
-    fn evaluate(
-        &self,
-        document: &JValue,
-        original: Vec<u8>,
-        completed_predicates: usize,
-    ) -> Result<Action, TransformError> {
-        for (index, expression) in self.drops.iter().enumerate().skip(completed_predicates) {
-            if self.predicate(expression, document, "drop predicate", index)? {
-                return Ok(Action::Drop);
+        input: &PreparedInput<'_, 'a, '_>,
+    ) -> Result<Option<Action>, TransformError> {
+        for index in 0..self.plan.drops.len() {
+            if self.predicate(input, index, "drop predicate", index)? {
+                return Ok(Some(Action::Drop));
             }
         }
-        for (index, expression) in self
-            .tombstones
-            .iter()
-            .enumerate()
-            .skip(completed_predicates.saturating_sub(self.drops.len()))
-        {
-            if self.predicate(expression, document, "tombstone predicate", index)? {
-                return Ok(self.tombstone_action());
+        for index in 0..self.plan.tombstones.len() {
+            if self.predicate(
+                input,
+                self.plan.drops.len() + index,
+                "tombstone predicate",
+                index,
+            )? {
+                return Ok(Some(self.tombstone_action()));
             }
         }
-        self.project_or_pass(document, original)
-    }
-
-    fn project_or_pass(
-        &self,
-        document: &JValue,
-        original: Vec<u8>,
-    ) -> Result<Action, TransformError> {
-        let Some(expression) = &self.projection else {
-            if !self.embeds_json {
-                return Ok(Action::PassThrough(PassPayload::Exact(original)));
-            }
-            let source_length = original.len();
-            // Strict parsing already limits this tree to JSON variants; avoid a second full walk.
-            return document
-                .to_json_string()
-                .map(|json| {
-                    Action::PassThrough(PassPayload::Json {
-                        bytes: json.into_bytes(),
-                        source_length,
-                    })
-                })
-                .map_err(|error| evaluation_error("envelope payload", None, error.to_string()));
-        };
-
-        let value = self
-            .evaluate_expression(expression, document)
-            .map_err(|message| evaluation_error("projection", None, message))?;
-        validate_json_result(&value)
-            .map_err(|message| evaluation_error("projection", None, message))?;
-        value
-            .to_json_string()
-            .map(|json| Action::Project(json.into_bytes()))
-            .map_err(|error| evaluation_error("projection", None, error.to_string()))
+        Ok(None)
     }
 
     fn predicate(
         &self,
-        expression: &AstNode,
-        document: &JValue,
+        input: &PreparedInput<'_, 'a, '_>,
+        expression_index: usize,
         category: &'static str,
         index: usize,
     ) -> Result<bool, TransformError> {
-        let value = self
-            .evaluate_expression(expression, document)
-            .map_err(|message| evaluation_error(category, Some(index), message))?;
-        value.as_bool().ok_or_else(|| {
-            evaluation_error(
-                category,
-                Some(index),
-                format!("result must be a Boolean, received {}", value_type(&value)),
-            )
+        let value = input
+            .evaluate(expression_index)
+            .and_then(Evaluation::single)
+            .map_err(|error| evaluation_error(category, Some(index), error.to_string()))?;
+        value.as_ref().and_then(jx::Value::as_bool).ok_or_else(|| {
+            evaluation_error(category, Some(index), "result must be a Boolean".to_owned())
         })
     }
 
     fn tombstone_action(&self) -> Action {
-        if self.drop_tombstones {
+        if self.plan.drop_tombstones {
             Action::Drop
         } else {
             Action::Tombstone
         }
     }
-
-    fn evaluate_expression(
-        &self,
-        expression: &AstNode,
-        document: &JValue,
-    ) -> Result<JValue, String> {
-        let mut context = Context::new();
-        if let Some(variables) = &self.variables {
-            context.bind("vars".to_owned(), variables.clone());
-        }
-        Evaluator::with_context(context)
-            .evaluate(expression, document)
-            .map_err(|error| error.to_string())
-    }
 }
 
-fn parsed(source: &str) -> AstNode {
-    parser::parse(source).expect("startup validated JSONata expression")
+fn serialize_projection(
+    evaluation: Evaluation<'_, '_>,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    let mut first = None;
+    let mut sequence = false;
+    evaluation
+        .try_for_each(|value| {
+            if sequence {
+                output.push(b',');
+            } else if let Some(first) = first.take() {
+                sequence = true;
+                output.push(b'[');
+                jx::Value::write_compact(&first, &mut *output)?;
+                output.push(b',');
+            } else {
+                first = Some(value);
+                return Ok(());
+            }
+            value.write_compact(&mut *output)
+        })
+        .map_err(|error| error.to_string())?;
+    if sequence {
+        output.push(b']');
+        Ok(())
+    } else if let Some(first) = first {
+        first
+            .write_compact(output)
+            .map_err(|error| error.to_string())
+    } else {
+        Err("projection emitted no results".to_owned())
+    }
 }
 
 fn evaluation_result(
@@ -305,7 +281,7 @@ fn evaluation_result(
 
 fn invalid_json(
     policy: InvalidJsonPolicy,
-    original: Vec<u8>,
+    original: &mut Option<Vec<u8>>,
     message: String,
 ) -> Result<Execution, TransformError> {
     match policy {
@@ -319,7 +295,9 @@ fn invalid_json(
             issue: Some(ExecutionIssue::InvalidJson),
         }),
         InvalidJsonPolicy::Pass => Ok(Execution {
-            action: Action::PassThrough(PassPayload::Exact(original)),
+            action: Action::PassThrough(PassPayload::Exact(
+                original.take().expect("source payload"),
+            )),
             issue: Some(ExecutionIssue::InvalidJson),
         }),
     }
@@ -335,768 +313,17 @@ fn evaluation_error(category: &str, index: Option<usize>, message: String) -> Tr
     }
 }
 
-fn validate_json_result(value: &JValue) -> Result<(), String> {
-    match value {
-        JValue::Null | JValue::Bool(_) | JValue::String(_) => Ok(()),
-        JValue::Number(number) if number.is_finite() => Ok(()),
-        JValue::Number(_) => Err("result contains a non-finite number".to_owned()),
-        JValue::Array(values) => values.iter().try_for_each(validate_json_result),
-        JValue::Object(fields) => fields.values().try_for_each(validate_json_result),
-        JValue::Undefined => Err("result is Undefined".to_owned()),
-        JValue::Lambda { .. } | JValue::Builtin { .. } => {
-            Err("result contains a function".to_owned())
-        }
-        JValue::Regex { .. } => Err("result contains a regular expression".to_owned()),
-    }
-}
-
-fn value_type(value: &JValue) -> &'static str {
-    match value {
-        JValue::Null => "null",
-        JValue::Bool(_) => "Boolean",
-        JValue::Number(_) => "number",
-        JValue::String(_) => "string",
-        JValue::Array(_) => "array",
-        JValue::Object(_) => "object",
-        JValue::Undefined => "Undefined",
-        JValue::Lambda { .. } | JValue::Builtin { .. } => "function",
-        JValue::Regex { .. } => "regular expression",
-    }
-}
-
 #[cfg(test)]
 fn execute(
     plan: &TransformPlan,
-    payload: Option<Vec<u8>>,
+    mut payload: Option<Vec<u8>>,
     policies: ErrorPolicies,
 ) -> Result<Action, TransformError> {
-    Worker::new(plan, false)
-        .execute_report(payload, policies)
+    let input_plan = plan.input_plan();
+    Worker::new(plan, &input_plan, false, usize::MAX)
+        .execute_report(&mut payload, policies)
         .map(|execution| execution.action)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transform::build_plan;
-
-    const FAIL: ErrorPolicies = ErrorPolicies {
-        invalid_json: InvalidJsonPolicy::Fail,
-        evaluation: EvaluationPolicy::Fail,
-    };
-
-    fn plan(
-        drops: &[&str],
-        tombstones: &[&str],
-        projection: Option<&str>,
-        variables: Option<&str>,
-        validate: bool,
-    ) -> TransformPlan {
-        build_plan(
-            &drops
-                .iter()
-                .map(|value| (*value).to_owned())
-                .collect::<Vec<_>>(),
-            &tombstones
-                .iter()
-                .map(|value| (*value).to_owned())
-                .collect::<Vec<_>>(),
-            false,
-            projection,
-            variables,
-            validate,
-        )
-        .unwrap()
-    }
-
-    fn run(plan: &TransformPlan, input: Option<&[u8]>) -> Result<Action, TransformError> {
-        execute(plan, input.map(<[u8]>::to_vec), FAIL)
-    }
-
-    #[test]
-    fn jsonata_filters_maps_and_aggregates() {
-        let transform = plan(
-            &[],
-            &[],
-            Some(r#"{"names": items[price >= 10].name, "total": $sum(items[price >= 10].price)}"#),
-            None,
-            false,
-        );
-        assert_eq!(
-            run(
-                &transform,
-                Some(br#"{"items":[{"name":"a","price":4},{"name":"b","price":10},{"name":"c","price":12}]}"#)
-            )
-            .unwrap(),
-            Action::Project(br#"{"names":["b","c"],"total":22}"#.to_vec())
-        );
-    }
-
-    #[test]
-    fn actions_follow_drop_tombstone_projection_pass_precedence() {
-        let dropped = plan(&["true"], &["true"], Some("1"), None, false);
-        assert_eq!(run(&dropped, Some(b"{}")).unwrap(), Action::Drop);
-
-        let tombstone = plan(&["false"], &["true"], Some("1"), None, false);
-        assert_eq!(run(&tombstone, Some(b"{}")).unwrap(), Action::Tombstone);
-
-        let projected = plan(&[], &[], Some("1"), None, false);
-        assert_eq!(
-            run(&projected, Some(b"{}")).unwrap(),
-            Action::Project(b"1".to_vec())
-        );
-
-        let passed = plan(&[], &[], None, None, false);
-        assert_eq!(
-            run(&passed, Some(b"{ \"a\" : 1 }")).unwrap(),
-            Action::PassThrough(PassPayload::Exact(b"{ \"a\" : 1 }".to_vec()))
-        );
-    }
-
-    #[test]
-    fn json_value_pass_compacts_payload_and_retains_source_length() {
-        let transform = plan(&[], &[], None, None, true);
-        let source = b"{\n  \"a\": 1\n}";
-        let execution = Worker::new(&transform, true)
-            .execute_report(Some(source.to_vec()), FAIL)
-            .unwrap();
-
-        assert_eq!(
-            execution.action,
-            Action::PassThrough(PassPayload::Json {
-                bytes: br#"{"a":1}"#.to_vec(),
-                source_length: source.len(),
-            })
-        );
-    }
-
-    #[test]
-    fn repeated_predicates_short_circuit_in_command_line_order() {
-        for (drops, tombstones, expected) in [
-            (
-                vec!["first = 1", "$error(\"must not run\")"],
-                vec![],
-                Action::Drop,
-            ),
-            (
-                vec!["false"],
-                vec!["first = 1", "$error(\"must not run\")"],
-                Action::Tombstone,
-            ),
-        ] {
-            let transform = plan(&drops, &tombstones, None, None, false);
-            assert_eq!(run(&transform, Some(br#"{"first":1}"#)).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn action_predicates_require_boolean_results() {
-        for expression in ["missing", "null", "0", r#""value""#, "[]", "{}", "$sum"] {
-            let transform = plan(&[expression], &[], None, None, false);
-            let error = run(&transform, Some(b"{}")).unwrap_err();
-            assert!(
-                error.to_string().contains("result must be a Boolean"),
-                "{expression}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn source_tombstones_bypass_evaluation() {
-        let transform = plan(
-            &["$error(\"must not run\")"],
-            &[],
-            Some("missing"),
-            None,
-            false,
-        );
-        assert_eq!(run(&transform, None).unwrap(), Action::Tombstone);
-    }
-
-    #[test]
-    fn drop_tombstones_applies_before_projection() {
-        let transform =
-            build_plan(&[], &["deleted".to_owned()], true, Some("id"), None, false).unwrap();
-
-        assert_eq!(run(&transform, None).unwrap(), Action::Drop);
-        assert_eq!(
-            run(&transform, Some(br#"{"deleted":true,"id":1}"#)).unwrap(),
-            Action::Drop
-        );
-        assert_eq!(
-            run(&transform, Some(br#"{"deleted":false,"id":1}"#)).unwrap(),
-            Action::Project(b"1".to_vec())
-        );
-
-        let transform = build_plan(&[], &["deleted".to_owned()], true, None, None, false).unwrap();
-        assert_eq!(
-            run(&transform, Some(br#"{"deleted":true}"#)).unwrap(),
-            Action::Drop
-        );
-    }
-
-    #[test]
-    fn invalid_json_policies_preserve_exact_pass_bytes() {
-        let transform = plan(&[], &[], None, None, true);
-        let worker = Worker::new(&transform, false);
-        assert_eq!(
-            worker
-                .tape
-                .as_ref()
-                .and_then(|tape| tape.execute(br#"{"valid":true}"#)),
-            Some(TapeResult::Pass)
-        );
-        let invalid = b"{ not json \xff".to_vec();
-        for (policy, expected) in [
-            (InvalidJsonPolicy::Drop, Action::Drop),
-            (InvalidJsonPolicy::Tombstone, Action::Tombstone),
-            (
-                InvalidJsonPolicy::Pass,
-                Action::PassThrough(PassPayload::Exact(invalid.clone())),
-            ),
-        ] {
-            let result = Worker::new(&transform, false)
-                .execute_report(
-                    Some(invalid.clone()),
-                    ErrorPolicies {
-                        invalid_json: policy,
-                        evaluation: EvaluationPolicy::Fail,
-                    },
-                )
-                .unwrap();
-            assert_eq!(result.action, expected);
-            assert_eq!(result.issue, Some(ExecutionIssue::InvalidJson));
-        }
-        assert!(run(&transform, Some(&invalid)).is_err());
-    }
-
-    #[test]
-    fn evaluation_errors_and_undefined_follow_policy() {
-        for projection in ["$error(\"failure\")", "missing"] {
-            let transform = plan(&[], &[], Some(projection), None, false);
-            for (policy, expected) in [
-                (EvaluationPolicy::Drop, Action::Drop),
-                (EvaluationPolicy::Tombstone, Action::Tombstone),
-            ] {
-                let result = Worker::new(&transform, false)
-                    .execute_report(
-                        Some(b"{}".to_vec()),
-                        ErrorPolicies {
-                            invalid_json: InvalidJsonPolicy::Fail,
-                            evaluation: policy,
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(result.action, expected);
-                assert_eq!(result.issue, Some(ExecutionIssue::Evaluation));
-            }
-        }
-    }
-
-    #[test]
-    fn evaluation_errors_identify_the_expression_category() {
-        for (drops, tombstones, projection, category) in [
-            (
-                vec!["$error(\"failure\")"],
-                vec![],
-                None,
-                "drop predicate #1",
-            ),
-            (
-                vec![],
-                vec!["$error(\"failure\")"],
-                None,
-                "tombstone predicate #1",
-            ),
-            (vec![], vec![], Some("$error(\"failure\")"), "projection"),
-        ] {
-            let transform = plan(&drops, &tombstones, projection, None, false);
-            assert!(
-                run(&transform, Some(b"{}"))
-                    .unwrap_err()
-                    .to_string()
-                    .starts_with(category),
-                "{category}"
-            );
-        }
-    }
-
-    #[test]
-    fn projected_null_empty_payload_and_tombstone_are_distinct() {
-        let projected = plan(&[], &[], Some("null"), None, false);
-        assert_eq!(
-            run(&projected, Some(b"{}")).unwrap(),
-            Action::Project(b"null".to_vec())
-        );
-
-        let passed = plan(&[], &[], None, None, false);
-        assert_eq!(
-            run(&passed, Some(b"")).unwrap(),
-            Action::PassThrough(PassPayload::Exact(Vec::new()))
-        );
-        assert_eq!(run(&passed, None).unwrap(), Action::Tombstone);
-    }
-
-    #[test]
-    fn result_sequences_serialize_as_one_payload() {
-        let transform = plan(&[], &[], Some("items.price"), None, false);
-        assert_eq!(
-            run(&transform, Some(br#"{"items":[{"price":2},{"price":3}]}"#)).unwrap(),
-            Action::Project(b"[2,3]".to_vec())
-        );
-    }
-
-    #[test]
-    fn native_missing_values_are_omitted_from_constructed_results() {
-        for (projection, expected) in [
-            (
-                r#"{"kept": 1, "missing": missing}"#,
-                br#"{"kept":1}"#.as_slice(),
-            ),
-            ("[missing, 1]", b"[1]".as_slice()),
-        ] {
-            let transform = plan(&[], &[], Some(projection), None, false);
-            assert_eq!(
-                run(&transform, Some(b"{}")).unwrap(),
-                Action::Project(expected.to_vec()),
-                "{projection}"
-            );
-        }
-    }
-
-    #[test]
-    fn vars_are_bound_immutably_for_every_expression() {
-        let transform = plan(
-            &["tenant != $vars.tenant"],
-            &[],
-            Some(r#"{"tenant": $vars.tenant, "cutoff": $vars.cutoff}"#),
-            Some(r#"{"tenant":"acme","cutoff":1000}"#),
-            false,
-        );
-        assert_eq!(
-            run(&transform, Some(br#"{"tenant":"acme"}"#)).unwrap(),
-            Action::Project(br#"{"tenant":"acme","cutoff":1000}"#.to_vec())
-        );
-    }
-
-    #[test]
-    fn evaluator_root_and_assignments_do_not_leak_between_records() {
-        let transform = plan(&[], &[], Some("($seen := id; $seen)"), None, false);
-        let worker = Worker::new(&transform, false);
-        for (input, expected) in [
-            (br#"{"id":1}"#.as_slice(), b"1".as_slice()),
-            (br#"{"id":2}"#.as_slice(), b"2".as_slice()),
-        ] {
-            assert_eq!(
-                worker
-                    .execute_report(Some(input.to_vec()), FAIL)
-                    .unwrap()
-                    .action,
-                Action::Project(expected.to_vec())
-            );
-        }
-    }
-
-    #[test]
-    fn large_integers_follow_ieee_754_semantics() {
-        let transform = plan(&[], &[], Some("value"), None, false);
-        assert_eq!(
-            run(&transform, Some(br#"{"value":9007199254740993}"#)).unwrap(),
-            Action::Project(b"9007199254740992".to_vec())
-        );
-    }
-
-    #[test]
-    fn tape_predicates_match_jsonata_scalar_semantics() {
-        for (expression, variables, input, expected) in [
-            (
-                r#"kind = "ignore""#,
-                None,
-                br#"{"kind":"ignore"}"#.as_slice(),
-                TapeResult::Drop,
-            ),
-            (
-                r#"kind = "ignore""#,
-                None,
-                br#"{"kind":"keep"}"#.as_slice(),
-                TapeResult::Pass,
-            ),
-            (
-                "10 <= metrics.score",
-                None,
-                br#"{"metrics":{"score":10}}"#.as_slice(),
-                TapeResult::Drop,
-            ),
-            (
-                "tenant != $vars.tenant",
-                Some(r#"{"tenant":"acme"}"#),
-                br#"{"tenant":"other"}"#.as_slice(),
-                TapeResult::Drop,
-            ),
-            (
-                r#"(kind = "event" and active) or force = true"#,
-                None,
-                br#"{"kind":"event","active":true}"#.as_slice(),
-                TapeResult::Drop,
-            ),
-            (
-                r#"status = "keep""#,
-                None,
-                br#"{"status":"drop","status":"keep"}"#.as_slice(),
-                TapeResult::Drop,
-            ),
-            (
-                "value = 9007199254740992",
-                None,
-                br#"{"value":9007199254740993}"#.as_slice(),
-                TapeResult::Drop,
-            ),
-            (
-                "missing != null",
-                None,
-                br#"{}"#.as_slice(),
-                TapeResult::Drop,
-            ),
-        ] {
-            let transform = plan(&[expression], &[], None, variables, false);
-            let worker = Worker::new(&transform, false);
-            assert_eq!(
-                worker.tape.as_ref().and_then(|tape| tape.execute(input)),
-                Some(expected),
-                "{expression}"
-            );
-            assert_eq!(
-                worker.execute_report(Some(input.to_vec()), FAIL),
-                worker.execute_jsonata(input.to_vec(), FAIL),
-                "{expression}"
-            );
-        }
-    }
-
-    #[test]
-    fn tape_lookup_matches_native_for_string_keys_and_scalar_results() {
-        let variables = r#"{"rules":{"acme:42":true,"a:b:c:d":true,"acme:é":false,"":null,"number":3,"text":"yes"}}"#;
-        for (expression, input, expected) in [
-            (
-                r#"$lookup($vars.rules, tenant & ":" & account) = true"#,
-                r#"{"tenant":"acme","account":"42"}"#,
-                TapeResult::Tombstone,
-            ),
-            (
-                r#"$lookup($vars.rules, tenant & ":" & account) = true"#,
-                r#"{"tenant":"acme","account":"missing"}"#,
-                TapeResult::Pass,
-            ),
-            (
-                r#"$lookup($vars.rules, tenant & ":" & account) = false"#,
-                r#"{"tenant":"acme","account":"42","account":"\u00e9"}"#,
-                TapeResult::Tombstone,
-            ),
-            (
-                r#"$lookup($vars.rules, (a & ":" & b) & ":" & c & ":" & d) = true"#,
-                r#"{"a":"a","b":"b","c":"c","d":"d"}"#,
-                TapeResult::Tombstone,
-            ),
-            (
-                r#"$lookup($vars.rules, key) = null"#,
-                r#"{"key":""}"#,
-                TapeResult::Tombstone,
-            ),
-            (
-                r#"$lookup($vars.rules, key) = null"#,
-                r#"{"key":"absent"}"#,
-                TapeResult::Tombstone,
-            ),
-            (
-                r#"$lookup($vars.rules, key) >= 3"#,
-                r#"{"key":"number"}"#,
-                TapeResult::Tombstone,
-            ),
-            (
-                r#"$lookup($vars.rules, key) = "yes""#,
-                r#"{"key":"text"}"#,
-                TapeResult::Tombstone,
-            ),
-            (
-                r#"$lookup($vars, "absent") != true"#,
-                r#"{}"#,
-                TapeResult::Tombstone,
-            ),
-        ] {
-            let transform = plan(&[], &[expression], None, Some(variables), false);
-            let worker = Worker::new(&transform, false);
-            assert_eq!(
-                worker
-                    .tape
-                    .as_ref()
-                    .and_then(|tape| tape.execute(input.as_bytes())),
-                Some(expected),
-                "{expression}"
-            );
-            assert_eq!(
-                worker.execute_report(Some(input.as_bytes().to_vec()), FAIL),
-                worker.execute_jsonata(input.as_bytes().to_vec(), FAIL),
-                "{expression}"
-            );
-        }
-    }
-
-    #[test]
-    fn tape_lookup_fallback_preserves_native_semantics_and_survivors() {
-        let variables = r#"{"rules":{"acme:42":true,"acme:":false,"acme:null":[true],"acme:object":{"value":true}}}"#;
-        let expression = r#"$lookup($vars.rules, tenant & ":" & account) = true"#;
-        for (projection, embeds_json) in [(None, false), (Some("$$.id"), false), (None, true)] {
-            let transform = plan(
-                &["skip = true"],
-                &[expression],
-                projection,
-                Some(variables),
-                false,
-            );
-            let worker = Worker::new(&transform, embeds_json);
-            for input in [
-                r#"{ "id":1,"tenant":"acme","account":"42" }"#,
-                r#"{ "id":2,"tenant":"acme","account":"other" }"#,
-                r#"{"id":3,"tenant":"acme","account":42}"#,
-                r#"{"id":4,"tenant":"acme","account":null}"#,
-                r#"{"id":5,"tenant":"acme"}"#,
-                r#"{"id":6,"tenant":["acme"],"account":["42"]}"#,
-                r#"{"id":7,"tenant":"acme","account":"object"}"#,
-                r#"{"skip":true,"tenant":[],"account":{}}"#,
-                r#"{"tenant":"acme","account":"42","invalid":}"#,
-            ] {
-                assert_eq!(
-                    worker.execute_report(Some(input.as_bytes().to_vec()), FAIL),
-                    worker.execute_jsonata(input.as_bytes().to_vec(), FAIL),
-                    "{input}"
-                );
-            }
-        }
-        for expression in [
-            r#"$lookup($vars.rules, key) = true"#,
-            r#"$lookup($vars.rules, key)"#,
-            r#"$lookup($vars.rules) = true"#,
-            r#"$lookup($vars.rules.missing, key) = true"#,
-            r#"$lookup([ $vars.rules ], key) = true"#,
-            r#"($lookup := function($o, $k) { false }; $lookup($vars.rules, key) = true)"#,
-        ] {
-            let transform = plan(&[], &[expression], None, Some(variables), false);
-            let worker = Worker::new(&transform, false);
-            for input in [
-                r#"{"key":"acme:42"}"#,
-                r#"{"key":42}"#,
-                r#"{"key":["acme:42"]}"#,
-                r#"{}"#,
-            ] {
-                for evaluation in [
-                    EvaluationPolicy::Fail,
-                    EvaluationPolicy::Drop,
-                    EvaluationPolicy::Tombstone,
-                ] {
-                    let policies = ErrorPolicies { evaluation, ..FAIL };
-                    assert_eq!(
-                        worker.execute_report(Some(input.as_bytes().to_vec()), policies),
-                        worker.execute_jsonata(input.as_bytes().to_vec(), policies),
-                        "{expression}: {input}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn tape_scalar_prefix_preserves_native_predicate_order_and_errors() {
-        for (drops, tombstones, expected, completed_predicates) in [
-            (
-                vec!["skip = true", "$error(\"native predicate\")", "true"],
-                vec!["true"],
-                TapeResult::Drop,
-                1,
-            ),
-            (
-                vec!["false"],
-                vec!["skip = true", "$error(\"native predicate\")", "true"],
-                TapeResult::Tombstone,
-                2,
-            ),
-        ] {
-            let transform = plan(
-                &drops,
-                &tombstones,
-                Some("$error(\"projection\")"),
-                None,
-                false,
-            );
-            let worker = Worker::new(&transform, false);
-            let tape = worker.tape.as_ref().expect("retain the scalar prefix");
-            assert_eq!(tape.execute(br#"{"skip":true}"#), Some(expected));
-            assert!(matches!(
-                tape.execute(br#"{"skip":false}"#),
-                Some(TapeResult::Fallback { completed_predicates: count, .. })
-                    if count == completed_predicates
-            ));
-            for input in [
-                br#"{ "skip":true }"#.as_slice(),
-                br#"{"skip":false}"#,
-                br#"{"skip":true,"skip":false}"#,
-                br#"{"skip":[true]}"#,
-                br#"{"skip":true,"invalid":}"#,
-            ] {
-                for evaluation in [
-                    EvaluationPolicy::Fail,
-                    EvaluationPolicy::Drop,
-                    EvaluationPolicy::Tombstone,
-                ] {
-                    let policies = ErrorPolicies { evaluation, ..FAIL };
-                    assert_eq!(
-                        worker.execute_report(Some(input.to_vec()), policies),
-                        worker.execute_jsonata(input.to_vec(), policies)
-                    );
-                }
-            }
-        }
-        let transform = plan(&["$exists(missing)", "true"], &[], None, None, false);
-        assert!(Worker::new(&transform, false).tape.is_none());
-    }
-
-    #[test]
-    fn tape_mixed_predicates_preserve_survivor_payloads() {
-        for (projection, embeds_json) in [(None, false), (Some("$$.id"), false), (None, true)] {
-            let transform = plan(
-                &["skip = true", "$exists(blocked)"],
-                &["deleted = true"],
-                projection,
-                None,
-                true,
-            );
-            let worker = Worker::new(&transform, embeds_json);
-            for input in [
-                br#"{ "id":1, "text":"a\n\u00e9" }"#.as_slice(),
-                br#"{"id":2,"deleted":true}"#,
-                br#"{"id":3,"blocked":false}"#,
-                br#"{"id":4}"#,
-            ] {
-                assert_eq!(
-                    worker.execute_report(Some(input.to_vec()), FAIL),
-                    worker.execute_jsonata(input.to_vec(), FAIL)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn tape_filters_preserve_projection_and_json_value_envelopes() {
-        for (projection, embeds_json) in
-            [(Some(r#"{"id": id, "text": text}"#), false), (None, true)]
-        {
-            let transform = plan(&["drop"], &["deleted"], projection, None, false);
-            let worker = Worker::new(&transform, embeds_json);
-            for input in [
-                br#"{"drop":true}"#.as_slice(),
-                br#"{"drop":false,"deleted":true}"#,
-                br#"{ "drop":false,"deleted":false,"id":9007199254740993,"text":"a\n\u00e9" }"#,
-                br#"{"drop":false,"deleted":false,"id":1,"id":2,"text":null}"#,
-                br#"{"drop":false,"deleted":false,"id":3}"#,
-            ] {
-                let result = worker.tape.as_ref().unwrap().execute(input).unwrap();
-                let expected = worker.execute_jsonata(input.to_vec(), FAIL);
-                match result {
-                    TapeResult::Drop => assert_eq!(expected.as_ref().unwrap().action, Action::Drop),
-                    TapeResult::Tombstone => {
-                        assert_eq!(expected.as_ref().unwrap().action, Action::Tombstone);
-                    }
-                    TapeResult::Survivor(document) => {
-                        assert_eq!(
-                            document,
-                            JValue::from_json_str(str::from_utf8(input).unwrap()).unwrap()
-                        );
-                    }
-                    _ => panic!("survivors must complete predicates on the tape"),
-                }
-                assert_eq!(worker.execute_report(Some(input.to_vec()), FAIL), expected);
-            }
-        }
-    }
-
-    #[test]
-    fn tape_document_fallback_preserves_values_and_error_policies() {
-        let transform = plan(&["items.active = true"], &[], None, None, false);
-        let worker = Worker::new(&transform, false);
-        assert!(matches!(
-            worker
-                .tape
-                .as_ref()
-                .unwrap()
-                .execute(br#"{"items":[{"active":true}]}"#),
-            Some(TapeResult::Fallback { .. })
-        ));
-        for input in [
-            br#"{"items":[{"active":true},{"active":false}],"text":"\u00e9\n"}"#.as_slice(),
-            br#"{"items":{"active":true},"items":[{"active":false}]}"#,
-            br#"{"items":{"active":true}}"#,
-            br#"{"items":[{"active":true}],"bad":}"#,
-            b"\xff",
-        ] {
-            for invalid_json in [InvalidJsonPolicy::Fail, InvalidJsonPolicy::Pass] {
-                let policies = ErrorPolicies {
-                    invalid_json,
-                    ..FAIL
-                };
-                assert_eq!(
-                    worker.execute_report(Some(input.to_vec()), policies),
-                    worker.execute_jsonata(input.to_vec(), policies)
-                );
-            }
-        }
-        let transform = plan(&["items.active"], &[], None, None, false);
-        let worker = Worker::new(&transform, false);
-        for evaluation in [
-            EvaluationPolicy::Fail,
-            EvaluationPolicy::Drop,
-            EvaluationPolicy::Tombstone,
-        ] {
-            let policies = ErrorPolicies { evaluation, ..FAIL };
-            let input = br#"{"items":[{"active":true},{"active":false}]}"#;
-            assert_eq!(
-                worker.execute_report(Some(input.to_vec()), policies),
-                worker.execute_jsonata(input.to_vec(), policies)
-            );
-        }
-    }
-
-    #[test]
-    fn tape_survivors_preserve_projection_error_policies() {
-        for projection in [
-            "missing",
-            "$error(\"projection failed\")",
-            r#"{"value": $sum}"#,
-        ] {
-            let transform = plan(&["drop = true"], &[], Some(projection), None, false);
-            let worker = Worker::new(&transform, false);
-            let input = br#"{"drop":false}"#;
-            assert!(matches!(
-                worker.tape.as_ref().unwrap().execute(input),
-                Some(TapeResult::Survivor(_))
-            ));
-            for evaluation in [
-                EvaluationPolicy::Fail,
-                EvaluationPolicy::Drop,
-                EvaluationPolicy::Tombstone,
-            ] {
-                let policies = ErrorPolicies { evaluation, ..FAIL };
-                assert_eq!(
-                    worker.execute_report(Some(input.to_vec()), policies),
-                    worker.execute_jsonata(input.to_vec(), policies)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn non_json_projection_values_are_errors_even_when_nested() {
-        for projection in ["$sum", "/x/", "[$sum]", r#"{"value": $sum}"#] {
-            let transform = plan(&[], &[], Some(projection), None, false);
-            assert!(run(&transform, Some(b"{}")).is_err(), "{projection}");
-        }
-    }
-}
+mod tests;

@@ -147,10 +147,10 @@ not applied at this external boundary. An existing Kafka tombstone bypasses
 JSON parsing, predicates, and projection. It remains a tombstone by default
 and is dropped when `--drop-tombstones` is set.
 
-Projection results are compact JSON. `Undefined`, functions, regular
-expressions, nested non-JSON values, and serialization failures are evaluation
-errors. A result sequence with multiple items is one JSON array payload, never
-multiple output records. See [expression-language.md](expression-language.md)
+Projection results use native jx compact JSON serialization. Zero emitted
+results, function values (including regex functions), and serialization failures
+are evaluation errors. A result sequence with multiple items is one JSON array
+payload, never multiple output records. See [expression-language.md](expression-language.md)
 for the complete jkq-to-JSONata integration contract and links to the language
 reference.
 
@@ -261,10 +261,10 @@ with the `pass` policy without changing the schema.
 ```
 
 A projected payload reuses the compact JSON already produced by JSONata. A
-pass-through payload is parsed once by the worker and serialized compactly, so
-whitespace and number spelling may change and a multiline input still produces
-one envelope line. For a pass action, `payloadLength` remains the source payload
-byte length; for a project action, it is the compact projected byte length. The
+pass-through payload is validated once and compacted by the worker. Whitespace
+outside strings is removed; number and escape spelling and duplicate members
+are retained. A multiline input still produces one envelope line. For a pass
+action, `payloadLength` remains the source payload byte length; for a project action, it is the compact projected byte length. The
 source text `null` and a projected JSON `null` have payload `null`, encoding
 `"json"`, and length `4`; a tombstone has payload `null`, null encoding, and
 length `-1`.
@@ -297,7 +297,7 @@ invalid JSON with `--envelope-payload value`. Fatal Kafka state errors and
 offset errors reported while polling remain fatal even when
 `--on-kafka-error continue` is selected.
 
-JSONata parse errors are command-line errors. Runtime evaluation errors name
+JSONata compile errors are command-line errors. Runtime evaluation errors name
 the failing drop predicate, tombstone predicate, or projection. The pipeline
 adds topic, partition, and offset context. `jkq` does not automatically add
 source payload contents, but native messages deliberately produced by JSONata
@@ -364,9 +364,13 @@ Without range sharding, extra consumers help only when multiple partitions
 are selected. With range sharding, each consumer has its own fetch,
 decompression, and native prefetch queue, even for one source partition.
 
-`-j, --jobs` controls JSON compute workers. The default is available CPU
-parallelism minus two, with a minimum of one. Identity transforms bypass the
-worker pool. Values must be between 1 and 1024.
+JSON evaluation uses an automatic shared evaluator pool, including parallel
+records from the same partition. There is no `--jobs` option. With `cpus` from
+Rust's available parallelism and `pollers` the actual active consumer count,
+the pool size is `max(1, ceil(cpus / 2), cpus - pollers - 1)`, capped by the
+global admitted-record limit. This leaves an allowance for polling and output
+without shrinking evaluation below half the available CPUs. Identity runs
+bypass the pool.
 
 Output remains ordered within each partition. `--unordered` emits transformed
 records as workers complete and removes that guarantee.
@@ -382,9 +386,13 @@ These limits bound admitted work:
 Sizes accept bytes or `KiB`, `MiB`, and `GiB`. `--max-inflight-bytes` is an
 admission budget for owned source record bytes and copied source metadata: the
 payload, key, header names, and header values required by the output plan. It
-does not account for jsonata-core's parsed value tree, evaluation
-intermediates, or projected output. Those allocations depend on the input and
-expressions and are outside this source-byte budget.
+does not account for worker output buffers, evaluation intermediates, or
+projected output. Those allocations depend on the input and
+expressions and are outside this source-byte budget. Payload reuse retains
+capacities up to 16 KiB; spare capacity and vector growth can exceed logical
+source length. Each poller also
+retains at most 1 MiB of cleared spare payload storage, bounded further by the
+record limit; both capacity thresholds shrink with a smaller byte budget.
 
 All three limits must be positive. `--max-inflight-per-partition` cannot exceed
 `--max-inflight-records`. Global record and byte limits apply across all Kafka
@@ -404,7 +412,7 @@ owned source-byte accounting remain bounded.
 
 High-throughput runs benefit most from keeping the work per input record
 predictable. Build with `--release`, test against representative records, and
-change one setting at a time rather than assuming that more workers or larger
+change one setting at a time rather than assuming that more consumers or larger
 buffers will help.
 
 ### Use objects for large membership sets
@@ -460,10 +468,10 @@ predicate commonly matches and avoids later work. The JSONata
 operands to strings; include separators or other disambiguation when different
 attribute combinations could otherwise produce the same key.
 
-The variables object is parsed once per worker rather than once per record.
-Binding `$vars` for an expression clones a reference-counted handle, not the
-object tree. Each worker still holds its own parsed copy, so account for the
-set size when increasing `--jobs`.
+The variables object is validated once and bound before expression compilation.
+Compiled expressions share its immutable storage across workers, with no
+per-record binding setup. Static reads and lookups use jx's normal optimizations;
+local assignments and dynamic evaluation keep native lexical semantics.
 
 ### Preserve bytes and emit only required metadata
 
@@ -471,26 +479,19 @@ When predicates choose between pass and tombstone, omit `--project` unless the
 payload must change. Passing preserves the exact source payload and avoids
 projection serialization.
 
-When every predicate uses plain scalar paths, comparisons, Boolean literals,
-and `and`/`or`, dropped and tombstoned records can avoid materializing a JSONata
-value tree, including before a projection or JSON-value envelope. Surviving
-records reuse the parsed input for projection or serialization. Other
-expressions and record shapes fall back automatically with the same semantics.
-An initial sequence of supported scalar predicates retains this optimization
-even when later predicates need full JSONata evaluation. Treat this as an
-optimization, not a reason to make an equivalent predicate harder to understand.
+jx evaluates predicates and projections against borrowed validated JSON.
+Surviving records reuse that validation for every expression; no full input
+value tree or fallback evaluator is required. Short-circuiting action
+predicates still avoid later expressions and projection serialization.
 
-The same optimization supports object lookups into `$vars` with string keys,
-including concatenated string attributes:
+Object lookups use native JSONata syntax, including concatenated attributes:
 
 ```sh
 --tombstone-if '$lookup($vars.blacklist, tenant & ":" & account) = true'
 ```
 
-Keys may combine more than two string attributes. Non-string components,
-array-mapped paths, and container-valued lookup results use native JSONata
-instead. Blocks with assignments and other function calls also retain native
-evaluation. This does not change expression results or error policies.
+An absent key is missing, so it does not match `true` or `null`. Use `$exists`
+when the policy depends on presence rather than the lookup value.
 
 When only selected metadata must be included in the payload, use
 [`--payload-format`](#payload-formatting) instead of a complete JSON envelope.
@@ -508,12 +509,11 @@ encoding fields the downstream consumer does not use. JSON-value envelopes
 also compactly serialize pass-through payloads, so use that mode when the
 downstream consumer benefits from a typed JSON field.
 
-### Scale consumers with partitions, then tune workers
+### Scale consumers with partitions
 
-The default worker count leaves one CPU for Kafka polling and one for output.
-Measure nearby `--jobs` values with representative payloads and expressions;
-additional workers can increase contention after polling or output becomes the
-bottleneck.
+Evaluator parallelism is automatic. `--consumers` controls Kafka polling and
+native fetch/decompression capacity; additional consumers can help when
+partitions or range shards provide independent work.
 
 Keep the default per-partition ordering when later records update earlier
 records. Use `--unordered` only when completion order is acceptable. If polling

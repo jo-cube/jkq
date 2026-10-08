@@ -7,8 +7,7 @@ predicates, and projections. The
 implementation.
 
 The runtime implementation is the public Rust API of
-[`jsonata-core`](https://github.com/txjmb/jsonata-core), currently version
-2.2.7. Expressions use JSONata syntax directly:
+[`jx`](https://github.com/jo-cube/jx). Expressions use JSONata syntax directly:
 
 ```sh
 --drop-if 'environment != "production"'
@@ -22,9 +21,9 @@ sequences, functions, variables, and assignments.
 
 ## Startup and Record Evaluation
 
-Every configured JSONata expression is parsed during CLI resolution. A parse
-failure is a command-line error and exits with status 2 before Kafka
-consumption. `--check` performs the same parsing and variable validation
+Every configured JSONata expression is compiled once during CLI resolution.
+A compilation failure is a command-line error and exits with status 2 before Kafka
+consumption. `--check` performs the same compilation and variable validation
 without creating a Kafka consumer.
 
 For each non-tombstone input record that needs JSON, `jkq` validates the
@@ -39,8 +38,8 @@ payload and:
 4. otherwise passes through the source payload, preserving its exact bytes
    unless `--envelope-payload value` requests compact JSON serialization.
 
-Workers reuse parsed input across expressions. Supported scalar predicates
-can avoid constructing a jsonata-core value tree; see
+Workers validate each payload once into a borrowed `jx::RawJson` and reuse it
+across expressions without constructing a JSON tree; see
 [expression execution](architecture.md#expression-execution).
 
 Existing Kafka tombstones bypass JSON parsing and every expression. A
@@ -69,16 +68,23 @@ sequences with multiple values are serialized as one JSON array payload:
 items.price  ->  [2,3]
 ```
 
-Top-level `Undefined` is an evaluation error. A function, regular expression,
-or any other non-JSON internal value is also an error, including when nested
-inside an array or object. jkq checks the value tree before serialization so
-jsonata-core cannot silently convert such values to null, an empty string, or
-another JSON-looking representation. A serialization failure is an evaluation
-error.
+Zero emitted results (including a missing top-level value) are an evaluation
+error. One emitted result is serialized as that JSON value; multiple results
+are wrapped in one JSON array. An explicit JSON array is a single value,
+including an empty array. The entire evaluation and serialization must finish
+before a successful action is published, so a late evaluation error cannot
+emit a partial record.
 
-Native JSONata sequence flattening, missing-value behavior, and object-property
-omission otherwise apply. A projected JSON `null` is the four-byte payload
-`null`; it is not a Kafka tombstone.
+Serialization uses `jx::Value::write_compact`. Borrowed values retain number
+and escape spelling and duplicate object members; only whitespace outside
+strings is removed. Constructed values use jx's native JSON encoding. Retained
+missing values inside sequences and non-finite computed numbers serialize as
+`null`; function values (including regex functions) fail serialization, also
+when nested. There is no additional jkq value-tree compatibility check.
+
+Native jx sequence flattening, missing-value behavior, and object-property
+omission apply. A projected JSON `null` is the four-byte payload `null`; it is
+not a Kafka tombstone.
 
 ## Variables
 
@@ -99,22 +105,24 @@ File errors, invalid JSON, and non-object roots fail during startup and
 `--check`. Expressions access the immutable object as `$vars`, for example
 `$vars.tenant` and `$vars.cutoff`.
 
-Each expression evaluation receives a clean JSONata context containing the
-same worker-local variable value. JSONata assignments are scoped normally
-within that expression, but evaluator state, assignments, the root document,
-and variable mutations do not carry into another expression or input record.
+The object is bound once before compilation through jx immutable bindings and
+shared across expressions. Each evaluation has independent state. Local JSONata
+assignments and parameters may shadow `$vars` within that expression; closures
+and `$eval` retain native lexical semantics. Evaluator state, assignments, the
+root document, and local rebinding do not carry into another expression or
+input record.
 
 ## Numbers
 
-jsonata-core uses JSONata and IEEE-754 `f64` number semantics. Integers outside
-the exactly representable range can lose precision while the payload is
-parsed. For example, projecting an input value of `9007199254740993` produces
-`9007199254740992`.
+jx borrows JSON number tokens until computation needs IEEE-754 `f64` values.
+Projecting the input token `9007199254740993` preserves it exactly. Arithmetic
+on that value can lose precision. Computed numbers use jx's compact binary64
+encoding.
 
 ## Errors and Upstream Deviations
 
 Invalid UTF-8 or malformed JSON follows `--on-invalid-json`. JSONata runtime
-failures, strict predicate-result failures, `Undefined` projections, non-JSON
+failures, strict predicate-result failures, empty projections, non-JSON
 results, and serialization failures follow `--on-eval-error`. Runtime errors
 identify the drop predicate, tombstone predicate, or projection and are
 wrapped with topic, partition, and offset by the pipeline. `jkq` does not
@@ -122,13 +130,18 @@ automatically add source payload contents to diagnostics. Native messages
 deliberately produced by JSONata expressions, including `$error()` and
 `$assert()` messages, are preserved and may contain record data.
 
-jkq exposes useful jsonata-core parser and evaluator messages but does not
-invent byte positions that its public API does not reliably provide. When
-jsonata-core differs from jsonata-js, jkq reports and documents the dependency
-behavior directly.
+jkq exposes jx compiler, validator, evaluator, and serializer diagnostics,
+including available byte offsets. Dependency semantics are used directly.
 
-One known jsonata-core 2.2.7 deviation is that a regular-expression literal
-used directly as an object-constructor value, such as `{"value": /x/}`, is
-rejected during parsing, while jsonata-js 2.2.2 accepts that syntax. jkq reports
-the startup parse error. A top-level regular expression is parsed by
-jsonata-core, then rejected by jkq because it is not a JSON projection result.
+Intentional changes from the former jsonata-core integration include:
+
+- `$lookup` of an absent key is missing rather than JSON `null`; projecting it
+  is an empty-result error, and comparing it with `null` returns false.
+- Missing operands follow jx comparisons: both `missing = null` and
+  `missing != null` return false. Use `$exists` to test presence.
+- Borrowed compact output preserves tokens and duplicate members instead of
+  parsing and re-encoding the entire JSON tree.
+- Retained missing sequence entries and non-finite computed results use jx's
+  native `null` serialization.
+- Regex literals in object constructors compile successfully; serialization
+  still rejects a function-valued result.

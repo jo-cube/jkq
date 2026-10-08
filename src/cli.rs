@@ -108,9 +108,6 @@ pub struct RawCli {
     /// Suppress non-error diagnostics
     #[arg(short = 'q', long)]
     quiet: bool,
-    /// Number of compute workers
-    #[arg(short = 'j', long)]
-    jobs: Option<usize>,
     /// Number of Kafka consumers
     #[arg(long, default_value_t = 1)]
     consumers: usize,
@@ -219,7 +216,6 @@ pub struct RuntimeConfig {
     pub count_limit: Option<u64>,
     pub count_per_partition: Option<u64>,
     pub exit_at_end: bool,
-    pub jobs: usize,
     pub consumers: usize,
     pub range_sharding: bool,
     pub unordered: bool,
@@ -280,13 +276,6 @@ impl RawCli {
         }
         if self.count_per_partition == Some(0) {
             return Err("per-partition count must be positive".to_owned());
-        }
-        let jobs = self.jobs.unwrap_or_else(default_jobs);
-        if jobs == 0 {
-            return Err("jobs must be at least 1".to_owned());
-        }
-        if jobs > 1_024 {
-            return Err("jobs must not exceed 1024".to_owned());
         }
         if self.consumers == 0 {
             return Err("consumer count must be at least 1".to_owned());
@@ -421,7 +410,6 @@ impl RawCli {
             end,
             count_limit: self.count,
             count_per_partition: self.count_per_partition,
-            jobs,
             consumers: self.consumers,
             range_sharding: self.range_sharding,
             unordered: self.unordered,
@@ -445,14 +433,6 @@ impl RawCli {
             check: self.check,
         })
     }
-}
-
-fn default_jobs() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .saturating_sub(2)
-        .max(1)
 }
 
 fn parse_partitions(values: &[String]) -> Result<Vec<i32>, String> {
@@ -673,6 +653,16 @@ mod tests {
         let all = resolve(&["jkq", "-b", "localhost", "-t", "events"]).unwrap();
         assert_eq!(all.partitions, None);
         assert_eq!(all.consumers, 1);
+    }
+
+    #[test]
+    fn evaluator_concurrency_is_not_a_cli_option() {
+        for option in ["-j", "--jobs"] {
+            let error =
+                RawCli::try_parse_from(["jkq", "-b", "localhost", "-t", "events", option, "2"])
+                    .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 
     #[test]
@@ -1086,7 +1076,7 @@ mod tests {
             "--vars-file",
             &path_text,
             "--project",
-            "$vars.tenant",
+            "$vars",
             "--check",
         ]);
         fs::write(&path, "[]").unwrap();
@@ -1104,7 +1094,20 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let config = valid.unwrap();
-        assert_eq!(config.transform.variables.as_deref(), Some(source));
+        let mut bytes = Vec::new();
+        config
+            .transform
+            .projection
+            .as_ref()
+            .unwrap()
+            .evaluate(b"null")
+            .unwrap()
+            .single()
+            .unwrap()
+            .unwrap()
+            .write_compact(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, source.as_bytes());
         assert!(
             invalid
                 .unwrap_err()
@@ -1165,6 +1168,7 @@ mod tests {
         assert!(help.contains("Owned source-byte admission budget; supports KiB, MiB, and GiB"));
         assert!(help.contains("Number of Kafka consumers"));
         assert!(help.contains("--consumers <CONSUMERS>"));
+        assert!(!help.contains("--jobs"));
         assert!(help.contains("Drop source and predicate-generated tombstones before projection"));
         assert!(help.contains("Strict JSON object available as $vars"));
         assert!(help.contains("Read the strict JSON object available as $vars from a file"));

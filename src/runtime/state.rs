@@ -7,10 +7,10 @@ use crate::cli::RuntimeLimits;
 
 use super::Completion;
 
-#[derive(Clone, Copy)]
 pub(super) struct Release {
     pub partition: i32,
     pub retained_bytes: usize,
+    pub payload: Option<Vec<u8>>,
 }
 
 pub(super) struct SharedAdmission {
@@ -234,6 +234,7 @@ mod tests {
             partition,
             sequence,
             retained_bytes: bytes,
+            spare_payload: None,
             source: SourceRecord {
                 partition,
                 offset: i64::try_from(sequence).unwrap(),

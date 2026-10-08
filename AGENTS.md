@@ -7,7 +7,7 @@ This repository contains a small, high-throughput Rust command-line consumer for
 The product combines:
 
 - direct Kafka partition consumption;
-- native JSONata predicates and projections powered by `jsonata-core`;
+- native JSONata predicates and projections powered by `jx`;
 - explicit record actions: drop, tombstone, pass through, and project;
 - kcat-style record formatting;
 - bounded parallel execution with per-partition output ordering.
@@ -66,7 +66,8 @@ in the work process below.
 Expected initial runtime dependencies are limited to:
 
 - `rdkafka`
-- `jsonata-core`
+- `jx`
+- `simd-json`
 - `clap`
 - `crossbeam-channel`
 - `signal-hook`
@@ -104,11 +105,11 @@ These invariants must remain true unless the owning behavior or architecture doc
 - `%R` writes signed `-1` as a four-byte big-endian length for a tombstone.
 - All predicates and projections use native JSONata.
 - Channels, admitted record counts, per-partition work, and owned source record bytes are bounded.
-- `--max-inflight-bytes` accounts for owned source payload, key, header names, and header values; it does not cover jsonata-core's parsed tree, evaluation intermediates, or projected output.
+- `--max-inflight-bytes` accounts for owned source payload, key, header names, and header values; it does not cover worker output buffers, evaluation intermediates, or projected output.
 - A poller waiting for admission does not request another Kafka record; partitions are paused only after permanent completion.
 - Snapshot termination is based on captured exclusive high-watermark offsets.
-- Shared transform plans contain only thread-safe JSONata expression source and variable JSON; ASTs, values, contexts, and evaluators are worker-local.
-- Each Kafka payload is parsed into jsonata-core's value representation at most once per record and reused across predicates and projection.
+- Shared transform plans contain immutable compiled jx expressions with shared immutable compile-time variable bindings; evaluation state and output buffers are worker-local.
+- Each Kafka payload is validated into borrowed jx RawJson at most once per record and reused across predicates and projection.
 - Evaluator state, assignments, variables, and root context never leak between records.
 - The default runtime uses dedicated threads and bounded channels rather than an async runtime.
 - Errors are governed by explicit policy and never silently converted into successful output.

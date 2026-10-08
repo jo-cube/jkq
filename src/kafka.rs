@@ -1,7 +1,9 @@
+mod fetch;
+
 use std::{collections::BTreeMap, time::Duration};
 
 use rdkafka::{
-    ClientConfig, Message,
+    ClientConfig,
     consumer::{BaseConsumer, Consumer},
     error::{KafkaError, RDKafkaErrorCode},
     message::{Headers, Timestamp as KafkaTimestamp},
@@ -9,12 +11,62 @@ use rdkafka::{
 };
 
 use crate::{
-    cli::{EndPosition, KafkaErrorPolicy, MAX_ASSIGNED_PARTITIONS, RuntimeConfig, StartPosition},
+    cli::{
+        EndPosition, KafkaErrorPolicy, MAX_ASSIGNED_PARTITIONS, RuntimeConfig, RuntimeLimits,
+        StartPosition,
+    },
     output::{Header, OutputRequirements, Timestamp, TimestampType},
 };
 
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+pub(crate) const MAX_REUSABLE_PAYLOAD_CAPACITY: usize = 16 * 1024;
+const MAX_SPARE_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+pub(crate) struct PayloadBuffers {
+    free: Vec<Vec<u8>>,
+    capacity: usize,
+    max_records: usize,
+    max_bytes: usize,
+    max_buffer_capacity: usize,
+}
+
+impl PayloadBuffers {
+    pub(crate) fn new(limits: RuntimeLimits) -> Self {
+        Self {
+            free: Vec::new(),
+            capacity: 0,
+            max_records: limits.max_inflight_records,
+            max_bytes: limits.max_inflight_bytes.min(MAX_SPARE_PAYLOAD_BYTES),
+            max_buffer_capacity: limits.max_inflight_bytes.min(MAX_REUSABLE_PAYLOAD_CAPACITY),
+        }
+    }
+
+    fn copy(&mut self, source: &[u8]) -> Vec<u8> {
+        if source.len() > self.max_buffer_capacity {
+            return source.to_vec();
+        }
+        let mut buffer = self.free.pop().unwrap_or_default();
+        self.capacity -= buffer.capacity();
+        buffer.extend_from_slice(source);
+        buffer
+    }
+
+    pub(crate) fn recycle(&mut self, mut buffer: Vec<u8>) {
+        let capacity = buffer.capacity();
+        if capacity == 0
+            || capacity > self.max_buffer_capacity
+            || self.free.len() == self.max_records
+            || capacity > self.max_bytes - self.capacity
+        {
+            return;
+        }
+        buffer.clear();
+        self.capacity += capacity;
+        self.free.push(buffer);
+    }
+}
 
 #[derive(Debug)]
 pub struct OwnedRecord {
@@ -52,7 +104,8 @@ pub enum PollEvent {
 }
 
 pub struct KafkaInput {
-    consumer: BaseConsumer,
+    pub(crate) payload_buffers: PayloadBuffers,
+    consumer: fetch::FetchConsumer,
     topic: String,
     partitions: BTreeMap<i32, PartitionState>,
     remaining_partitions: usize,
@@ -197,9 +250,7 @@ impl KafkaInput {
                 .add_partition_offset(&config.topic, range.partition, range.start)
                 .map_err(|error| assignment_error(&config.topic, range.partition, error))?;
         }
-        consumer
-            .assign(&partitions)
-            .map_err(|error| format!("cannot assign topic {}: {error}", config.topic))?;
+        let consumer = fetch::FetchConsumer::new(consumer, &config.topic, &partitions)?;
         let partitions = assignment
             .ranges
             .into_iter()
@@ -211,6 +262,7 @@ impl KafkaInput {
             .collect::<BTreeMap<_, _>>();
         let remaining_partitions = partitions.values().filter(|state| !state.done).count();
         let input = Self {
+            payload_buffers: PayloadBuffers::new(config.limits),
             consumer,
             topic: config.topic.clone(),
             partitions,
@@ -251,26 +303,29 @@ impl KafkaInput {
         let Some(result) = self.consumer.poll(timeout) else {
             return Ok(PollEvent::Idle);
         };
-        let message = match result {
-            Ok(message) => message,
-            Err(KafkaError::PartitionEOF(partition)) => {
-                self.handle_eof(partition)?;
-                return Ok(PollEvent::Idle);
-            }
-            Err(error) if error.rdkafka_error_code() == Some(RDKafkaErrorCode::AutoOffsetReset) => {
-                return Err(format!("Kafka offset error: {error}"));
-            }
-            Err(error @ KafkaError::MessageConsumptionFatal(_)) => {
-                return Err(format!("fatal Kafka consumer error: {error}"));
-            }
-            Err(error) if self.error_policy == KafkaErrorPolicy::Continue => {
-                if !self.quiet {
-                    eprintln!("jkq: Kafka record error: {error}");
+        if result.is_err() {
+            let error = result.err().expect("failed Kafka poll has an error");
+            return match error {
+                KafkaError::PartitionEOF(partition) => {
+                    self.handle_eof(partition)?;
+                    Ok(PollEvent::Idle)
                 }
-                return Ok(PollEvent::Idle);
-            }
-            Err(error) => return Err(format!("Kafka record error: {error}")),
-        };
+                error if error.rdkafka_error_code() == Some(RDKafkaErrorCode::AutoOffsetReset) => {
+                    Err(format!("Kafka offset error: {error}"))
+                }
+                error @ KafkaError::MessageConsumptionFatal(_) => {
+                    Err(format!("fatal Kafka consumer error: {error}"))
+                }
+                error if self.error_policy == KafkaErrorPolicy::Continue => {
+                    if !self.quiet {
+                        eprintln!("jkq: Kafka record error: {error}");
+                    }
+                    Ok(PollEvent::Idle)
+                }
+                error => Err(format!("Kafka record error: {error}")),
+            };
+        }
+        let message = result.unwrap();
 
         let partition = message.partition();
         let Some(state) = self.partitions.get(&partition).copied() else {
@@ -322,7 +377,9 @@ impl KafkaInput {
             } else {
                 Vec::new()
             },
-            payload: message.payload().map(<[u8]>::to_vec),
+            payload: message
+                .payload()
+                .map(|bytes| self.payload_buffers.copy(bytes)),
             retained_bytes,
         };
         Ok(PollEvent::Record(record))
@@ -335,6 +392,7 @@ impl KafkaInput {
         let should_finish = match state.range.end_exclusive {
             Some(end) => {
                 self.consumer
+                    .consumer()
                     .fetch_watermarks(&self.topic, partition, METADATA_TIMEOUT)
                     .map_err(|error| watermark_error(&self.topic, partition, error))?
                     .1
@@ -373,6 +431,7 @@ impl KafkaInput {
         let mut partitions = TopicPartitionList::new();
         partitions.add_partition(&self.topic, partition);
         self.consumer
+            .consumer()
             .pause(&partitions)
             .map_err(|error| format!("cannot pause {} partition {partition}: {error}", self.topic))
     }
@@ -432,7 +491,7 @@ fn consumer_assignments(
 }
 
 fn retained_bytes(
-    message: &rdkafka::message::BorrowedMessage<'_>,
+    message: &fetch::NativeMessage<'_>,
     requirements: OutputRequirements,
 ) -> Result<usize, String> {
     let mut bytes = message.payload().map_or(0, <[u8]>::len);
@@ -727,6 +786,69 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn recycled_payloads_keep_storage_and_replace_every_source_byte() {
+        let mut buffers = PayloadBuffers::new(RuntimeLimits {
+            max_inflight_records: 2,
+            max_inflight_bytes: 64,
+            max_inflight_per_partition: 2,
+        });
+        let mut original = Vec::with_capacity(32);
+        original.extend_from_slice(b"previous contents");
+        let storage = original.as_ptr();
+        buffers.recycle(original);
+        let copied = buffers.copy(b"new");
+        assert_eq!(copied, b"new");
+        assert_eq!(copied.as_ptr(), storage);
+        assert_eq!(copied.capacity(), 32);
+        assert_eq!(buffers.capacity, 0);
+        buffers.recycle(copied);
+        assert!(buffers.copy(b"").is_empty());
+    }
+
+    #[test]
+    fn spare_payloads_obey_record_capacity_and_byte_limits() {
+        let limits = RuntimeLimits {
+            max_inflight_records: 2,
+            max_inflight_bytes: 64,
+            max_inflight_per_partition: 2,
+        };
+        let mut buffers = PayloadBuffers::new(limits);
+        for _ in 0..3 {
+            buffers.recycle(Vec::with_capacity(1));
+        }
+        assert_eq!(buffers.free.len(), 2);
+        assert_eq!(buffers.capacity, 2);
+
+        let mut buffers = PayloadBuffers::new(limits);
+        buffers.recycle(Vec::with_capacity(32));
+        buffers.recycle(Vec::with_capacity(32));
+        buffers.recycle(Vec::with_capacity(1));
+        assert_eq!(buffers.free.len(), 2);
+        assert_eq!(buffers.capacity, 64);
+
+        let mut buffers = PayloadBuffers::new(RuntimeLimits {
+            max_inflight_records: 10000,
+            max_inflight_bytes: 256 * 1024 * 1024,
+            max_inflight_per_partition: 10000,
+        });
+        for _ in 0..10000 {
+            buffers.recycle(Vec::with_capacity(1024));
+        }
+        assert_eq!(buffers.capacity, MAX_SPARE_PAYLOAD_BYTES);
+        let retained = buffers.free.len();
+        buffers.recycle(Vec::with_capacity(MAX_REUSABLE_PAYLOAD_CAPACITY + 1));
+        buffers.recycle(Vec::new());
+        assert_eq!(buffers.free.len(), retained);
+
+        let large = vec![b'x'; MAX_REUSABLE_PAYLOAD_CAPACITY + 1];
+        assert_eq!(buffers.copy(&large), large);
+        assert_eq!(buffers.free.len(), retained);
+        let mut buffers = PayloadBuffers::new(limits);
+        buffers.recycle(Vec::with_capacity(65));
+        assert!(buffers.free.is_empty());
     }
 
     #[test]
