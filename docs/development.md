@@ -149,7 +149,7 @@ part of the question.
 The direct runtime dependencies are deliberately limited to:
 
 - `rdkafka`
-- `jx` (the sibling checkout at `../jx/crates/jx`)
+- `jx` ([upstream repository](https://github.com/jo-cube/jx))
 - `simd-json`
 - `clap`
 - `crossbeam-channel`
@@ -158,10 +158,10 @@ The direct runtime dependencies are deliberately limited to:
 `jx` is the sole expression implementation. Its immutable compiled expressions
 are shared across workers together with one borrowed `jx::InputPlan`. Each
 payload is prepared once and reused across independent indexed evaluations.
-`$vars` is an immutable compile-time binding shared across expressions. The sibling
-checkout must include `InputPlan`, `PreparedInput`, `PreparedInput::as_raw` and
-`CompileOptions::constant_binding`.
-simd-json remains only for the streaming JSON envelope string serializer.
+`$vars` is an immutable compile-time binding shared across expressions. The Git
+dependency tracks upstream `main`; `Cargo.lock` pins the exact revision for
+reproducible builds. simd-json remains only for the streaming JSON envelope string
+serializer.
 
 Before adding another dependency, confirm that the standard library or an
 existing dependency is insufficient and that the new dependency removes
