@@ -105,9 +105,10 @@ positions apply to every assigned partition.
 An explicit end ahead of the current log waits until the delivered partition EOF
 or a record reaches that exclusive boundary. EOF uses the offset carried by the
 Kafka event, so later appends cannot make an earlier EOF finish the range.
-With `isolation.level=read_committed`, an open transaction can keep the delivered
-EOF below a captured high watermark; a fixed-end snapshot can wait until that
-transaction resolves. It is an offset boundary, not a wall-clock deadline.
+With `isolation.level=read_committed`, snapshot ends are queried at the last
+stable offset and exclude open transactions. An explicit end beyond that offset
+can wait until a transaction commits or aborts. Ranges are offset boundaries,
+not wall-clock deadlines.
 
 ## Transforms
 
@@ -349,9 +350,11 @@ ssl.key.location=/path/to/client.key
 jkq -F kafka.properties -t events -p 0 --snapshot
 ```
 
-The official build includes TLS support through vendored OpenSSL. Additional
-TLS properties can be passed through with `-F` or `-X` unless listed as owned
-above.
+The official build includes TLS and client certificates through vendored
+OpenSSL, plus SASL/PLAIN and SCRAM-SHA-256/512. It does not include
+GSSAPI/Kerberos or automatic OAuth/OIDC token retrieval. Additional native
+properties can be passed through with `-F` or `-X` unless listed as owned
+above; configuration cannot enable features omitted at build time.
 
 There is no implicit configuration-file discovery.
 
