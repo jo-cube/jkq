@@ -513,6 +513,13 @@ fn retained_bytes(
     Ok(bytes)
 }
 
+pub fn validate_config(config: &RuntimeConfig) -> Result<(), String> {
+    consumer_config(config)
+        .create_native_config()
+        .map(|_| ())
+        .map_err(client_creation_error)
+}
+
 fn create_consumer(config: &RuntimeConfig) -> Result<BaseConsumer, String> {
     consumer_config(config)
         .create()
@@ -775,6 +782,31 @@ mod tests {
             }
         }
         assert_eq!(offsets, [1, 2]);
+    }
+
+    #[test]
+    fn partition_fetch_alias_is_forwarded_to_native_configuration() {
+        use clap::Parser;
+        let config = crate::cli::RawCli::try_parse_from([
+            "jkq",
+            "-b",
+            "unused",
+            "-t",
+            "events",
+            "-X",
+            "max.partition.fetch.bytes=32768",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap();
+        assert_eq!(
+            consumer_config(&config)
+                .create_native_config()
+                .unwrap()
+                .get("fetch.message.max.bytes")
+                .unwrap(),
+            "32768"
+        );
     }
 
     fn range(partition: i32, start: i64, end: i64) -> PartitionRange {

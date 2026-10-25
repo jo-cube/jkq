@@ -15,6 +15,10 @@ fn main() {
         }
         Ok(config) => {
             if config.check {
+                if let Err(error) = kafka::validate_config(&config) {
+                    eprintln!("jkq: {error}");
+                    std::process::exit(2);
+                }
                 return;
             }
             if let Err(error) = app::run(config) {
