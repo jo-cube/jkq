@@ -676,7 +676,11 @@ fn poll_loop(
                 .expect("running poller has an output buffer");
             let record = match pending.take() {
                 Some(record) => record,
-                None => match input.poll() {
+                None => match if buffer.pending.is_empty() {
+                    input.poll()
+                } else {
+                    input.poll_with_timeout(Duration::ZERO)
+                } {
                     Ok(PollEvent::Record(record)) => record,
                     Ok(PollEvent::Idle) => {
                         if let Err(error) = buffer.flush(&stats) {

@@ -296,7 +296,7 @@ impl KafkaInput {
         self.poll_with_timeout(POLL_TIMEOUT)
     }
 
-    fn poll_with_timeout(&mut self, timeout: Duration) -> Result<PollEvent, String> {
+    pub(crate) fn poll_with_timeout(&mut self, timeout: Duration) -> Result<PollEvent, String> {
         if self.remaining_partitions == 0 {
             return Ok(PollEvent::Done);
         }
