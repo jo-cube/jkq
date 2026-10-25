@@ -886,3 +886,39 @@ fn unused_source_storage_survives_actions_and_evaluation_failures() {
         assert_eq!(source.as_deref(), Some(source_bytes));
     }
 }
+
+#[test]
+fn failed_projection_releases_oversized_output_scratch() {
+    let plan = plan(
+        &[],
+        &[],
+        Some(r#"items.($exists(x) ? x : function(){1})"#),
+        None,
+        false,
+    );
+    let input_plan = plan.input_plan();
+    let mut worker = Worker::new(&plan, &input_plan, false, 16384);
+    let mut source = Some(
+        format!(
+            r#"{{"items":[{{"x":"{}"}},{{}}]}}"#,
+            "x".repeat(1024 * 1024)
+        )
+        .into_bytes(),
+    );
+    let execution = worker
+        .execute_report(
+            &mut source,
+            ErrorPolicies {
+                invalid_json: InvalidJsonPolicy::Fail,
+                evaluation: EvaluationPolicy::Drop,
+            },
+        )
+        .unwrap();
+    assert_eq!(execution.action, Action::Drop);
+    assert_eq!(execution.issue, Some(ExecutionIssue::Evaluation));
+    assert!(
+        worker.output.capacity() <= 16384,
+        "failed output retained {} bytes",
+        worker.output.capacity()
+    );
+}

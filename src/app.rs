@@ -215,6 +215,35 @@ mod tests {
     }
 
     #[test]
+    fn header_slot_storage_is_charged_only_when_metadata_is_required() {
+        let fixture = Fixture::new("metadata-accounting", 1);
+        let mut headers = OwnedHeaders::new();
+        for _ in 0..128 {
+            headers = headers.insert(KafkaHeader::<&[u8]> {
+                key: "x",
+                value: None,
+            });
+        }
+        fixture.produce(0, Some(b"{}"), None, 0, Some(headers));
+        for (format, count) in [("%s", 0), ("%h", 128)] {
+            let config = fixture.config(&["-p", "0", "--snapshot", "-f", format]);
+            let mut input = KafkaInput::prepare(&config).unwrap().pop().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(std::time::Instant::now() < deadline);
+                if let crate::kafka::PollEvent::Record(record) = input.poll().unwrap() {
+                    assert_eq!(record.headers.len(), count);
+                    assert_eq!(
+                        record.retained_bytes,
+                        2 + count * (std::mem::size_of::<crate::output::Header>() + 1)
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
     fn omitted_partition_selects_all_topic_partitions() {
         let fixture = Fixture::new("all-partitions", 2);
         fixture.produce(0, Some(b"zero"), None, 0, None);

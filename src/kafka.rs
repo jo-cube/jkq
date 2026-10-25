@@ -367,15 +367,15 @@ impl KafkaInput {
                 .then(|| message.key().map(<[u8]>::to_vec))
                 .flatten(),
             headers: if self.requirements.headers {
-                message
-                    .headers()
-                    .into_iter()
-                    .flat_map(Headers::iter)
-                    .map(|header| Header {
+                let mut owned = Vec::new();
+                if let Some(headers) = message.headers() {
+                    owned = Vec::with_capacity(headers.count());
+                    owned.extend(headers.iter().map(|header| Header {
                         name: header.key.to_owned(),
                         value: header.value.map(<[u8]>::to_vec),
-                    })
-                    .collect()
+                    }));
+                }
+                owned
             } else {
                 Vec::new()
             },
@@ -498,6 +498,11 @@ fn retained_bytes(
     if requirements.headers
         && let Some(headers) = message.headers()
     {
+        bytes = headers
+            .count()
+            .checked_mul(std::mem::size_of::<Header>())
+            .and_then(|slots| bytes.checked_add(slots))
+            .ok_or_else(|| "record retained-byte charge overflowed usize".to_owned())?;
         for header in headers.iter() {
             bytes = bytes
                 .checked_add(header.key.len())
