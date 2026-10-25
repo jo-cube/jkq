@@ -2,6 +2,10 @@
 
 set -eu
 
+GITHUB_REPOSITORY=jo-cube/jkq
+VERSION=latest
+export GITHUB_REPOSITORY VERSION
+
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
@@ -71,3 +75,20 @@ if PATH="$TMP_DIR/mock-bin:$PATH" \
 	exit 1
 fi
 test ! -e "$TMP_DIR/rejected/jkq"
+
+printf 'unexpected file\n' > "$TMP_DIR/fixtures/unexpected"
+tar -czf "$TMP_DIR/fixtures/jkq_linux_amd64.tar.gz" \
+    -C "$TMP_DIR/fixtures" jkq unexpected
+if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$TMP_DIR/fixtures" && sha256sum jkq_linux_amd64.tar.gz > jkq_linux_amd64.tar.gz.sha256)
+else
+    (cd "$TMP_DIR/fixtures" && shasum -a 256 jkq_linux_amd64.tar.gz > jkq_linux_amd64.tar.gz.sha256)
+fi
+if PATH="$TMP_DIR/mock-bin:$PATH" \
+    FIXTURES="$TMP_DIR/fixtures" CURL_LOG="$TMP_DIR/curl.log" \
+    INSTALL_DIR="$TMP_DIR/rejected-archive" \
+    sh "$ROOT/scripts/install.sh" >/dev/null 2>&1; then
+    printf 'installer accepted unexpected archive contents\n' >&2
+    exit 1
+fi
+test ! -e "$TMP_DIR/rejected-archive/jkq"

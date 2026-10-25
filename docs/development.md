@@ -29,8 +29,8 @@ the observable behavior contracts.
 ## Prerequisites
 
 The repository follows stable Rust through `rust-toolchain.toml`. Building the
-bundled librdkafka, Zstandard, and vendored OpenSSL normally requires a C
-compiler, `make`, Perl, `pkg-config`, and libclang on Unix.
+bundled librdkafka, Zstandard, and vendored OpenSSL normally requires C
+and C++ compilers, `make`, Perl, and `pkg-config` on Unix.
 
 Build a release binary with:
 
@@ -54,6 +54,30 @@ cargo test --locked --all-targets --all-features
 ```
 
 CI runs the same checks.
+
+## Experimental jx Trial
+
+The release dependency currently pins the legacy jx API. To evaluate a reviewed
+local jx checkout with its experimental foundation, build a separate executable:
+
+```sh
+python3 scripts/build-experimental.py ../jx target/experimental-trial
+```
+
+The script uses cached Cargo dependencies and requires Python 3.9 or newer.
+Build normally and fetch the reviewed jx dependencies before running it. It
+requires a new destination under `target`, copies the current source
+(including uncommitted files), and changes only the copied dependency and the
+private expression compilation boundary. It runs `make check` and a release
+build against the copied lockfile and records source/library identities. Neither
+checkout is modified. The resulting `target/experimental-trial/target/release/jkq`
+is explicitly experimental; do not replace an installed release with it.
+Compilation failures are explicit, with no per-record legacy fallback. Immutable
+bindings, shared preparation, strict predicates and complete projection delivery
+use the same application code. Compare fixed snapshots and failure/output contracts
+before allowing sustained traffic. Shipping a supported opt-in feature requires
+a published, pinned jx revision with the experimental facade; the trial script
+does not make that dependency a release prerequisite.
 
 ## Release Packaging
 
