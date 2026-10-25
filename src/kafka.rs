@@ -306,10 +306,6 @@ impl KafkaInput {
         if result.is_err() {
             let error = result.err().expect("failed Kafka poll has an error");
             return match error {
-                KafkaError::PartitionEOF(partition) => {
-                    self.handle_eof(partition)?;
-                    Ok(PollEvent::Idle)
-                }
                 error if error.rdkafka_error_code() == Some(RDKafkaErrorCode::AutoOffsetReset) => {
                     Err(format!("Kafka offset error: {error}"))
                 }
@@ -326,6 +322,12 @@ impl KafkaInput {
             };
         }
         let message = result.unwrap();
+        if message.is_partition_eof() {
+            let (partition, offset) = (message.partition(), message.offset());
+            drop(message);
+            self.handle_eof(partition, offset)?;
+            return Ok(PollEvent::Idle);
+        }
 
         let partition = message.partition();
         let Some(state) = self.partitions.get(&partition).copied() else {
@@ -385,19 +387,12 @@ impl KafkaInput {
         Ok(PollEvent::Record(record))
     }
 
-    fn handle_eof(&mut self, partition: i32) -> Result<(), String> {
+    fn handle_eof(&mut self, partition: i32, offset: i64) -> Result<(), String> {
         let Some(state) = self.partitions.get(&partition).copied() else {
             return Ok(());
         };
         let should_finish = match state.range.end_exclusive {
-            Some(end) => {
-                self.consumer
-                    .consumer()
-                    .fetch_watermarks(&self.topic, partition, METADATA_TIMEOUT)
-                    .map_err(|error| watermark_error(&self.topic, partition, error))?
-                    .1
-                    >= end
-            }
+            Some(end) => offset >= end,
             None => self.exit_at_end,
         };
         if should_finish {
@@ -707,6 +702,74 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn a_delayed_eof_does_not_use_a_later_broker_high_watermark() {
+        use clap::Parser;
+        use rdkafka::{
+            mocking::MockCluster,
+            producer::{BaseProducer, BaseRecord, Producer},
+        };
+        let cluster = MockCluster::new(1).unwrap();
+        cluster.create_topic("delayed-eof", 1, 1).unwrap();
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .create()
+            .unwrap();
+        let produce = || {
+            producer
+                .send(
+                    BaseRecord::<(), [u8]>::to("delayed-eof")
+                        .partition(0)
+                        .payload(b"{}"),
+                )
+                .map_err(|(error, _)| error)
+                .unwrap();
+            producer.flush(Duration::from_secs(5)).unwrap();
+        };
+        produce();
+        let config = crate::cli::RawCli::try_parse_from([
+            "jkq",
+            "-b",
+            &cluster.bootstrap_servers(),
+            "-t",
+            "delayed-eof",
+            "-p",
+            "0",
+            "--end-offset",
+            "3",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap();
+        let mut input = KafkaInput::prepare(&config).unwrap().pop().unwrap();
+        // Hold the EOF event at offset 1 while the broker advances to offset 3.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            if matches!(input.consumer.poll(POLL_TIMEOUT), Some(Ok(event)) if event.is_partition_eof() && event.offset() == 1)
+            {
+                break;
+            }
+        }
+        produce();
+        produce();
+        input.handle_eof(0, 1).unwrap();
+        assert_eq!(
+            input.remaining_partitions, 1,
+            "stale EOF must not finish the range"
+        );
+        let mut offsets = Vec::new();
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            match input.poll().unwrap() {
+                PollEvent::Record(record) => offsets.push(record.offset),
+                PollEvent::Done => break,
+                PollEvent::Idle => {}
+            }
+        }
+        assert_eq!(offsets, [1, 2]);
     }
 
     fn range(partition: i32, start: i64, end: i64) -> PartitionRange {
