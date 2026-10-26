@@ -159,12 +159,26 @@ else
 	exit 1
 fi
 
-mkdir -p "$INSTALL_DIR"
-if [ "$(tar -tzf "$ARCHIVE_PATH")" != "$CLI_NAME" ]; then
-	printf 'error: release archive must contain only %s\n' "$CLI_NAME" >&2
-	exit 1
+tar -tzf "$ARCHIVE_PATH" > "${TMP_DIR}/members"
+if ! awk '
+    $0 != "jkq" && $0 != "LICENSE" && $0 != "THIRD_PARTY_LICENSES" { bad = 1 }
+    { if (seen[$0]++) bad = 1 }
+    END { exit (bad || !seen["jkq"]) }
+' "${TMP_DIR}/members"; then
+    printf 'error: unexpected or duplicate release archive member\n' >&2
+    exit 1
 fi
-tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
+if ! tar -tvzf "$ARCHIVE_PATH" | awk '
+    substr($0, 1, 1) != "-" { bad = 1 }
+    END { exit bad }
+'; then
+    printf 'error: release archive must contain regular files\n' >&2
+    exit 1
+fi
+# Extract only the executable bytes; archive paths never become filesystem paths.
+tar -xzOf "$ARCHIVE_PATH" "$CLI_NAME" > "${TMP_DIR}/${CLI_NAME}"
+test -s "${TMP_DIR}/${CLI_NAME}"
+mkdir -p "$INSTALL_DIR"
 install -m 0755 "${TMP_DIR}/${CLI_NAME}" "${INSTALL_DIR}/${CLI_NAME}"
 
 printf 'Installed %s to %s\n' "$CLI_NAME" "${INSTALL_DIR}/${CLI_NAME}"

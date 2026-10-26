@@ -62,10 +62,10 @@ its public compiler uses the common semantic IR. No backend flag, source patch o
 copied-source trial builder is needed. Cargo.lock must resolve the same revision.
 An unpublished candidate is not yet available to clean remote builds.
 
-Release jx first after its candidate CI passes. Once `v0.2.0` exists, resolve that
-tag, verify it names the reviewed candidate, and update the dependency to the tag
-without changing the resolved code. Run `make check`, regenerate dependency notices
-and verify release archives through the normal locked build before releasing jkq.
+Release jx first after its candidate CI passes. Once `v0.2.0` exists, verify it
+names the revision pinned by the manifest and lock. Keep the immutable revision
+pin, fetch it from the normal remote in a clean Cargo cache, run `make check`,
+regenerate notices and verify release archives before releasing jkq.
 Local Git-cache validation establishes candidate correctness, not publication.
 
 ## Release Packaging
@@ -175,7 +175,7 @@ are shared across workers together with one borrowed `jx::InputPlan`. Each
 payload is prepared once and reused across independent indexed evaluations.
 `$vars` is an immutable compile-time binding shared across expressions. The Git
 dependency and `Cargo.lock` pin the reviewed immutable revision; the release handoff
-above switches the published tag to that same code. simd-json remains only for the streaming JSON envelope string
+above verifies the published tag names that same code. simd-json remains only for the streaming JSON envelope string
 serializer.
 
 Before adding another dependency, confirm that the standard library or an
