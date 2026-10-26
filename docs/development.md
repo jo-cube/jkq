@@ -55,18 +55,17 @@ cargo test --locked --all-targets --all-features
 
 CI runs the same checks.
 
-## Coordinated jx dependency
+## jx dependency
 
-The normal dependency pins the reviewed jx 0.2.0 candidate by immutable Git revision;
-its public compiler uses the common semantic IR. No backend flag, source patch or
-copied-source trial builder is needed. Cargo.lock must resolve the same revision.
-An unpublished candidate is not yet available to clean remote builds.
+The normal dependency pins the merged upstream jx implementation by immutable
+Git revision. Its public compiler uses the common semantic IR; no backend flag,
+source patch or local path is needed. Cargo.lock must resolve the same revision.
+A separate jx release or tag is not required.
 
-Release jx first after its candidate CI passes. Once `v0.2.0` exists, verify it
-names the revision pinned by the manifest and lock. Keep the immutable revision
-pin, fetch it from the normal remote in a clean Cargo cache, run `make check`,
-regenerate notices and verify release archives before releasing jkq.
-Local Git-cache validation establishes candidate correctness, not publication.
+When updating the pin, verify that the commit is reachable from upstream main,
+fetch it from GitHub in a clean Cargo Git cache, and run `make check` and a release
+build without local overrides. Regenerate notices and verify release archives
+before releasing jkq.
 
 ## Release Packaging
 
@@ -83,8 +82,9 @@ build native Linux amd64, Linux arm64, and macOS arm64 archives, execute each
 binary as a smoke test, and attach each archive and its SHA-256 checksum to the
 GitHub release. Archives contain the executable, MIT license and third-party notices.
 Regenerate notices with `python3 scripts/update-notices.py` after resolving the
-reviewed jx release and inspect bundled native-source licensing. GNU binaries are built on Ubuntu 26.04; build locally when
-compatibility with an older glibc-based system is required. `scripts/install.sh`
+pinned dependency graph and inspect bundled native-source licensing. GNU binaries
+are built on Ubuntu 26.04; build locally when compatibility with an older
+glibc-based system is required. `scripts/install.sh`
 installs supported release binaries after verifying their published checksums.
 There is no crates.io publication.
 

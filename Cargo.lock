@@ -309,7 +309,7 @@ dependencies = [
 [[package]]
 name = "jx"
 version = "0.2.0"
-source = "git+https://github.com/jo-cube/jx.git?rev=2b36e8549fd7e79dd93142093e4062d194351144#2b36e8549fd7e79dd93142093e4062d194351144"
+source = "git+https://github.com/jo-cube/jx.git?rev=5c32d1cd63b03eb25741d651fbc026cf0e97f934#5c32d1cd63b03eb25741d651fbc026cf0e97f934"
 dependencies = [
  "base64",
  "regress",
