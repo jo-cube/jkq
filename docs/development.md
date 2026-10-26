@@ -55,29 +55,18 @@ cargo test --locked --all-targets --all-features
 
 CI runs the same checks.
 
-## Experimental jx Trial
+## Coordinated jx dependency
 
-The release dependency currently pins the legacy jx API. To evaluate a reviewed
-local jx checkout with its experimental foundation, build a separate executable:
+The normal dependency pins the reviewed jx 0.2.0 candidate by immutable Git revision;
+its public compiler uses the common semantic IR. No backend flag, source patch or
+copied-source trial builder is needed. Cargo.lock must resolve the same revision.
+An unpublished candidate is not yet available to clean remote builds.
 
-```sh
-python3 scripts/build-experimental.py ../jx target/experimental-trial
-```
-
-The script uses cached Cargo dependencies and requires Python 3.9 or newer.
-Build normally and fetch the reviewed jx dependencies before running it. It
-requires a new destination under `target`, copies the current source
-(including uncommitted files), and changes only the copied dependency and the
-private expression compilation boundary. It runs `make check` and a release
-build against the copied lockfile and records source/library identities. Neither
-checkout is modified. The resulting `target/experimental-trial/target/release/jkq`
-is explicitly experimental; do not replace an installed release with it.
-Compilation failures are explicit, with no per-record legacy fallback. Immutable
-bindings, shared preparation, strict predicates and complete projection delivery
-use the same application code. Compare fixed snapshots and failure/output contracts
-before allowing sustained traffic. Shipping a supported opt-in feature requires
-a published, pinned jx revision with the experimental facade; the trial script
-does not make that dependency a release prerequisite.
+Release jx first after its candidate CI passes. Once `v0.2.0` exists, resolve that
+tag, verify it names the reviewed candidate, and update the dependency to the tag
+without changing the resolved code. Run `make check`, regenerate dependency notices
+and verify release archives through the normal locked build before releasing jkq.
+Local Git-cache validation establishes candidate correctness, not publication.
 
 ## Release Packaging
 
@@ -92,7 +81,9 @@ Before creating a release tag:
 A release tag must match the package version with a `v` prefix. Release jobs
 build native Linux amd64, Linux arm64, and macOS arm64 archives, execute each
 binary as a smoke test, and attach each archive and its SHA-256 checksum to the
-GitHub release. GNU binaries are built on Ubuntu 26.04; build locally when
+GitHub release. Archives contain the executable, MIT license and third-party notices.
+Regenerate notices with `python3 scripts/update-notices.py` after resolving the
+reviewed jx release and inspect bundled native-source licensing. GNU binaries are built on Ubuntu 26.04; build locally when
 compatibility with an older glibc-based system is required. `scripts/install.sh`
 installs supported release binaries after verifying their published checksums.
 There is no crates.io publication.
@@ -183,8 +174,8 @@ The direct runtime dependencies are deliberately limited to:
 are shared across workers together with one borrowed `jx::InputPlan`. Each
 payload is prepared once and reused across independent indexed evaluations.
 `$vars` is an immutable compile-time binding shared across expressions. The Git
-dependency tracks upstream `main`; `Cargo.lock` pins the exact revision for
-reproducible builds. simd-json remains only for the streaming JSON envelope string
+dependency and `Cargo.lock` pin the reviewed immutable revision; the release handoff
+above switches the published tag to that same code. simd-json remains only for the streaming JSON envelope string
 serializer.
 
 Before adding another dependency, confirm that the standard library or an

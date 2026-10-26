@@ -922,3 +922,43 @@ fn failed_projection_releases_oversized_output_scratch() {
         worker.output.capacity()
     );
 }
+
+#[test]
+fn correlated_callbacks_and_invariant_code_preserve_worker_actions() {
+    let transform = plan(
+        &[
+            "env != 'production'",
+            "$not($exists($lookup($vars.allowed, region & ':' & $string(id))))",
+        ],
+        &["deleted=true"],
+        Some(
+            "{'id':id,'values':groups.items.($parent:=%;$map(v,function($n){$parent.name & ':' & $string($n)})),'copy':$eval('id') }",
+        ),
+        Some(r#"{"allowed":{"eu:7":true}}"#),
+        false,
+    );
+    let input = br#"{"id":7,"env":"production","region":"eu","groups":[{"name":"g","items":[{"v":[1,2]}]}]}"#;
+    for transform in [transform.clone(), transform] {
+        assert_eq!(
+            run(&transform, Some(input)).unwrap(),
+            Action::Project(br#"{"id":7,"values":["g:1","g:2"],"copy":7}"#.to_vec())
+        );
+        assert_eq!(
+            run(
+                &transform,
+                Some(br#"{"id":7,"env":"production","region":"eu","deleted":true}"#)
+            )
+            .unwrap(),
+            Action::Tombstone
+        );
+        assert_eq!(
+            run(
+                &transform,
+                Some(br#"{"id":8,"env":"production","region":"eu"}"#)
+            )
+            .unwrap(),
+            Action::Drop
+        );
+        assert_eq!(run(&transform, None).unwrap(), Action::Tombstone);
+    }
+}

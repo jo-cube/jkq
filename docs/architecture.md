@@ -155,9 +155,9 @@ per-record binding setup.
 Before workers start, one `jx::InputPlan` borrows the compiled expressions
 in drop, tombstone, then projection order. Workers share this immutable plan.
 Each required payload is prepared once: jx validates the complete input and
-captures eligible bounded static paths during that traversal. Predicates and
-projection evaluate through stable indices with independent state. Unsupported
-expressions and deferred array paths use jx's ordinary evaluation fallback;
+captures query-sized input demands during that traversal. Predicates and
+projection evaluate through stable indices with independent state. General
+expressions and deferred array paths execute through the same common IR;
 immutable `$vars` reads can participate in those captures. There is no tape,
 mutable parsing copy, worker AST compilation, input tree, or jkq acquisition
 cache or fallback evaluator. jx owns acquisition and expression semantics.
