@@ -29,8 +29,8 @@ the observable behavior contracts.
 ## Prerequisites
 
 The repository follows stable Rust through `rust-toolchain.toml`. Building the
-bundled librdkafka, Zstandard, and vendored OpenSSL normally requires a C
-compiler, `make`, Perl, `pkg-config`, and libclang on Unix.
+bundled librdkafka, Zstandard, and vendored OpenSSL normally requires C
+and C++ compilers, `make`, Perl, and `pkg-config` on Unix.
 
 Build a release binary with:
 
@@ -55,6 +55,18 @@ cargo test --locked --all-targets --all-features
 
 CI runs the same checks.
 
+## jx dependency
+
+The normal dependency pins the merged upstream jx implementation by immutable
+Git revision. Its public compiler uses the common semantic IR; no backend flag,
+source patch or local path is needed. Cargo.lock must resolve the same revision.
+A separate jx release or tag is not required.
+
+When updating the pin, verify that the commit is reachable from upstream main,
+fetch it from GitHub in a clean Cargo Git cache, and run `make check` and a release
+build without local overrides. Regenerate notices and verify release archives
+before releasing jkq.
+
 ## Release Packaging
 
 Before creating a release tag:
@@ -68,8 +80,11 @@ Before creating a release tag:
 A release tag must match the package version with a `v` prefix. Release jobs
 build native Linux amd64, Linux arm64, and macOS arm64 archives, execute each
 binary as a smoke test, and attach each archive and its SHA-256 checksum to the
-GitHub release. GNU binaries are built on Ubuntu 26.04; build locally when
-compatibility with an older glibc-based system is required. `scripts/install.sh`
+GitHub release. Archives contain the executable, MIT license and third-party notices.
+Regenerate notices with `python3 scripts/update-notices.py` after resolving the
+pinned dependency graph and inspect bundled native-source licensing. GNU binaries
+are built on Ubuntu 26.04; build locally when compatibility with an older
+glibc-based system is required. `scripts/install.sh`
 installs supported release binaries after verifying their published checksums.
 There is no crates.io publication.
 
@@ -159,8 +174,8 @@ The direct runtime dependencies are deliberately limited to:
 are shared across workers together with one borrowed `jx::InputPlan`. Each
 payload is prepared once and reused across independent indexed evaluations.
 `$vars` is an immutable compile-time binding shared across expressions. The Git
-dependency tracks upstream `main`; `Cargo.lock` pins the exact revision for
-reproducible builds. simd-json remains only for the streaming JSON envelope string
+dependency and `Cargo.lock` pin the reviewed immutable revision; the release handoff
+above verifies the published tag names that same code. simd-json remains only for the streaming JSON envelope string
 serializer.
 
 Before adding another dependency, confirm that the standard library or an

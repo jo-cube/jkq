@@ -286,7 +286,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jkq"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "clap",
  "crossbeam-channel",
@@ -308,8 +308,8 @@ dependencies = [
 
 [[package]]
 name = "jx"
-version = "0.1.0"
-source = "git+https://github.com/jo-cube/jx.git?branch=main#6e47f581e83201a21935fba9e63eb9cd50eaad66"
+version = "0.2.0"
+source = "git+https://github.com/jo-cube/jx.git?rev=5c32d1cd63b03eb25741d651fbc026cf0e97f934#5c32d1cd63b03eb25741d651fbc026cf0e97f934"
 dependencies = [
  "base64",
  "regress",

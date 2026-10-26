@@ -116,8 +116,9 @@ source metadata; the local sequence drives completion ordering even when
 offsets are sparse.
 
 Each poller groups admitted inputs into batches capped by record count and
-retained source bytes. Partial batches flush when Kafka is idle, backpressure
-starts, or consumption stops. All pollers feed the same bounded worker and
+retained source bytes. Partial batches flush when the ready Kafka queue is empty, backpressure
+starts, or consumption stops. A poller with buffered work never waits for a
+future Kafka record before dispatching that work. All pollers feed the same bounded worker and
 completion channels. Workers process each received batch
 sequentially, and completions and source-byte releases cross their channels in
 batches. Admission, actions, ordering, and byte accounting remain per record.
@@ -154,9 +155,9 @@ per-record binding setup.
 Before workers start, one `jx::InputPlan` borrows the compiled expressions
 in drop, tombstone, then projection order. Workers share this immutable plan.
 Each required payload is prepared once: jx validates the complete input and
-captures eligible bounded static paths during that traversal. Predicates and
-projection evaluate through stable indices with independent state. Unsupported
-expressions and deferred array paths use jx's ordinary evaluation fallback;
+captures query-sized input demands during that traversal. Predicates and
+projection evaluate through stable indices with independent state. General
+expressions and deferred array paths execute through the same common IR;
 immutable `$vars` reads can participate in those captures. There is no tape,
 mutable parsing copy, worker AST compilation, input tree, or jkq acquisition
 cache or fallback evaluator. jx owns acquisition and expression semantics.
@@ -174,8 +175,8 @@ JSON-value pass uses `RawJson::write_compact` and retains source byte length.
 After successful serialization, the worker transfers the output buffer into
 the action and recycles the consumed source allocation as its next output
 buffer, provided its capacity fits the same 16 KiB/source-budget threshold.
-Oversized source allocations are discarded instead of becoming persistent
-scratch. Serialized output returns through the writer's release and can become
+Oversized source allocations and partially serialized failed projections are
+discarded instead of becoming persistent scratch. Serialized output returns through the writer's release and can become
 source storage again, completing the same reuse cycle. Worker scratch is outside
 the source-byte admission budget. Exact pass actions transfer the original
 bytes unchanged; drops and failures retain unused source storage until release.
@@ -235,7 +236,7 @@ covers owned bytes copied from the source record:
 
 - payload;
 - key, when required;
-- header names and header values, when required.
+- header names, header values, and their owned vector slots, when required.
 
 The charge intentionally excludes the worker-local output buffer, evaluation
 intermediates, projected output, the writer-local payload-format buffer, and compact pass output for a JSON-value envelope. It
@@ -274,11 +275,12 @@ Fixed ranges use exclusive end offsets. Snapshot boundaries are captured once
 and never extended. Completion means that the poller has stopped admitting the
 range and every admitted partition sequence has crossed its frontier.
 
-rdkafka 0.39 reports partition EOF without the event's offset. Fixed-end EOF
-handling therefore queries a fresh broker high watermark, which leaves the
-[future-end race documented in usage](usage.md#assignment-and-ranges). A
-compatible fix needs the actual EOF offset: the last delivered record alone
-cannot account for trailing compacted offsets or transaction control records.
+The native fetch adapter preserves partition EOF offsets until range handling
+has inspected the event. Fixed-end completion compares that delivered offset
+with the exclusive end. It does not substitute a later broker watermark:
+concurrent appends cannot make a stale EOF finish a future-ended range. EOF can
+also cover compacted offsets or transaction control records with no visible
+payload. The adapter services ordinary rust-rdkafka callbacks separately.
 
 Global counts atomically stop all admission after the configured number of
 input records.
@@ -300,8 +302,8 @@ or stdout that cannot make progress.
 
 - One invocation consumes one topic and directly assigns either explicitly
   selected partitions or every partition discovered at startup.
-- Every assigned partition belongs to exactly one consumer for the complete
-  run.
+- Every assigned partition has one consumer owner, except explicit unordered
+  range sharding, where each non-overlapping half-open range has one owner.
 - JSONata is the only expression language.
 - Every successfully transformed non-tombstone input resolves to exactly one
   action.

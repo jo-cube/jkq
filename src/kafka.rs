@@ -296,7 +296,7 @@ impl KafkaInput {
         self.poll_with_timeout(POLL_TIMEOUT)
     }
 
-    fn poll_with_timeout(&mut self, timeout: Duration) -> Result<PollEvent, String> {
+    pub(crate) fn poll_with_timeout(&mut self, timeout: Duration) -> Result<PollEvent, String> {
         if self.remaining_partitions == 0 {
             return Ok(PollEvent::Done);
         }
@@ -306,10 +306,6 @@ impl KafkaInput {
         if result.is_err() {
             let error = result.err().expect("failed Kafka poll has an error");
             return match error {
-                KafkaError::PartitionEOF(partition) => {
-                    self.handle_eof(partition)?;
-                    Ok(PollEvent::Idle)
-                }
                 error if error.rdkafka_error_code() == Some(RDKafkaErrorCode::AutoOffsetReset) => {
                     Err(format!("Kafka offset error: {error}"))
                 }
@@ -326,6 +322,12 @@ impl KafkaInput {
             };
         }
         let message = result.unwrap();
+        if message.is_partition_eof() {
+            let (partition, offset) = (message.partition(), message.offset());
+            drop(message);
+            self.handle_eof(partition, offset)?;
+            return Ok(PollEvent::Idle);
+        }
 
         let partition = message.partition();
         let Some(state) = self.partitions.get(&partition).copied() else {
@@ -365,15 +367,15 @@ impl KafkaInput {
                 .then(|| message.key().map(<[u8]>::to_vec))
                 .flatten(),
             headers: if self.requirements.headers {
-                message
-                    .headers()
-                    .into_iter()
-                    .flat_map(Headers::iter)
-                    .map(|header| Header {
+                let mut owned = Vec::new();
+                if let Some(headers) = message.headers() {
+                    owned = Vec::with_capacity(headers.count());
+                    owned.extend(headers.iter().map(|header| Header {
                         name: header.key.to_owned(),
                         value: header.value.map(<[u8]>::to_vec),
-                    })
-                    .collect()
+                    }));
+                }
+                owned
             } else {
                 Vec::new()
             },
@@ -385,19 +387,12 @@ impl KafkaInput {
         Ok(PollEvent::Record(record))
     }
 
-    fn handle_eof(&mut self, partition: i32) -> Result<(), String> {
+    fn handle_eof(&mut self, partition: i32, offset: i64) -> Result<(), String> {
         let Some(state) = self.partitions.get(&partition).copied() else {
             return Ok(());
         };
         let should_finish = match state.range.end_exclusive {
-            Some(end) => {
-                self.consumer
-                    .consumer()
-                    .fetch_watermarks(&self.topic, partition, METADATA_TIMEOUT)
-                    .map_err(|error| watermark_error(&self.topic, partition, error))?
-                    .1
-                    >= end
-            }
+            Some(end) => offset >= end,
             None => self.exit_at_end,
         };
         if should_finish {
@@ -503,6 +498,11 @@ fn retained_bytes(
     if requirements.headers
         && let Some(headers) = message.headers()
     {
+        bytes = headers
+            .count()
+            .checked_mul(std::mem::size_of::<Header>())
+            .and_then(|slots| bytes.checked_add(slots))
+            .ok_or_else(|| "record retained-byte charge overflowed usize".to_owned())?;
         for header in headers.iter() {
             bytes = bytes
                 .checked_add(header.key.len())
@@ -511,6 +511,13 @@ fn retained_bytes(
         }
     }
     Ok(bytes)
+}
+
+pub fn validate_config(config: &RuntimeConfig) -> Result<(), String> {
+    consumer_config(config)
+        .create_native_config()
+        .map(|_| ())
+        .map_err(client_creation_error)
 }
 
 fn create_consumer(config: &RuntimeConfig) -> Result<BaseConsumer, String> {
@@ -707,6 +714,99 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn a_delayed_eof_does_not_use_a_later_broker_high_watermark() {
+        use clap::Parser;
+        use rdkafka::{
+            mocking::MockCluster,
+            producer::{BaseProducer, BaseRecord, Producer},
+        };
+        let cluster = MockCluster::new(1).unwrap();
+        cluster.create_topic("delayed-eof", 1, 1).unwrap();
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .create()
+            .unwrap();
+        let produce = || {
+            producer
+                .send(
+                    BaseRecord::<(), [u8]>::to("delayed-eof")
+                        .partition(0)
+                        .payload(b"{}"),
+                )
+                .map_err(|(error, _)| error)
+                .unwrap();
+            producer.flush(Duration::from_secs(5)).unwrap();
+        };
+        produce();
+        let config = crate::cli::RawCli::try_parse_from([
+            "jkq",
+            "-b",
+            &cluster.bootstrap_servers(),
+            "-t",
+            "delayed-eof",
+            "-p",
+            "0",
+            "--end-offset",
+            "3",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap();
+        let mut input = KafkaInput::prepare(&config).unwrap().pop().unwrap();
+        // Hold the EOF event at offset 1 while the broker advances to offset 3.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            if matches!(input.consumer.poll(POLL_TIMEOUT), Some(Ok(event)) if event.is_partition_eof() && event.offset() == 1)
+            {
+                break;
+            }
+        }
+        produce();
+        produce();
+        input.handle_eof(0, 1).unwrap();
+        assert_eq!(
+            input.remaining_partitions, 1,
+            "stale EOF must not finish the range"
+        );
+        let mut offsets = Vec::new();
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            match input.poll().unwrap() {
+                PollEvent::Record(record) => offsets.push(record.offset),
+                PollEvent::Done => break,
+                PollEvent::Idle => {}
+            }
+        }
+        assert_eq!(offsets, [1, 2]);
+    }
+
+    #[test]
+    fn partition_fetch_alias_is_forwarded_to_native_configuration() {
+        use clap::Parser;
+        let config = crate::cli::RawCli::try_parse_from([
+            "jkq",
+            "-b",
+            "unused",
+            "-t",
+            "events",
+            "-X",
+            "max.partition.fetch.bytes=32768",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap();
+        assert_eq!(
+            consumer_config(&config)
+                .create_native_config()
+                .unwrap()
+                .get("fetch.message.max.bytes")
+                .unwrap(),
+            "32768"
+        );
     }
 
     fn range(partition: i32, start: i64, end: i64) -> PartitionRange {

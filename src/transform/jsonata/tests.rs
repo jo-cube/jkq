@@ -886,3 +886,79 @@ fn unused_source_storage_survives_actions_and_evaluation_failures() {
         assert_eq!(source.as_deref(), Some(source_bytes));
     }
 }
+
+#[test]
+fn failed_projection_releases_oversized_output_scratch() {
+    let plan = plan(
+        &[],
+        &[],
+        Some(r#"items.($exists(x) ? x : function(){1})"#),
+        None,
+        false,
+    );
+    let input_plan = plan.input_plan();
+    let mut worker = Worker::new(&plan, &input_plan, false, 16384);
+    let mut source = Some(
+        format!(
+            r#"{{"items":[{{"x":"{}"}},{{}}]}}"#,
+            "x".repeat(1024 * 1024)
+        )
+        .into_bytes(),
+    );
+    let execution = worker
+        .execute_report(
+            &mut source,
+            ErrorPolicies {
+                invalid_json: InvalidJsonPolicy::Fail,
+                evaluation: EvaluationPolicy::Drop,
+            },
+        )
+        .unwrap();
+    assert_eq!(execution.action, Action::Drop);
+    assert_eq!(execution.issue, Some(ExecutionIssue::Evaluation));
+    assert!(
+        worker.output.capacity() <= 16384,
+        "failed output retained {} bytes",
+        worker.output.capacity()
+    );
+}
+
+#[test]
+fn correlated_callbacks_and_invariant_code_preserve_worker_actions() {
+    let transform = plan(
+        &[
+            "env != 'production'",
+            "$not($exists($lookup($vars.allowed, region & ':' & $string(id))))",
+        ],
+        &["deleted=true"],
+        Some(
+            "{'id':id,'values':groups.items.($parent:=%;$map(v,function($n){$parent.name & ':' & $string($n)})),'copy':$eval('id') }",
+        ),
+        Some(r#"{"allowed":{"eu:7":true}}"#),
+        false,
+    );
+    let input = br#"{"id":7,"env":"production","region":"eu","groups":[{"name":"g","items":[{"v":[1,2]}]}]}"#;
+    for transform in [transform.clone(), transform] {
+        assert_eq!(
+            run(&transform, Some(input)).unwrap(),
+            Action::Project(br#"{"id":7,"values":["g:1","g:2"],"copy":7}"#.to_vec())
+        );
+        assert_eq!(
+            run(
+                &transform,
+                Some(br#"{"id":7,"env":"production","region":"eu","deleted":true}"#)
+            )
+            .unwrap(),
+            Action::Tombstone
+        );
+        assert_eq!(
+            run(
+                &transform,
+                Some(br#"{"id":8,"env":"production","region":"eu"}"#)
+            )
+            .unwrap(),
+            Action::Drop
+        );
+        assert_eq!(run(&transform, None).unwrap(), Action::Tombstone);
+    }
+}

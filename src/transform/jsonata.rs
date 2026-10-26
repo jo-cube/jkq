@@ -150,7 +150,11 @@ impl<'a> Worker<'a> {
             );
         };
         if let Err(message) = result {
-            self.output.clear();
+            if self.output.capacity() > self.max_recycled_capacity {
+                self.output = Vec::new();
+            } else {
+                self.output.clear();
+            }
             return evaluation_result(
                 Err(evaluation_error(category, None, message)),
                 policies.evaluation,

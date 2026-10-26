@@ -27,6 +27,11 @@ tombstones by default. `--drop-tombstones` drops them, as well as records
 selected by `--tombstone-if`, before projection. Records stay in source order
 within each partition by default; there is no global order across partitions.
 
+Admission limits bound source work, rather than total process memory. Native
+Kafka batches, JSONata intermediates, and expanded output remain outside that
+budget. See [memory and native fetch controls](docs/usage.md#parallelism-and-memory)
+before processing large records or using a slow output sink.
+
 ## What It Is For
 
 Use `jkq` to:
@@ -76,8 +81,8 @@ and OpenSSL, then run:
 cargo build --release --locked
 ```
 
-On Unix, this normally requires a C compiler, `make`, Perl, `pkg-config`, and
-libclang. The executable is written to `target/release/jkq`.
+On Unix, this normally requires C and C++ compilers, `make`, Perl, and
+`pkg-config`. The executable is written to `target/release/jkq`.
 
 The bundled Kafka client supports gzip, Snappy, LZ4, and Zstandard-compressed
 record batches.

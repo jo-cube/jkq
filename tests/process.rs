@@ -140,6 +140,34 @@ fn check_validates_locally_without_connecting() {
 }
 
 #[test]
+fn check_rejects_invalid_native_properties_without_connecting() {
+    for property in [
+        "not.a.kafka.property=1",
+        "fetch.queue.backoff.ms=invalid",
+        "security.protocol=invalid",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_jkq"))
+            .args([
+                "-b",
+                "unreachable.invalid:9092",
+                "-t",
+                "events",
+                "--check",
+                "-X",
+                property,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("configuration"),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
 fn check_rejects_jsonata_and_variables_without_connecting() {
     for arguments in [
         vec!["--drop-if", "environment == \"production\""],

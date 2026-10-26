@@ -14,7 +14,9 @@ Jump to [assignment and ranges](#assignment-and-ranges),
 `--check` validates the complete local invocation and exits without creating a
 Kafka consumer. It checks required arguments, option combinations, partition
 selection, config-file syntax, expressions, and output formats. It does not
-test broker reachability or ask librdkafka to validate property values.
+test broker reachability, authentication, or constraints checked only when a
+Kafka client is created. Native property names, types, and enumeration values
+are checked locally without creating a client.
 
 ## Assignment and Ranges
 
@@ -100,10 +102,13 @@ Termination controls:
 `--snapshot` cannot be combined with an explicit end. All start and end
 positions apply to every assigned partition.
 
-Known limitation: an explicit end ahead of the current log can terminate early
-if producers append between EOF delivery and the subsequent watermark check.
-Use `--snapshot` to export records already retained at startup. See the
-[EOF handling constraint](architecture.md#termination-and-failure).
+An explicit end ahead of the current log waits until the delivered partition EOF
+or a record reaches that exclusive boundary. EOF uses the offset carried by the
+Kafka event, so later appends cannot make an earlier EOF finish the range.
+With `isolation.level=read_committed`, snapshot ends are queried at the last
+stable offset and exclude open transactions. An explicit end beyond that offset
+can wait until a transaction commits or aborts. Ranges are offset boundaries,
+not wall-clock deadlines.
 
 ## Transforms
 
@@ -312,8 +317,11 @@ validation, including for an otherwise identity transform.
 
 `-F, --config <path>` reads librdkafka properties as `key=value` lines. Blank
 lines and lines beginning with `#` are ignored. `-X, --property key=value` is
-repeatable; later values replace earlier ones. Dedicated `-b` brokers take
-precedence over both. For `-X`, everything after the first `=` is the property
+repeatable; later values replace earlier values of the same property. The broker
+alias `metadata.broker.list` is accepted, but cannot be combined with
+`bootstrap.servers` unless `-b` overrides both. Dedicated `-b` brokers take
+precedence over the file and properties, including either alias. For `-X`,
+everything after the first `=` is the property
 value, including surrounding whitespace. Malformed properties report the
 required `key=value` syntax and, for config files, the path and line number;
 they do not echo the property contents.
@@ -342,18 +350,31 @@ ssl.key.location=/path/to/client.key
 jkq -F kafka.properties -t events -p 0 --snapshot
 ```
 
-The official build includes TLS support through vendored OpenSSL. Additional
-TLS properties can be passed through with `-F` or `-X` unless listed as owned
-above.
+The official build includes TLS and client certificates through vendored
+OpenSSL, plus SASL/PLAIN and SCRAM-SHA-256/512. It does not include
+GSSAPI/Kerberos or automatic OAuth/OIDC token retrieval. Additional native
+properties can be passed through with `-F` or `-X` unless listed as owned
+above; configuration cannot enable features omitted at build time.
 
 There is no implicit configuration-file discovery.
 
-jkq sets `fetch.queue.backoff.ms=100` unless the property is supplied through
-`-F` or `-X`. This shortens the delay before a partition can fetch again after
-its prefetch queue crosses a threshold, avoiding long idle periods after the
-application drains that queue. Use `-X fetch.queue.backoff.ms=1000` for a longer
-retry interval, or measure nearby values for your workload. Other fetch and
-prefetch properties retain librdkafka's defaults unless supplied explicitly.
+jkq sets `fetch.queue.backoff.ms=100` unless overridden through `-F` or `-X`.
+Other fetch and prefetch properties retain librdkafka defaults. The partition
+fetch alias `max.partition.fetch.bytes` is accepted; supplying both it and
+`fetch.message.max.bytes` is an error because native configuration order would
+otherwise make their precedence ambiguous.
+
+Native queues are separate from the source-byte budget. Smaller
+`queued.max.messages.kbytes`, `fetch.message.max.bytes`, and `fetch.max.bytes`
+can reduce read-ahead, but can also reduce throughput. A shorter
+`fetch.queue.backoff.ms` can avoid starvation with small queues while increasing
+wakeups and, under some slow-output conditions, memory high water. Compare both
+fast and slow sinks, compressed and high-entropy inputs, and the intended consumer
+count before changing them. These are targets, not hard RSS or record-size limits:
+oversize first batches can exceed fetch limits, partition fetches grow for larger
+batches, and compression can expand substantially. Arbitrary JSONata output and
+intermediates are also outside the source budget. Use process resource limits
+when total RSS must have a hard ceiling.
 
 ## Parallelism and Memory
 
@@ -363,6 +384,10 @@ own poller thread and direct partition assignment.
 Without range sharding, extra consumers help only when multiple partitions
 are selected. With range sharding, each consumer has its own fetch,
 decompression, and native prefetch queue, even for one source partition.
+
+Ready records are batched, but a partial batch is dispatched before waiting
+for more Kafka input. `-u` additionally flushes stdout for each emitted record;
+without it the normal stdout buffer can delay small outputs.
 
 JSON evaluation uses an automatic shared evaluator pool, including parallel
 records from the same partition. There is no `--jobs` option. With `cpus` from
@@ -385,7 +410,8 @@ These limits bound admitted work:
 
 Sizes accept bytes or `KiB`, `MiB`, and `GiB`. `--max-inflight-bytes` is an
 admission budget for owned source record bytes and copied source metadata: the
-payload, key, header names, and header values required by the output plan. It
+payload, key, header names, header values, and owned header slots required by
+the output plan. It
 does not account for worker output buffers, evaluation intermediates, or
 projected output. Those allocations depend on the input and
 expressions and are outside this source-byte budget. Payload reuse retains
@@ -550,12 +576,12 @@ prefetch memory and trigger queue backoff. Compare a nearby value such as
 `-X fetch.message.max.bytes=8388608` before making it permanent. Increasing
 `queued.max.messages.kbytes` alone does not help when fetch queues are empty.
 
-A short range ending exactly at the log high includes EOF watermark queries.
-Measure a range ending inside the retained log as well, so termination latency
-does not distort sustained ingestion throughput. `fetch.wait.max.ms` can delay
-those queries behind an outstanding empty fetch. See the
-[Kafka throughput investigation](kafka-throughput-investigation.md) for measured
-examples and the rejected polling experiments.
+A short range ending exactly at the log high completes from the delivered EOF
+offset. Measure a range ending inside the retained log as well, so startup and
+termination latency do not distort sustained ingestion throughput. Kafka's
+`fetch.wait.max.ms` can affect empty-fetch latency; EOF handling does not query
+watermarks. The older [Kafka throughput investigation](kafka-throughput-investigation.md)
+records results for an earlier fetch path and defaults.
 
 ### Validate a bounded slice first
 

@@ -133,10 +133,8 @@ impl<C: ConsumerContext> FetchConsumer<C> {
         // SAFETY: extraction returned a live, independently destroyable message.
         let error = unsafe { (*ptr).err };
         match error {
-            sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR => Some(Ok(message)),
-            sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__PARTITION_EOF => {
-                Some(Err(KafkaError::PartitionEOF(message.partition())))
-            }
+            sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
+            | sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__PARTITION_EOF => Some(Ok(message)),
             sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__FATAL => {
                 Some(Err(KafkaError::MessageConsumptionFatal(error.into())))
             }
@@ -190,6 +188,10 @@ impl NativeMessage<'_> {
     fn raw(&self) -> &sys::rd_kafka_message_t {
         // SAFETY: message stays live until this owner drops.
         unsafe { &*self.ptr }
+    }
+
+    pub(super) fn is_partition_eof(&self) -> bool {
+        self.raw().err == sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__PARTITION_EOF
     }
 
     pub(super) fn partition(&self) -> i32 {
@@ -374,6 +376,10 @@ mod tests {
         while !eof || observed.load(Ordering::Relaxed) == 0 {
             assert!(Instant::now() < deadline);
             match input.poll(Duration::from_millis(100)) {
+                Some(Ok(message)) if message.is_partition_eof() => {
+                    assert_eq!((message.partition(), message.offset()), (0, 70));
+                    eof = true;
+                }
                 Some(Ok(message)) => {
                     assert_eq!(message.partition(), 0);
                     assert_eq!(message.offset(), seen);
@@ -395,7 +401,6 @@ mod tests {
                     assert!(headers.try_get(3).is_none());
                     seen += 1;
                 }
-                Some(Err(KafkaError::PartitionEOF(0))) => eof = true,
                 Some(Err(error)) => panic!("{error}"),
                 None => {}
             }

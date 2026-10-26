@@ -392,6 +392,19 @@ impl RawCli {
                 return Err(format!("Kafka property {key:?} is managed by jkq"));
             }
         }
+        if kafka_properties.contains_key("fetch.message.max.bytes")
+            && kafka_properties.contains_key("max.partition.fetch.bytes")
+        {
+            return Err("use only one of Kafka properties fetch.message.max.bytes and its alias max.partition.fetch.bytes".to_owned());
+        }
+        if let Some(brokers) = kafka_properties.remove("metadata.broker.list")
+            && self.brokers.is_none()
+            && kafka_properties
+                .insert("bootstrap.servers".to_owned(), brokers)
+                .is_some()
+        {
+            return Err("use only one of Kafka properties bootstrap.servers and its alias metadata.broker.list, or override both with -b".to_owned());
+        }
         if let Some(brokers) = &self.brokers {
             kafka_properties.insert("bootstrap.servers".to_owned(), brokers.clone());
         }
@@ -625,6 +638,23 @@ mod tests {
         RawCli::try_parse_from(arguments)
             .map_err(|error| error.to_string())?
             .resolve()
+    }
+
+    #[test]
+    fn conflicting_partition_fetch_aliases_fail_before_connecting() {
+        let error = resolve(&[
+            "jkq",
+            "-b",
+            "unused",
+            "-t",
+            "events",
+            "-X",
+            "fetch.message.max.bytes=16384",
+            "-X",
+            "max.partition.fetch.bytes=32768",
+        ])
+        .unwrap_err();
+        assert!(error.contains("use only one"), "{error}");
     }
 
     #[test]
@@ -883,6 +913,8 @@ mod tests {
             "-X",
             "bootstrap.servers=old",
             "-X",
+            "metadata.broker.list=also-old",
+            "-X",
             "a=1",
             "-X",
             "a=2",
@@ -893,8 +925,34 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(config.kafka_properties["bootstrap.servers"], "new");
+        assert!(!config.kafka_properties.contains_key("metadata.broker.list"));
         assert_eq!(config.kafka_properties["a"], "2");
         assert_eq!(config.kafka_properties["secret"], " padded ");
+    }
+
+    #[test]
+    fn broker_alias_is_resolved_before_native_configuration() {
+        let config = resolve(&[
+            "jkq",
+            "-t",
+            "events",
+            "-X",
+            "metadata.broker.list=broker:9092",
+        ])
+        .unwrap();
+        assert_eq!(config.kafka_properties["bootstrap.servers"], "broker:9092");
+        assert!(!config.kafka_properties.contains_key("metadata.broker.list"));
+        let error = resolve(&[
+            "jkq",
+            "-t",
+            "events",
+            "-X",
+            "metadata.broker.list=first:9092",
+            "-X",
+            "bootstrap.servers=second:9092",
+        ])
+        .unwrap_err();
+        assert!(error.contains("use only one"), "{error}");
     }
 
     #[test]
