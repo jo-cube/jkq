@@ -14,7 +14,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use signal_hook::{
     SigId,
     consts::{SIGINT, SIGTERM},
-    flag, low_level,
+    low_level,
 };
 
 use crate::{
@@ -73,44 +73,65 @@ impl fmt::Display for PipelineError {
     }
 }
 
+// The lifecycle gate holds this startup sentinel, zero after handoff, or a signal.
+const SIGNAL_STARTUP: usize = usize::MAX;
+
 pub struct SignalControl {
-    armed: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     received: Arc<AtomicUsize>,
     registrations: Vec<SigId>,
 }
 
 impl SignalControl {
-    pub fn install() -> Result<Self, String> {
-        let mut control = Self {
-            armed: Arc::new(AtomicBool::new(false)),
-            received: Arc::new(AtomicUsize::new(0)),
+    fn new() -> Self {
+        Self {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            received: Arc::new(AtomicUsize::new(SIGNAL_STARTUP)),
             registrations: Vec::new(),
-        };
-        for (signal, status) in [(SIGINT, 130), (SIGTERM, 143)] {
-            control.registrations.push(
-                flag::register_conditional_shutdown(signal, status, Arc::clone(&control.armed))
-                    .map_err(|error| format!("cannot install signal handler: {error}"))?,
-            );
         }
-        for signal in [SIGINT, SIGTERM] {
+    }
+
+    pub fn install() -> Result<Self, String> {
+        let mut control = Self::new();
+        for (signal, status) in [(SIGINT, 130), (SIGTERM, 143)] {
+            let shutdown = Arc::clone(&control.shutdown);
+            let received = Arc::clone(&control.received);
+            let value = usize::try_from(signal).expect("termination signals are positive");
+            let action = move || {
+                let already_stopping = shutdown.load(Ordering::SeqCst);
+                if Self::record_signal(&received, value) || already_stopping {
+                    low_level::exit(status);
+                }
+                shutdown.store(true, Ordering::SeqCst);
+            };
+            // SAFETY: the action only uses lock-free atomics and signal-safe _exit.
             control.registrations.push(
-                flag::register_usize(
-                    signal,
-                    Arc::clone(&control.received),
-                    usize::try_from(signal).expect("termination signals are positive"),
-                )
-                .map_err(|error| format!("cannot install signal handler: {error}"))?,
-            );
-            control.registrations.push(
-                flag::register(signal, Arc::clone(&control.armed))
+                unsafe { low_level::register(signal, action) }
                     .map_err(|error| format!("cannot install signal handler: {error}"))?,
             );
         }
         Ok(control)
     }
 
-    pub fn parts(&self) -> (Arc<AtomicBool>, Arc<AtomicUsize>) {
-        (Arc::clone(&self.armed), Arc::clone(&self.received))
+    fn record_signal(received: &AtomicUsize, signal: usize) -> bool {
+        // Claim the signal before publishing shutdown: overlapping handlers must
+        // force exit even if the first handler has not reached that store yet.
+        received.swap(signal, Ordering::SeqCst) != 0
+    }
+
+    fn try_begin_processing(&mut self) -> Result<(), usize> {
+        self.received
+            .compare_exchange(SIGNAL_STARTUP, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+    }
+
+    pub fn begin_processing(&mut self) -> (Arc<AtomicBool>, Arc<AtomicUsize>) {
+        if let Err(signal) = self.try_begin_processing() {
+            // A startup handler may still be running on another thread.
+            // Do not start processing or wait for consumer destruction.
+            low_level::exit(128 + i32::try_from(signal).expect("registered signal fits in i32"));
+        }
+        (Arc::clone(&self.shutdown), Arc::clone(&self.received))
     }
 }
 
@@ -1194,6 +1215,39 @@ mod tests {
         let mut base = vec!["jkq", "-b", "unused", "-t", "events", "-p", "0"];
         base.extend_from_slice(arguments);
         RawCli::try_parse_from(base).unwrap().resolve().unwrap()
+    }
+
+    #[test]
+    fn startup_signal_prevents_the_processing_handoff() {
+        for signal in [SIGINT, SIGTERM] {
+            let mut control = SignalControl::new();
+            let signal = usize::try_from(signal).unwrap();
+
+            assert!(SignalControl::record_signal(&control.received, signal));
+            // The handler can be suspended before _exit on another thread.
+            assert_eq!(control.try_begin_processing(), Err(signal));
+            assert_eq!(control.received.load(Ordering::SeqCst), signal);
+        }
+    }
+
+    #[test]
+    fn processing_signals_force_exit_before_shutdown_is_published() {
+        for first in [SIGINT, SIGTERM] {
+            for second in [SIGINT, SIGTERM] {
+                let mut control = SignalControl::new();
+                assert_eq!(control.try_begin_processing(), Ok(()));
+                let first = usize::try_from(first).unwrap();
+                let second = usize::try_from(second).unwrap();
+
+                assert!(!SignalControl::record_signal(&control.received, first));
+                assert_eq!(control.received.load(Ordering::SeqCst), first);
+                // Model a nested or concurrent handler before the first one
+                // publishes shutdown. The second signal must still force exit.
+                assert!(!control.shutdown.load(Ordering::SeqCst));
+                assert!(SignalControl::record_signal(&control.received, second));
+                assert_eq!(control.received.load(Ordering::SeqCst), second);
+            }
+        }
     }
 
     #[test]

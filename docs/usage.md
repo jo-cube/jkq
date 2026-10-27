@@ -633,7 +633,9 @@ requested statistics.
 the window length in a periodic report and the complete run time in the final
 report.
 
-The first `SIGINT` or `SIGTERM` stops admission, drains admitted records, and
+During Kafka startup, before any records are admitted, the first `SIGINT` or
+`SIGTERM` exits immediately with the signal's exit code. Once processing begins,
+the first termination signal stops admission, drains admitted records, and
 flushes stdout. A second termination signal exits immediately. A downstream
 broken pipe is normal, quiet termination.
 

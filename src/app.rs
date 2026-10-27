@@ -77,7 +77,7 @@ fn consume(
 ) -> Result<(), AppError> {
     let stats = Arc::new(Stats::new(config.stats));
     let started = Instant::now();
-    let (shutdown, pending_signals) = signals.parts();
+    let (shutdown, pending_signals) = signals.begin_processing();
     let result = runtime::run_pipeline(
         config,
         inputs,

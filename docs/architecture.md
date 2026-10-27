@@ -294,9 +294,15 @@ accounting for every completion. A flush failure never replaces an earlier
 fatal error. Poller, worker, and writer panics become pipeline failures rather
 than leaving another stage blocked.
 
-The first termination signal stops admission and drains. signal-hook arms the
-second signal for immediate process exit, which also handles a poller, worker,
-or stdout that cannot make progress.
+During Kafka preparation, a termination signal exits immediately: there is no
+admitted work or output to drain, and native metadata calls cannot observe
+application cancellation flags. The operating system reclaims native threads,
+sockets, and memory without running Rust destructors. An atomic lifecycle gate
+orders signals against the startup-to-processing handoff; a recorded startup
+signal prevents that handoff. After the handoff, the first signal records its
+number before publishing shutdown so admission stops and processing drains.
+Any subsequent signal forces immediate exit, even if the first handler has
+not finished or a poller, worker, or stdout cannot progress.
 
 ## Invariants
 
