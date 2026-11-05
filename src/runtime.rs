@@ -492,7 +492,7 @@ pub fn run_pipeline(
     };
     let input_plan = config.transform.input_plan();
 
-    let signal = thread::scope(|scope| {
+    thread::scope(|scope| {
         let (stats_stop_tx, stats_reporter) = if let Some(interval) = config.stats_interval {
             let (stop_tx, stop_rx) = bounded::<()>(1);
             let reporter_stats = Arc::clone(&stats);
@@ -518,7 +518,6 @@ pub fn run_pipeline(
         let mut pollers = Vec::with_capacity(inputs.len());
         for (consumer, (input, release_rx)) in inputs.into_iter().zip(release_rxs).enumerate() {
             let poller_shutdown = Arc::clone(&shutdown);
-            let poller_signal = Arc::clone(&received_signal);
             let poller_stats = Arc::clone(&stats);
             let poller_failure = Arc::clone(&first_failure);
             let panic_shutdown = Arc::clone(&poller_shutdown);
@@ -541,12 +540,10 @@ pub fn run_pipeline(
                             release_rx,
                             poller_admission,
                             poller_shutdown,
-                            poller_signal,
                             poller_stats,
                             poller_failure,
                         )
-                    })
-                    .flatten()
+                    });
                 }) {
                 Ok(poller) => pollers.push(poller),
                 Err(error) => {
@@ -613,15 +610,11 @@ pub fn run_pipeline(
                 shutdown.store(true, Ordering::SeqCst);
             }
         }
-        let mut signal = None;
         for poller in pollers {
-            match poller.join() {
-                Ok(result) => signal = signal.or(result),
-                Err(_) => {
-                    let error = PipelineError::Runtime("Kafka poll thread panicked".to_owned());
-                    record_failure(&first_failure, &error);
-                    shutdown.store(true, Ordering::SeqCst);
-                }
+            if poller.join().is_err() {
+                let error = PipelineError::Runtime("Kafka poll thread panicked".to_owned());
+                record_failure(&first_failure, &error);
+                shutdown.store(true, Ordering::SeqCst);
             }
         }
         drop(stats_stop_tx);
@@ -632,13 +625,16 @@ pub fn run_pipeline(
             record_failure(&first_failure, &error);
             shutdown.store(true, Ordering::SeqCst);
         }
-        signal
     });
 
     match Arc::try_unwrap(first_failure) {
         Ok(first_failure) => match first_failure.into_inner() {
             Some(error) => Err(error.into_error()),
-            None => Ok(signal),
+            None => {
+                let signal = received_signal.load(Ordering::SeqCst);
+                Ok((signal != 0)
+                    .then(|| i32::try_from(signal).expect("registered signal fits in i32")))
+            }
         },
         Err(_) => Err(PipelineError::Runtime(
             "internal failure state remained shared after shutdown".to_owned(),
@@ -654,10 +650,9 @@ fn poll_loop(
     release_rx: Receiver<Vec<Release>>,
     shared_admission: Arc<SharedAdmission>,
     shutdown: Arc<AtomicBool>,
-    received_signal: Arc<AtomicUsize>,
     stats: Arc<Stats>,
     first_failure: Arc<OnceLock<RecordedFailure>>,
-) -> Option<i32> {
+) {
     let partitions = input.assigned_partitions();
     let mut admission = Admission::new(&partitions, input.max_inflight_per_partition());
     let mut buffer = Some(buffer);
@@ -777,9 +772,6 @@ fn poll_loop(
             }
         }
     }
-
-    let signal = received_signal.load(Ordering::SeqCst);
-    (signal != 0).then(|| i32::try_from(signal).expect("registered signal fits in i32"))
 }
 
 fn release_batch(
@@ -1246,6 +1238,64 @@ mod tests {
                 assert!(!control.shutdown.load(Ordering::SeqCst));
                 assert!(SignalControl::record_signal(&control.received, second));
                 assert_eq!(control.received.load(Ordering::SeqCst), second);
+            }
+        }
+    }
+
+    #[test]
+    fn final_flush_signal_is_reported_unless_a_failure_was_recorded() {
+        struct SignalOnFlush<'a> {
+            control: &'a SignalControl,
+            signal: i32,
+            fail: bool,
+        }
+
+        impl Write for SignalOnFlush<'_> {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                unreachable!("no input records")
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                assert!(!SignalControl::record_signal(
+                    &self.control.received,
+                    usize::try_from(self.signal).unwrap(),
+                ));
+                self.control.shutdown.store(true, Ordering::SeqCst);
+                if self.fail {
+                    Err(io::Error::other("final flush failed"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let config = config(&[]);
+        for signal in [SIGINT, SIGTERM] {
+            for fail in [false, true] {
+                let mut control = SignalControl::new();
+                let (shutdown, received) = control.begin_processing();
+                let mut writer = SignalOnFlush {
+                    control: &control,
+                    signal,
+                    fail,
+                };
+                // No Kafka inputs are needed to isolate the post-polling flush:
+                // no poller can observe the signal recorded by this writer.
+                let result = run_pipeline(
+                    &config,
+                    Vec::new(),
+                    &mut writer,
+                    shutdown,
+                    received,
+                    Arc::new(Stats::default()),
+                );
+
+                if fail {
+                    assert!(matches!(result, Err(PipelineError::Output(ref error))
+                        if error.to_string() == "final flush failed"));
+                } else {
+                    assert_eq!(result.unwrap(), Some(signal));
+                }
             }
         }
     }
