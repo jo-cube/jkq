@@ -442,13 +442,26 @@ fn non_json_projection_values_are_errors_even_when_nested() {
 
 #[test]
 fn late_projection_failures_never_publish_partial_results() {
-    for (expression, variables) in [
-        (r#"rows.(n = null ? $error("late failure") : n * n)"#, None),
-        ("rows.(n = null ? $sum : n * n)", None),
+    for (expression, variables, error_detail, expected) in [
         (
-            r#"rows.(n = $vars.stop ? $error("late failure") : n * $vars.scale)"#,
-            Some(r#"{"stop":null,"scale":4}"#),
+            r#"items.(v = null ? $error("late failure") : v * v)"#,
+            None,
+            "late failure",
+            "16",
         ),
+        (
+            "items.(v = null ? $sum : v * v)",
+            None,
+            "functions have no JSON encoding",
+            "16",
+        ),
+        (
+            r#"items.(v = $vars.stop ? $error("late failure") : v * $vars.scale)"#,
+            Some(r#"{"stop":null,"scale":4}"#),
+            "late failure",
+            "16",
+        ),
+        ("items.(v=1?$sum:v+1)", None, "(TypeError)", "5"),
     ] {
         let transform = plan(
             &["id = 'drop'", "id = 'absent'"],
@@ -457,7 +470,7 @@ fn late_projection_failures_never_publish_partial_results() {
             variables,
             false,
         );
-        let bad = br#"{"rows":[{"n":2},{"n":3},{"n":null}]}"#;
+        let bad = br#"{"items":[{"v":1},{"v":2},{"v":null}]}"#;
         for policy in [
             EvaluationPolicy::Fail,
             EvaluationPolicy::Drop,
@@ -474,12 +487,9 @@ fn late_projection_failures_never_publish_partial_results() {
             );
             match policy {
                 EvaluationPolicy::Fail => {
-                    assert!(
-                        result
-                            .unwrap_err()
-                            .to_string()
-                            .starts_with("projection evaluation error")
-                    )
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.starts_with("projection evaluation error"), "{error}");
+                    assert!(error.contains(error_detail), "{error}");
                 }
                 EvaluationPolicy::Drop | EvaluationPolicy::Tombstone => {
                     let result = result.unwrap();
@@ -494,12 +504,13 @@ fn late_projection_failures_never_publish_partial_results() {
                     );
                 }
             }
+            assert!(worker.output.is_empty());
             assert_eq!(
                 worker
-                    .execute_report(&mut Some(br#"{"rows":[{"n":4}]}"#.to_vec()), FAIL)
+                    .execute_report(&mut Some(br#"{"items":[{"v":4}]}"#.to_vec()), FAIL)
                     .unwrap()
                     .action,
-                Action::Project(b"16".to_vec())
+                Action::Project(expected.as_bytes().to_vec())
             );
         }
     }

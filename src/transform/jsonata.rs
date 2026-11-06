@@ -128,9 +128,18 @@ impl<'a> Worker<'a> {
         let (result, category) = if self.plan.projection.is_some() {
             (
                 input
-                    .evaluate(self.plan.drops.len() + self.plan.tombstones.len())
+                    .write_json(
+                        self.plan.drops.len() + self.plan.tombstones.len(),
+                        &mut self.output,
+                    )
                     .map_err(|error| error.to_string())
-                    .and_then(|evaluation| serialize_projection(evaluation, &mut self.output)),
+                    .and_then(|present| {
+                        if present {
+                            Ok(())
+                        } else {
+                            Err("projection emitted no results".to_owned())
+                        }
+                    }),
                 "projection",
             )
         } else if self.embeds_json {
@@ -223,40 +232,6 @@ impl<'a> Worker<'a> {
         } else {
             Action::Tombstone
         }
-    }
-}
-
-fn serialize_projection(
-    evaluation: Evaluation<'_, '_>,
-    output: &mut Vec<u8>,
-) -> Result<(), String> {
-    let mut first = None;
-    let mut sequence = false;
-    evaluation
-        .try_for_each(|value| {
-            if sequence {
-                output.push(b',');
-            } else if let Some(first) = first.take() {
-                sequence = true;
-                output.push(b'[');
-                jx::Value::write_compact(&first, &mut *output)?;
-                output.push(b',');
-            } else {
-                first = Some(value);
-                return Ok(());
-            }
-            value.write_compact(&mut *output)
-        })
-        .map_err(|error| error.to_string())?;
-    if sequence {
-        output.push(b']');
-        Ok(())
-    } else if let Some(first) = first {
-        first
-            .write_compact(output)
-            .map_err(|error| error.to_string())
-    } else {
-        Err("projection emitted no results".to_owned())
     }
 }
 
