@@ -586,22 +586,15 @@ pub fn run_pipeline(
         drop(work_rx);
         drop(completion_tx);
 
-        let writer_result = catch_unwind(AssertUnwindSafe(|| {
-            writer_loop(
-                config,
-                writer,
-                completion_rx,
-                release_txs,
-                Arc::clone(&shutdown),
-                Arc::clone(&stats),
-                Arc::clone(&first_failure),
-            )
-        }));
-        if writer_result.is_err() {
-            let error = PipelineError::Runtime("output writer panicked".to_owned());
-            record_failure(&first_failure, &error);
-            shutdown.store(true, Ordering::SeqCst);
-        }
+        let _ = writer_loop(
+            config,
+            writer,
+            completion_rx,
+            release_txs,
+            Arc::clone(&shutdown),
+            Arc::clone(&stats),
+            Arc::clone(&first_failure),
+        );
 
         for worker in workers {
             if worker.join().is_err() {
@@ -962,6 +955,30 @@ fn writer_loop(
     stats: Arc<Stats>,
     first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> Result<(), PipelineError> {
+    // Keep channel owners outside the unwind boundary until the panic is recorded.
+    guard_thread(&shutdown, &first_failure, "output writer", || {
+        write_completions(
+            config,
+            writer,
+            &completion_rx,
+            &release_txs,
+            &shutdown,
+            &stats,
+            &first_failure,
+        )
+    })
+    .unwrap_or_else(|| Err(PipelineError::Runtime("output writer panicked".to_owned())))
+}
+
+fn write_completions(
+    config: &RuntimeConfig,
+    writer: &mut impl Write,
+    completion_rx: &Receiver<CompletionBatch>,
+    release_txs: &[Sender<Vec<Release>>],
+    shutdown: &AtomicBool,
+    stats: &Stats,
+    first_failure: &OnceLock<RecordedFailure>,
+) -> Result<(), PipelineError> {
     let mut orderer = Orderer::default();
     let mut ready = Vec::new();
     let mut failure = match first_failure.get() {
@@ -982,8 +999,8 @@ fn writer_loop(
                     release(&mut releases, completion);
                     writer_failure(
                         &mut failure,
-                        &first_failure,
-                        &shutdown,
+                        first_failure,
+                        shutdown,
                         PipelineError::Runtime(message),
                     );
                 }
@@ -997,8 +1014,8 @@ fn writer_loop(
                         CompletionOutcome::Fatal(ref message) => {
                             writer_failure(
                                 &mut failure,
-                                &first_failure,
-                                &shutdown,
+                                first_failure,
+                                shutdown,
                                 PipelineError::Runtime(message.clone()),
                             );
                         }
@@ -1009,12 +1026,12 @@ fn writer_loop(
                                 &completion.source,
                                 action,
                                 &mut payload_buffer,
-                                &stats,
+                                stats,
                             ) {
                                 writer_failure(
                                     &mut failure,
-                                    &first_failure,
-                                    &shutdown,
+                                    first_failure,
+                                    shutdown,
                                     PipelineError::Output(error),
                                 );
                             }
@@ -1044,8 +1061,8 @@ fn writer_loop(
         }
         writer_failure(
             &mut failure,
-            &first_failure,
-            &shutdown,
+            first_failure,
+            shutdown,
             PipelineError::Runtime(
                 "completion channel closed with a partition sequence gap".to_owned(),
             ),
@@ -1056,8 +1073,8 @@ fn writer_loop(
     {
         writer_failure(
             &mut failure,
-            &first_failure,
-            &shutdown,
+            first_failure,
+            shutdown,
             PipelineError::Output(error),
         );
     }
@@ -1804,6 +1821,105 @@ mod tests {
             first.get(),
             Some(RecordedFailure::Runtime(message)) if message == "Kafka poll thread panicked"
         ));
+    }
+
+    #[test]
+    fn writer_panic_is_recorded_before_channel_teardown() {
+        struct PanickingWriter;
+        impl Write for PanickingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("writer failure")
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for (arguments, prior_failure) in [
+            (vec![], None),
+            (vec!["--project", "$"], None),
+            (vec!["--project", "$"], Some("earlier independent failure")),
+        ] {
+            let config = config(&arguments);
+            let stats = Arc::new(Stats::default());
+            let (work_tx, work_rx) = bounded(1);
+            let (completion_tx, completion_rx) = bounded(1);
+            let destination = if config.transform.capabilities.parses_json {
+                Destination::Evaluate(work_tx.clone())
+            } else {
+                Destination::Write(completion_tx.clone(), false)
+            };
+            let mut buffer = PollerBuffer::new(0, destination);
+            buffer
+                .push(
+                    OwnedRecord {
+                        partition: 0,
+                        offset: 0,
+                        timestamp: None,
+                        key: None,
+                        headers: Vec::new(),
+                        payload: Some(b"{}".to_vec()),
+                        retained_bytes: 2,
+                    },
+                    0,
+                    &stats,
+                )
+                .unwrap();
+            buffer.flush(&stats).unwrap();
+            drop(buffer);
+            drop(work_tx);
+            if config.transform.capabilities.parses_json {
+                worker_loop(
+                    &config,
+                    &config.transform.input_plan(),
+                    work_rx,
+                    completion_tx.clone(),
+                    Arc::clone(&stats),
+                );
+            }
+            drop(completion_tx);
+
+            let (release_tx, release_rx) = bounded(1);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let first = Arc::new(OnceLock::new());
+            if let Some(message) = prior_failure {
+                runtime_failure(&first, &shutdown, message.to_owned());
+            }
+            let result = thread::scope(|scope| {
+                let poller = scope.spawn(|| {
+                    assert!(release_rx.recv().is_err());
+                    runtime_failure(
+                        &first,
+                        &shutdown,
+                        "completion release channel closed early".to_owned(),
+                    );
+                });
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    writer_loop(
+                        &config,
+                        &mut PanickingWriter,
+                        completion_rx,
+                        vec![release_tx],
+                        Arc::clone(&shutdown),
+                        stats,
+                        Arc::clone(&first),
+                    )
+                }));
+                // Force teardown's diagnostic before the caller's fallback panic
+                // handler, reproducing the old post-unwind recording race.
+                poller.join().unwrap();
+                if result.is_err() {
+                    runtime_failure(&first, &shutdown, "output writer panicked".to_owned());
+                }
+                result
+            });
+            assert!(shutdown.load(Ordering::SeqCst));
+            assert!(
+                matches!(first.get(), Some(RecordedFailure::Runtime(message))
+                if message == prior_failure.unwrap_or("output writer panicked"))
+            );
+            assert!(matches!(result, Ok(Err(PipelineError::Runtime(message)))
+                if message == "output writer panicked"));
+        }
     }
 
     #[test]
