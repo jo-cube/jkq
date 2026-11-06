@@ -1226,6 +1226,17 @@ mod tests {
         RawCli::try_parse_from(base).unwrap().resolve().unwrap()
     }
 
+    fn assert_all_capacity_released(shared: &SharedAdmission, limits: crate::cli::RuntimeLimits) {
+        assert!(shared.try_reserve(limits.max_inflight_bytes));
+        for _ in 1..limits.max_inflight_records {
+            assert!(shared.try_reserve(0));
+        }
+        assert!(!shared.try_reserve(0));
+        shared
+            .release(limits.max_inflight_records, limits.max_inflight_bytes)
+            .unwrap();
+    }
+
     #[test]
     fn startup_signal_prevents_the_processing_handoff() {
         for signal in [SIGINT, SIGTERM] {
@@ -1576,19 +1587,37 @@ mod tests {
     }
 
     #[test]
-    fn ordered_writer_drains_reverse_completions_and_releases_drops() {
+    fn ordered_writer_routes_interleaved_reverse_completions_to_each_owner() {
         let config = config(&["--drop-if", "false", "-f", "%p:%o:%S:%s\\n"]);
-        let (completion_tx, completion_rx) = bounded(3);
-        let (release_tx, release_rx) = bounded(3);
-        for completion in [
-            completion(0, 2, 3, Action::Tombstone),
-            completion(0, 1, 2, Action::Drop),
-            completion(0, 0, 1, pass(b"a")),
+        let limits = crate::cli::RuntimeLimits {
+            max_inflight_records: 6,
+            max_inflight_bytes: 21,
+            max_inflight_per_partition: 3,
+        };
+        let shared = SharedAdmission::new(limits, None);
+        let mut admissions = [Admission::new(&[7], 3), Admission::new(&[9], 3)];
+        for (owner, partition) in [(0, 7), (1, 9)] {
+            for bytes in (1 + owner * 3)..=(3 + owner * 3) {
+                assert!(shared.try_reserve(bytes));
+                admissions[owner].reserve(partition).unwrap();
+            }
+        }
+        let (completion_tx, completion_rx) = bounded(6);
+        let (release_txs, release_rxs): (Vec<_>, Vec<_>) = (0..2).map(|_| bounded(6)).unzip();
+        // Each ordered partition has one owner; both retain results across batches.
+        for (owner, mut item) in [
+            (0, completion(7, 2, 3, Action::Tombstone)),
+            (1, completion(9, 2, 6, Action::Drop)),
+            (0, completion(7, 1, 2, Action::Drop)),
+            (1, completion(9, 0, 4, pass(b"x"))),
+            (0, completion(7, 0, 1, pass(b"a"))),
+            (1, completion(9, 1, 5, pass(b"y"))),
         ] {
+            item.consumer = owner;
             completion_tx
                 .send(CompletionBatch {
-                    consumer: 0,
-                    items: vec![completion],
+                    consumer: owner,
+                    items: vec![item],
                 })
                 .unwrap();
         }
@@ -1599,44 +1628,159 @@ mod tests {
             &config,
             &mut output,
             completion_rx,
-            vec![release_tx],
+            release_txs,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Stats::default()),
             Arc::new(OnceLock::new()),
         )
         .unwrap();
 
-        assert_eq!(output, b"0:0:1:a\n0:2:-1:\n");
-        let releases = release_rx.iter().flatten().collect::<Vec<_>>();
-        assert_eq!(releases.len(), 3);
-        assert_eq!(
-            releases
+        let output = String::from_utf8(output).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4);
+        for (partition, expected) in [
+            ("7:", vec!["7:0:1:a", "7:2:-1:"]),
+            ("9:", vec!["9:0:1:x", "9:1:1:y"]),
+        ] {
+            assert_eq!(
+                lines
+                    .iter()
+                    .copied()
+                    .filter(|line| line.starts_with(partition))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        for (owner, (partition, release_rx)) in [7, 9].into_iter().zip(release_rxs).enumerate() {
+            let releases = release_rx.iter().flatten().collect::<Vec<_>>();
+            let mut charges = releases
                 .iter()
-                .map(|release| release.retained_bytes)
-                .sum::<usize>(),
-            6
-        );
-        let limits = crate::cli::RuntimeLimits {
+                .map(|release| (release.partition, release.retained_bytes))
+                .collect::<Vec<_>>();
+            charges.sort_unstable();
+            assert_eq!(
+                charges,
+                (1 + owner * 3..=3 + owner * 3)
+                    .map(|bytes| (partition, bytes))
+                    .collect::<Vec<_>>()
+            );
+            release_batch(
+                &mut admissions[owner],
+                &shared,
+                &mut PayloadBuffers::new(limits),
+                releases,
+            )
+            .unwrap();
+            assert_eq!(admissions[owner].total_records, 0);
+        }
+        assert_all_capacity_released(&shared, limits);
+    }
+
+    #[test]
+    fn first_signal_drains_admitted_transforms_and_releases_credits() {
+        let mut config = config(&["--drop-if", "id = 10", "--project", "id", "-f", "%s\\n"]);
+        config.limits = crate::cli::RuntimeLimits {
             max_inflight_records: 3,
-            max_inflight_bytes: 6,
+            max_inflight_bytes: 27,
             max_inflight_per_partition: 3,
         };
-        let shared = SharedAdmission::new(limits, None);
-        let mut admission = Admission::new(&[0], 3);
-        for bytes in [1, 2, 3] {
-            assert!(shared.try_reserve(bytes));
-            admission.reserve(0).unwrap();
+        for signal in [SIGINT, SIGTERM] {
+            let mut control = SignalControl::new();
+            let (shutdown, received) = control.begin_processing();
+            let stats = Arc::new(Stats::new(true));
+            let shared = SharedAdmission::new(config.limits, None);
+            let mut admission = Admission::new(&[0], 3);
+            let (work_tx, work_rx) = bounded(3);
+            let mut buffer = PollerBuffer::new(0, Destination::Evaluate(work_tx));
+            for (offset, payload) in [br#"{"id":0}"#.as_slice(), br#"{"id":10}"#, br#"{"id":200}"#]
+                .into_iter()
+                .enumerate()
+            {
+                assert!(shared.try_reserve(payload.len()));
+                admit(
+                    OwnedRecord {
+                        partition: 0,
+                        offset: i64::try_from(offset).unwrap(),
+                        timestamp: None,
+                        key: None,
+                        headers: Vec::new(),
+                        payload: Some(payload.to_vec()),
+                        retained_bytes: payload.len(),
+                    },
+                    &mut admission,
+                    &shared,
+                    &mut buffer,
+                    &stats,
+                )
+                .unwrap();
+                buffer.flush(&stats).unwrap();
+            }
+            drop(buffer);
+            assert_eq!(admission.total_records, 3);
+            assert_eq!(stats.snapshot().admitted, 3);
+            assert_eq!(stats.snapshot().projected, 0);
+            assert!(!SignalControl::record_signal(
+                &received,
+                usize::try_from(signal).unwrap()
+            ));
+            shutdown.store(true, Ordering::SeqCst);
+
+            // Evaluation starts after the signal; delivery models independent
+            // evaluators finishing the admitted batches in reverse order.
+            let (completion_tx, completion_rx) = bounded(3);
+            worker_loop(
+                &config,
+                &config.transform.input_plan(),
+                work_rx,
+                completion_tx,
+                Arc::clone(&stats),
+            );
+            let batches = completion_rx.iter().collect::<Vec<_>>();
+            let (completion_tx, completion_rx) = bounded(3);
+            for batch in batches.into_iter().rev() {
+                completion_tx.send(batch).unwrap();
+            }
+            drop(completion_tx);
+            let (release_tx, release_rx) = bounded(3);
+            let first = Arc::new(OnceLock::new());
+            let mut output = Vec::new();
+            writer_loop(
+                &config,
+                &mut output,
+                completion_rx,
+                vec![release_tx],
+                Arc::clone(&shutdown),
+                Arc::clone(&stats),
+                Arc::clone(&first),
+            )
+            .unwrap();
+            assert_eq!(output, b"0\n200\n");
+            assert_eq!(stats.snapshot().projected, 2);
+            assert_eq!(stats.snapshot().dropped, 1);
+            assert_eq!(stats.snapshot().output_records, 2);
+            assert!(first.get().is_none());
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                usize::try_from(signal).unwrap()
+            );
+            let releases = release_rx.iter().flatten().collect::<Vec<_>>();
+            // Distinct source sizes identify each credit without relying on buffer reuse.
+            let mut charges = releases
+                .iter()
+                .map(|release| (release.partition, release.retained_bytes))
+                .collect::<Vec<_>>();
+            charges.sort_unstable();
+            assert_eq!(charges, [(0, 8), (0, 9), (0, 10)]);
+            release_batch(
+                &mut admission,
+                &shared,
+                &mut PayloadBuffers::new(config.limits),
+                releases,
+            )
+            .unwrap();
+            assert_eq!(admission.total_records, 0);
+            assert_all_capacity_released(&shared, config.limits);
         }
-        release_batch(
-            &mut admission,
-            &shared,
-            &mut PayloadBuffers::new(limits),
-            releases,
-        )
-        .unwrap();
-        assert_eq!(admission.total_records, 0);
-        assert!(shared.try_reserve(6));
-        assert!(!shared.try_reserve(1));
     }
 
     #[test]
