@@ -75,9 +75,10 @@ including an empty array. The entire evaluation and serialization must finish
 before a successful action is published, so a late evaluation error cannot
 emit a partial record.
 
-Serialization uses `jx::Value::write_compact`. Borrowed values retain number
-and escape spelling and duplicate object members; only whitespace outside
-strings is removed. Constructed values use jx's native JSON encoding. Retained
+Serialization uses `jx::PreparedInput::write_json` and native jx value encoding.
+Evaluation continues after an encoding failure; a later evaluation error takes
+precedence. Borrowed values retain number and escape spelling and duplicate object
+members; only whitespace outside strings is removed. Constructed values use jx's native JSON encoding. Retained
 missing values inside sequences and non-finite computed numbers serialize as
 `null`; function values (including regex functions) fail serialization, also
 when nested. There is no additional jkq value-tree compatibility check.

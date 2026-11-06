@@ -169,9 +169,11 @@ result is one JSON value, and multiple results form one array payload. Explicit
 arrays remain single values. Lazy evaluation and serialization failures follow
 `--on-eval-error` without publishing a partial projection.
 
-Borrowed results serialize directly with `Value::write_compact` into a worker
-byte buffer, without detached values or an intermediate JSON string. A
-JSON-value pass uses `RawJson::write_compact` and retains source byte length.
+Projection uses `PreparedInput::write_json`, forwarding to jx's complete-result
+serializer over the same captures. Borrowed results serialize into a worker byte
+buffer without detached values or an intermediate JSON string; failures roll back
+the buffer. A JSON-value pass uses `RawJson::write_compact` and retains source byte
+length.
 After successful serialization, the worker transfers the output buffer into
 the action and recycles the consumed source allocation as its next output
 buffer, provided its capacity fits the same 16 KiB/source-budget threshold.

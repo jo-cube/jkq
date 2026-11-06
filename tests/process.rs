@@ -229,6 +229,55 @@ fn first_termination_signal_drains_and_uses_signal_exit_code() {
 }
 
 #[test]
+fn first_signal_drains_projected_output_and_preserves_exit_status() {
+    let fixture = Fixture::new("projected-signal-drain");
+    let padding = "x".repeat(512 * 1024);
+    fixture.produce(format!(r#"{{"payload":"{padding}"}}"#).as_bytes());
+    let expected = format!("\"{padding}\"\n").into_bytes();
+    for (signal, status) in [("-INT", 130), ("-TERM", 143)] {
+        let mut child = fixture
+            .command()
+            .args(["--project", "payload"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut first = [0];
+            let result = stdout.read_exact(&mut first).map(|()| (first, stdout));
+            let _ = ready_tx.send(result);
+        });
+        let (first, mut stdout) = match ready_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(started)) => started,
+            error => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("jkq did not begin projected output: {error:?}");
+            }
+        };
+        reader.join().unwrap();
+        assert_eq!(first, [b'"']);
+        assert!(
+            Command::new("kill")
+                .args([signal, &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let stdout_reader = thread::spawn(move || {
+            let mut actual = first.to_vec();
+            stdout.read_to_end(&mut actual).unwrap();
+            actual
+        });
+        let output = wait(child);
+        assert_eq!(output.status.code(), Some(status));
+        assert_eq!(stdout_reader.join().unwrap(), expected);
+    }
+}
+
+#[test]
 fn second_termination_signal_forces_a_blocked_writer_to_exit() {
     let fixture = Fixture::new("signal-force");
     let mut payload = vec![b'a'; 512 * 1024];

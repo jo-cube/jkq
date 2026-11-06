@@ -492,7 +492,7 @@ pub fn run_pipeline(
     };
     let input_plan = config.transform.input_plan();
 
-    let signal = thread::scope(|scope| {
+    thread::scope(|scope| {
         let (stats_stop_tx, stats_reporter) = if let Some(interval) = config.stats_interval {
             let (stop_tx, stop_rx) = bounded::<()>(1);
             let reporter_stats = Arc::clone(&stats);
@@ -518,7 +518,6 @@ pub fn run_pipeline(
         let mut pollers = Vec::with_capacity(inputs.len());
         for (consumer, (input, release_rx)) in inputs.into_iter().zip(release_rxs).enumerate() {
             let poller_shutdown = Arc::clone(&shutdown);
-            let poller_signal = Arc::clone(&received_signal);
             let poller_stats = Arc::clone(&stats);
             let poller_failure = Arc::clone(&first_failure);
             let panic_shutdown = Arc::clone(&poller_shutdown);
@@ -541,12 +540,10 @@ pub fn run_pipeline(
                             release_rx,
                             poller_admission,
                             poller_shutdown,
-                            poller_signal,
                             poller_stats,
                             poller_failure,
                         )
-                    })
-                    .flatten()
+                    });
                 }) {
                 Ok(poller) => pollers.push(poller),
                 Err(error) => {
@@ -589,22 +586,15 @@ pub fn run_pipeline(
         drop(work_rx);
         drop(completion_tx);
 
-        let writer_result = catch_unwind(AssertUnwindSafe(|| {
-            writer_loop(
-                config,
-                writer,
-                completion_rx,
-                release_txs,
-                Arc::clone(&shutdown),
-                Arc::clone(&stats),
-                Arc::clone(&first_failure),
-            )
-        }));
-        if writer_result.is_err() {
-            let error = PipelineError::Runtime("output writer panicked".to_owned());
-            record_failure(&first_failure, &error);
-            shutdown.store(true, Ordering::SeqCst);
-        }
+        let _ = writer_loop(
+            config,
+            writer,
+            completion_rx,
+            release_txs,
+            Arc::clone(&shutdown),
+            Arc::clone(&stats),
+            Arc::clone(&first_failure),
+        );
 
         for worker in workers {
             if worker.join().is_err() {
@@ -613,15 +603,11 @@ pub fn run_pipeline(
                 shutdown.store(true, Ordering::SeqCst);
             }
         }
-        let mut signal = None;
         for poller in pollers {
-            match poller.join() {
-                Ok(result) => signal = signal.or(result),
-                Err(_) => {
-                    let error = PipelineError::Runtime("Kafka poll thread panicked".to_owned());
-                    record_failure(&first_failure, &error);
-                    shutdown.store(true, Ordering::SeqCst);
-                }
+            if poller.join().is_err() {
+                let error = PipelineError::Runtime("Kafka poll thread panicked".to_owned());
+                record_failure(&first_failure, &error);
+                shutdown.store(true, Ordering::SeqCst);
             }
         }
         drop(stats_stop_tx);
@@ -632,13 +618,16 @@ pub fn run_pipeline(
             record_failure(&first_failure, &error);
             shutdown.store(true, Ordering::SeqCst);
         }
-        signal
     });
 
     match Arc::try_unwrap(first_failure) {
         Ok(first_failure) => match first_failure.into_inner() {
             Some(error) => Err(error.into_error()),
-            None => Ok(signal),
+            None => {
+                let signal = received_signal.load(Ordering::SeqCst);
+                Ok((signal != 0)
+                    .then(|| i32::try_from(signal).expect("registered signal fits in i32")))
+            }
         },
         Err(_) => Err(PipelineError::Runtime(
             "internal failure state remained shared after shutdown".to_owned(),
@@ -654,10 +643,9 @@ fn poll_loop(
     release_rx: Receiver<Vec<Release>>,
     shared_admission: Arc<SharedAdmission>,
     shutdown: Arc<AtomicBool>,
-    received_signal: Arc<AtomicUsize>,
     stats: Arc<Stats>,
     first_failure: Arc<OnceLock<RecordedFailure>>,
-) -> Option<i32> {
+) {
     let partitions = input.assigned_partitions();
     let mut admission = Admission::new(&partitions, input.max_inflight_per_partition());
     let mut buffer = Some(buffer);
@@ -777,9 +765,6 @@ fn poll_loop(
             }
         }
     }
-
-    let signal = received_signal.load(Ordering::SeqCst);
-    (signal != 0).then(|| i32::try_from(signal).expect("registered signal fits in i32"))
 }
 
 fn release_batch(
@@ -970,6 +955,30 @@ fn writer_loop(
     stats: Arc<Stats>,
     first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> Result<(), PipelineError> {
+    // Keep channel owners outside the unwind boundary until the panic is recorded.
+    guard_thread(&shutdown, &first_failure, "output writer", || {
+        write_completions(
+            config,
+            writer,
+            &completion_rx,
+            &release_txs,
+            &shutdown,
+            &stats,
+            &first_failure,
+        )
+    })
+    .unwrap_or_else(|| Err(PipelineError::Runtime("output writer panicked".to_owned())))
+}
+
+fn write_completions(
+    config: &RuntimeConfig,
+    writer: &mut impl Write,
+    completion_rx: &Receiver<CompletionBatch>,
+    release_txs: &[Sender<Vec<Release>>],
+    shutdown: &AtomicBool,
+    stats: &Stats,
+    first_failure: &OnceLock<RecordedFailure>,
+) -> Result<(), PipelineError> {
     let mut orderer = Orderer::default();
     let mut ready = Vec::new();
     let mut failure = match first_failure.get() {
@@ -990,8 +999,8 @@ fn writer_loop(
                     release(&mut releases, completion);
                     writer_failure(
                         &mut failure,
-                        &first_failure,
-                        &shutdown,
+                        first_failure,
+                        shutdown,
                         PipelineError::Runtime(message),
                     );
                 }
@@ -1005,8 +1014,8 @@ fn writer_loop(
                         CompletionOutcome::Fatal(ref message) => {
                             writer_failure(
                                 &mut failure,
-                                &first_failure,
-                                &shutdown,
+                                first_failure,
+                                shutdown,
                                 PipelineError::Runtime(message.clone()),
                             );
                         }
@@ -1017,12 +1026,12 @@ fn writer_loop(
                                 &completion.source,
                                 action,
                                 &mut payload_buffer,
-                                &stats,
+                                stats,
                             ) {
                                 writer_failure(
                                     &mut failure,
-                                    &first_failure,
-                                    &shutdown,
+                                    first_failure,
+                                    shutdown,
                                     PipelineError::Output(error),
                                 );
                             }
@@ -1052,8 +1061,8 @@ fn writer_loop(
         }
         writer_failure(
             &mut failure,
-            &first_failure,
-            &shutdown,
+            first_failure,
+            shutdown,
             PipelineError::Runtime(
                 "completion channel closed with a partition sequence gap".to_owned(),
             ),
@@ -1064,8 +1073,8 @@ fn writer_loop(
     {
         writer_failure(
             &mut failure,
-            &first_failure,
-            &shutdown,
+            first_failure,
+            shutdown,
             PipelineError::Output(error),
         );
     }
@@ -1217,6 +1226,17 @@ mod tests {
         RawCli::try_parse_from(base).unwrap().resolve().unwrap()
     }
 
+    fn assert_all_capacity_released(shared: &SharedAdmission, limits: crate::cli::RuntimeLimits) {
+        assert!(shared.try_reserve(limits.max_inflight_bytes));
+        for _ in 1..limits.max_inflight_records {
+            assert!(shared.try_reserve(0));
+        }
+        assert!(!shared.try_reserve(0));
+        shared
+            .release(limits.max_inflight_records, limits.max_inflight_bytes)
+            .unwrap();
+    }
+
     #[test]
     fn startup_signal_prevents_the_processing_handoff() {
         for signal in [SIGINT, SIGTERM] {
@@ -1246,6 +1266,64 @@ mod tests {
                 assert!(!control.shutdown.load(Ordering::SeqCst));
                 assert!(SignalControl::record_signal(&control.received, second));
                 assert_eq!(control.received.load(Ordering::SeqCst), second);
+            }
+        }
+    }
+
+    #[test]
+    fn final_flush_signal_is_reported_unless_a_failure_was_recorded() {
+        struct SignalOnFlush<'a> {
+            control: &'a SignalControl,
+            signal: i32,
+            fail: bool,
+        }
+
+        impl Write for SignalOnFlush<'_> {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                unreachable!("no input records")
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                assert!(!SignalControl::record_signal(
+                    &self.control.received,
+                    usize::try_from(self.signal).unwrap(),
+                ));
+                self.control.shutdown.store(true, Ordering::SeqCst);
+                if self.fail {
+                    Err(io::Error::other("final flush failed"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let config = config(&[]);
+        for signal in [SIGINT, SIGTERM] {
+            for fail in [false, true] {
+                let mut control = SignalControl::new();
+                let (shutdown, received) = control.begin_processing();
+                let mut writer = SignalOnFlush {
+                    control: &control,
+                    signal,
+                    fail,
+                };
+                // No Kafka inputs are needed to isolate the post-polling flush:
+                // no poller can observe the signal recorded by this writer.
+                let result = run_pipeline(
+                    &config,
+                    Vec::new(),
+                    &mut writer,
+                    shutdown,
+                    received,
+                    Arc::new(Stats::default()),
+                );
+
+                if fail {
+                    assert!(matches!(result, Err(PipelineError::Output(ref error))
+                        if error.to_string() == "final flush failed"));
+                } else {
+                    assert_eq!(result.unwrap(), Some(signal));
+                }
             }
         }
     }
@@ -1509,19 +1587,37 @@ mod tests {
     }
 
     #[test]
-    fn ordered_writer_drains_reverse_completions_and_releases_drops() {
+    fn ordered_writer_routes_interleaved_reverse_completions_to_each_owner() {
         let config = config(&["--drop-if", "false", "-f", "%p:%o:%S:%s\\n"]);
-        let (completion_tx, completion_rx) = bounded(3);
-        let (release_tx, release_rx) = bounded(3);
-        for completion in [
-            completion(0, 2, 3, Action::Tombstone),
-            completion(0, 1, 2, Action::Drop),
-            completion(0, 0, 1, pass(b"a")),
+        let limits = crate::cli::RuntimeLimits {
+            max_inflight_records: 6,
+            max_inflight_bytes: 21,
+            max_inflight_per_partition: 3,
+        };
+        let shared = SharedAdmission::new(limits, None);
+        let mut admissions = [Admission::new(&[7], 3), Admission::new(&[9], 3)];
+        for (owner, partition) in [(0, 7), (1, 9)] {
+            for bytes in (1 + owner * 3)..=(3 + owner * 3) {
+                assert!(shared.try_reserve(bytes));
+                admissions[owner].reserve(partition).unwrap();
+            }
+        }
+        let (completion_tx, completion_rx) = bounded(6);
+        let (release_txs, release_rxs): (Vec<_>, Vec<_>) = (0..2).map(|_| bounded(6)).unzip();
+        // Each ordered partition has one owner; both retain results across batches.
+        for (owner, mut item) in [
+            (0, completion(7, 2, 3, Action::Tombstone)),
+            (1, completion(9, 2, 6, Action::Drop)),
+            (0, completion(7, 1, 2, Action::Drop)),
+            (1, completion(9, 0, 4, pass(b"x"))),
+            (0, completion(7, 0, 1, pass(b"a"))),
+            (1, completion(9, 1, 5, pass(b"y"))),
         ] {
+            item.consumer = owner;
             completion_tx
                 .send(CompletionBatch {
-                    consumer: 0,
-                    items: vec![completion],
+                    consumer: owner,
+                    items: vec![item],
                 })
                 .unwrap();
         }
@@ -1532,44 +1628,159 @@ mod tests {
             &config,
             &mut output,
             completion_rx,
-            vec![release_tx],
+            release_txs,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Stats::default()),
             Arc::new(OnceLock::new()),
         )
         .unwrap();
 
-        assert_eq!(output, b"0:0:1:a\n0:2:-1:\n");
-        let releases = release_rx.iter().flatten().collect::<Vec<_>>();
-        assert_eq!(releases.len(), 3);
-        assert_eq!(
-            releases
+        let output = String::from_utf8(output).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4);
+        for (partition, expected) in [
+            ("7:", vec!["7:0:1:a", "7:2:-1:"]),
+            ("9:", vec!["9:0:1:x", "9:1:1:y"]),
+        ] {
+            assert_eq!(
+                lines
+                    .iter()
+                    .copied()
+                    .filter(|line| line.starts_with(partition))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        for (owner, (partition, release_rx)) in [7, 9].into_iter().zip(release_rxs).enumerate() {
+            let releases = release_rx.iter().flatten().collect::<Vec<_>>();
+            let mut charges = releases
                 .iter()
-                .map(|release| release.retained_bytes)
-                .sum::<usize>(),
-            6
-        );
-        let limits = crate::cli::RuntimeLimits {
+                .map(|release| (release.partition, release.retained_bytes))
+                .collect::<Vec<_>>();
+            charges.sort_unstable();
+            assert_eq!(
+                charges,
+                (1 + owner * 3..=3 + owner * 3)
+                    .map(|bytes| (partition, bytes))
+                    .collect::<Vec<_>>()
+            );
+            release_batch(
+                &mut admissions[owner],
+                &shared,
+                &mut PayloadBuffers::new(limits),
+                releases,
+            )
+            .unwrap();
+            assert_eq!(admissions[owner].total_records, 0);
+        }
+        assert_all_capacity_released(&shared, limits);
+    }
+
+    #[test]
+    fn first_signal_drains_admitted_transforms_and_releases_credits() {
+        let mut config = config(&["--drop-if", "id = 10", "--project", "id", "-f", "%s\\n"]);
+        config.limits = crate::cli::RuntimeLimits {
             max_inflight_records: 3,
-            max_inflight_bytes: 6,
+            max_inflight_bytes: 27,
             max_inflight_per_partition: 3,
         };
-        let shared = SharedAdmission::new(limits, None);
-        let mut admission = Admission::new(&[0], 3);
-        for bytes in [1, 2, 3] {
-            assert!(shared.try_reserve(bytes));
-            admission.reserve(0).unwrap();
+        for signal in [SIGINT, SIGTERM] {
+            let mut control = SignalControl::new();
+            let (shutdown, received) = control.begin_processing();
+            let stats = Arc::new(Stats::new(true));
+            let shared = SharedAdmission::new(config.limits, None);
+            let mut admission = Admission::new(&[0], 3);
+            let (work_tx, work_rx) = bounded(3);
+            let mut buffer = PollerBuffer::new(0, Destination::Evaluate(work_tx));
+            for (offset, payload) in [br#"{"id":0}"#.as_slice(), br#"{"id":10}"#, br#"{"id":200}"#]
+                .into_iter()
+                .enumerate()
+            {
+                assert!(shared.try_reserve(payload.len()));
+                admit(
+                    OwnedRecord {
+                        partition: 0,
+                        offset: i64::try_from(offset).unwrap(),
+                        timestamp: None,
+                        key: None,
+                        headers: Vec::new(),
+                        payload: Some(payload.to_vec()),
+                        retained_bytes: payload.len(),
+                    },
+                    &mut admission,
+                    &shared,
+                    &mut buffer,
+                    &stats,
+                )
+                .unwrap();
+                buffer.flush(&stats).unwrap();
+            }
+            drop(buffer);
+            assert_eq!(admission.total_records, 3);
+            assert_eq!(stats.snapshot().admitted, 3);
+            assert_eq!(stats.snapshot().projected, 0);
+            assert!(!SignalControl::record_signal(
+                &received,
+                usize::try_from(signal).unwrap()
+            ));
+            shutdown.store(true, Ordering::SeqCst);
+
+            // Evaluation starts after the signal; delivery models independent
+            // evaluators finishing the admitted batches in reverse order.
+            let (completion_tx, completion_rx) = bounded(3);
+            worker_loop(
+                &config,
+                &config.transform.input_plan(),
+                work_rx,
+                completion_tx,
+                Arc::clone(&stats),
+            );
+            let batches = completion_rx.iter().collect::<Vec<_>>();
+            let (completion_tx, completion_rx) = bounded(3);
+            for batch in batches.into_iter().rev() {
+                completion_tx.send(batch).unwrap();
+            }
+            drop(completion_tx);
+            let (release_tx, release_rx) = bounded(3);
+            let first = Arc::new(OnceLock::new());
+            let mut output = Vec::new();
+            writer_loop(
+                &config,
+                &mut output,
+                completion_rx,
+                vec![release_tx],
+                Arc::clone(&shutdown),
+                Arc::clone(&stats),
+                Arc::clone(&first),
+            )
+            .unwrap();
+            assert_eq!(output, b"0\n200\n");
+            assert_eq!(stats.snapshot().projected, 2);
+            assert_eq!(stats.snapshot().dropped, 1);
+            assert_eq!(stats.snapshot().output_records, 2);
+            assert!(first.get().is_none());
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                usize::try_from(signal).unwrap()
+            );
+            let releases = release_rx.iter().flatten().collect::<Vec<_>>();
+            // Distinct source sizes identify each credit without relying on buffer reuse.
+            let mut charges = releases
+                .iter()
+                .map(|release| (release.partition, release.retained_bytes))
+                .collect::<Vec<_>>();
+            charges.sort_unstable();
+            assert_eq!(charges, [(0, 8), (0, 9), (0, 10)]);
+            release_batch(
+                &mut admission,
+                &shared,
+                &mut PayloadBuffers::new(config.limits),
+                releases,
+            )
+            .unwrap();
+            assert_eq!(admission.total_records, 0);
+            assert_all_capacity_released(&shared, config.limits);
         }
-        release_batch(
-            &mut admission,
-            &shared,
-            &mut PayloadBuffers::new(limits),
-            releases,
-        )
-        .unwrap();
-        assert_eq!(admission.total_records, 0);
-        assert!(shared.try_reserve(6));
-        assert!(!shared.try_reserve(1));
     }
 
     #[test]
@@ -1754,6 +1965,105 @@ mod tests {
             first.get(),
             Some(RecordedFailure::Runtime(message)) if message == "Kafka poll thread panicked"
         ));
+    }
+
+    #[test]
+    fn writer_panic_is_recorded_before_channel_teardown() {
+        struct PanickingWriter;
+        impl Write for PanickingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("writer failure")
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for (arguments, prior_failure) in [
+            (vec![], None),
+            (vec!["--project", "$"], None),
+            (vec!["--project", "$"], Some("earlier independent failure")),
+        ] {
+            let config = config(&arguments);
+            let stats = Arc::new(Stats::default());
+            let (work_tx, work_rx) = bounded(1);
+            let (completion_tx, completion_rx) = bounded(1);
+            let destination = if config.transform.capabilities.parses_json {
+                Destination::Evaluate(work_tx.clone())
+            } else {
+                Destination::Write(completion_tx.clone(), false)
+            };
+            let mut buffer = PollerBuffer::new(0, destination);
+            buffer
+                .push(
+                    OwnedRecord {
+                        partition: 0,
+                        offset: 0,
+                        timestamp: None,
+                        key: None,
+                        headers: Vec::new(),
+                        payload: Some(b"{}".to_vec()),
+                        retained_bytes: 2,
+                    },
+                    0,
+                    &stats,
+                )
+                .unwrap();
+            buffer.flush(&stats).unwrap();
+            drop(buffer);
+            drop(work_tx);
+            if config.transform.capabilities.parses_json {
+                worker_loop(
+                    &config,
+                    &config.transform.input_plan(),
+                    work_rx,
+                    completion_tx.clone(),
+                    Arc::clone(&stats),
+                );
+            }
+            drop(completion_tx);
+
+            let (release_tx, release_rx) = bounded(1);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let first = Arc::new(OnceLock::new());
+            if let Some(message) = prior_failure {
+                runtime_failure(&first, &shutdown, message.to_owned());
+            }
+            let result = thread::scope(|scope| {
+                let poller = scope.spawn(|| {
+                    assert!(release_rx.recv().is_err());
+                    runtime_failure(
+                        &first,
+                        &shutdown,
+                        "completion release channel closed early".to_owned(),
+                    );
+                });
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    writer_loop(
+                        &config,
+                        &mut PanickingWriter,
+                        completion_rx,
+                        vec![release_tx],
+                        Arc::clone(&shutdown),
+                        stats,
+                        Arc::clone(&first),
+                    )
+                }));
+                // Force teardown's diagnostic before the caller's fallback panic
+                // handler, reproducing the old post-unwind recording race.
+                poller.join().unwrap();
+                if result.is_err() {
+                    runtime_failure(&first, &shutdown, "output writer panicked".to_owned());
+                }
+                result
+            });
+            assert!(shutdown.load(Ordering::SeqCst));
+            assert!(
+                matches!(first.get(), Some(RecordedFailure::Runtime(message))
+                if message == prior_failure.unwrap_or("output writer panicked"))
+            );
+            assert!(matches!(result, Ok(Err(PipelineError::Runtime(message)))
+                if message == "output writer panicked"));
+        }
     }
 
     #[test]
