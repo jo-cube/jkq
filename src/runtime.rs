@@ -478,8 +478,8 @@ pub fn run_pipeline(
     let started = Instant::now();
     let first_failure = Arc::new(OnceLock::new());
     let shared_admission = Arc::new(SharedAdmission::new(config.limits, config.count_limit));
-    let transforms_json = config.transform.capabilities.parses_json;
-    let evaluators = if transforms_json {
+    let needs_worker = config.needs_worker();
+    let evaluators = if needs_worker {
         evaluator_count(
             thread::available_parallelism()
                 .map(usize::from)
@@ -523,7 +523,7 @@ pub fn run_pipeline(
             let panic_shutdown = Arc::clone(&poller_shutdown);
             let panic_failure = Arc::clone(&poller_failure);
             let poller_admission = Arc::clone(&shared_admission);
-            let destination = if transforms_json {
+            let destination = if needs_worker {
                 Destination::Evaluate(work_tx.clone())
             } else {
                 Destination::Write(completion_tx.clone(), config.transform.drop_tombstones)
@@ -555,7 +555,7 @@ pub fn run_pipeline(
         drop(work_tx);
 
         let mut workers = Vec::with_capacity(evaluators);
-        if transforms_json {
+        if needs_worker {
             for index in 0..evaluators {
                 let input_plan = &input_plan;
                 let receiver = work_rx.clone();
@@ -898,7 +898,19 @@ fn worker_loop(
             let source_tombstone = payload.is_none();
             let payload_length = payload.as_ref().map(Vec::len);
             let result = catch_unwind(AssertUnwindSafe(|| {
-                worker.execute_report(&mut payload, config.errors)
+                worker.execute_report(
+                    &mut payload,
+                    &crate::output::SourceMetadata {
+                        topic: &config.topic,
+                        partition,
+                        offset,
+                        timestamp,
+                        key: key.as_deref(),
+                        headers: &headers,
+                        value_length: payload_length,
+                    },
+                    config.errors,
+                )
             }));
             let outcome = match result {
                 Ok(Ok(execution)) => {
@@ -986,7 +998,7 @@ fn write_completions(
         _ => None,
     };
     let mut payload_buffer = Vec::new();
-    let ordered = !config.unordered && config.transform.capabilities.parses_json;
+    let ordered = !config.unordered && config.needs_worker();
     for completion_batch in completion_rx {
         let CompletionBatch { consumer, items } = completion_batch;
         let mut releases = Vec::with_capacity(items.len());
@@ -1175,7 +1187,9 @@ fn write_action(
             }
             format.write_to(&output_record, writer)?
         }
-        OutputPlan::Envelope(_) => output::write_envelope(&output_record, writer)?,
+        OutputPlan::Envelope(_) => {
+            output::write_envelope(&output_record, config.timestamp_format, writer)?
+        }
     };
     if config.unbuffered {
         writer.flush()?;
@@ -1498,6 +1512,45 @@ mod tests {
             br#""action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":8}
 "#
         ));
+    }
+
+    #[test]
+    fn envelope_timestamp_format_is_writer_local() {
+        let source = SourceRecord {
+            partition: 0,
+            offset: 7,
+            timestamp: Some(Timestamp {
+                milliseconds: -1,
+                kind: crate::output::TimestampType::LogAppendTime,
+            }),
+            key: None,
+            headers: Vec::new(),
+            payload_length: Some(3),
+        };
+        for (arguments, expected) in [
+            (
+                vec!["-J", "--timestamp-format", "iso8601"],
+                concat!(
+                    "{\"topic\":\"events\",\"partition\":0,\"offset\":7,",
+                    "\"timestamp\":\"1969-12-31T23:59:59.999Z\",\"timestampType\":\"logAppendTime\",",
+                    "\"key\":null,\"keyEncoding\":null,\"keyLength\":-1,\"headers\":[],",
+                    "\"action\":\"pass\",\"payload\":\"raw\",\"payloadEncoding\":\"utf8\",\"payloadLength\":3}\n"
+                ),
+            ),
+            (vec!["-f", "%T:%s"], "-1:raw"),
+        ] {
+            let mut output = Vec::new();
+            write_action(
+                &config(&arguments),
+                &mut output,
+                &source,
+                &pass(b"raw"),
+                &mut Vec::new(),
+                &Stats::default(),
+            )
+            .unwrap();
+            assert_eq!(output, expected.as_bytes());
+        }
     }
 
     #[test]
@@ -1847,6 +1900,100 @@ mod tests {
     }
 
     #[test]
+    fn deferred_metadata_workers_preserve_order_and_release_source_storage() {
+        for unordered in [false, true] {
+            let mut arguments = vec![
+                "--defer-json",
+                "--project",
+                "$meta.offset",
+                "-f",
+                "%o:%L:%s\\n",
+            ];
+            if unordered {
+                arguments.push("--unordered");
+            }
+            let config = config(&arguments);
+            assert!(config.needs_worker());
+            assert_eq!(
+                config
+                    .transform
+                    .projection
+                    .as_ref()
+                    .unwrap()
+                    .input_dependency(),
+                jx::InputDependency::Independent
+            );
+            let (work_tx, work_rx) = bounded(3);
+            for (sequence, payload) in [Some(b"bad".to_vec()), None, Some(vec![])]
+                .into_iter()
+                .enumerate()
+            {
+                work_tx
+                    .send(RecordBatch {
+                        consumer: 0,
+                        items: vec![WorkItem {
+                            sequence: u64::try_from(sequence).unwrap(),
+                            record: OwnedRecord {
+                                partition: 0,
+                                offset: i64::try_from(sequence).unwrap(),
+                                timestamp: None,
+                                key: None,
+                                headers: vec![],
+                                retained_bytes: payload.as_ref().map_or(0, Vec::len),
+                                payload,
+                            },
+                        }],
+                    })
+                    .unwrap();
+            }
+            drop(work_tx);
+            let (completion_tx, completion_rx) = bounded(3);
+            worker_loop(
+                &config,
+                &config.transform.input_plan(),
+                work_rx,
+                completion_tx,
+                Arc::new(Stats::default()),
+            );
+            let batches = completion_rx.iter().collect::<Vec<_>>();
+            let (completion_tx, completion_rx) = bounded(3);
+            for batch in batches.into_iter().rev() {
+                completion_tx.send(batch).unwrap();
+            }
+            drop(completion_tx);
+            let (release_tx, release_rx) = bounded(3);
+            let mut output = Vec::new();
+            writer_loop(
+                &config,
+                &mut output,
+                completion_rx,
+                vec![release_tx],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Stats::default()),
+                Arc::new(OnceLock::new()),
+            )
+            .unwrap();
+            assert_eq!(
+                output,
+                if unordered {
+                    b"2:0:\"2\"\n1:-1:\"1\"\n0:3:\"0\"\n".as_slice()
+                } else {
+                    b"0:3:\"0\"\n1:-1:\"1\"\n2:0:\"2\"\n"
+                }
+            );
+            let releases = release_rx.iter().flatten().collect::<Vec<_>>();
+            assert_eq!(releases.len(), 3);
+            assert_eq!(
+                releases
+                    .iter()
+                    .map(|release| release.retained_bytes)
+                    .sum::<usize>(),
+                3
+            );
+        }
+    }
+
+    #[test]
     fn unordered_writer_emits_completion_arrival_order() {
         let config = config(&["--unordered", "--drop-if", "false", "-f", "%o\\n"]);
         let (completion_tx, completion_rx) = bounded(2);
@@ -1987,7 +2134,7 @@ mod tests {
             let stats = Arc::new(Stats::default());
             let (work_tx, work_rx) = bounded(1);
             let (completion_tx, completion_rx) = bounded(1);
-            let destination = if config.transform.capabilities.parses_json {
+            let destination = if config.needs_worker() {
                 Destination::Evaluate(work_tx.clone())
             } else {
                 Destination::Write(completion_tx.clone(), false)
@@ -2011,7 +2158,7 @@ mod tests {
             buffer.flush(&stats).unwrap();
             drop(buffer);
             drop(work_tx);
-            if config.transform.capabilities.parses_json {
+            if config.needs_worker() {
                 worker_loop(
                     &config,
                     &config.transform.input_plan(),

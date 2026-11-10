@@ -215,6 +215,41 @@ mod tests {
     }
 
     #[test]
+    fn deferred_metadata_captures_native_fields_without_json_payloads() {
+        let fixture = Fixture::new("deferred-metadata", 1);
+        let headers = OwnedHeaders::new()
+            .insert(KafkaHeader::<&[u8]> {
+                key: "x",
+                value: None,
+            })
+            .insert(KafkaHeader {
+                key: "x",
+                value: Some(b"".as_slice()),
+            })
+            .insert(KafkaHeader {
+                key: "x",
+                value: Some(b"\xff".as_slice()),
+            });
+        fixture.produce(0, Some(b"not JSON"), Some(b"\xff"), 100, Some(headers));
+        fixture.produce(0, Some(b""), Some(b""), 101, None);
+        fixture.produce(0, None, None, 102, None);
+        let config = fixture.config(&["--snapshot", "--defer-json", "--project",
+            "{'offset':$meta.offset,'key':$meta.key,'headers':$meta.headers,'length':$meta.valueLength,'tombstone':$meta.isTombstone,'timestamp':$meta.timestamp,'timestampType':$meta.timestampType}"]);
+        let inputs = KafkaInput::prepare(&config).unwrap();
+        let mut output = Vec::new();
+        let mut signals = SignalControl::install().unwrap();
+        consume(&config, inputs, &mut output, &mut signals).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "{\"offset\":\"0\",\"key\":\"/w==\",\"headers\":[{\"name\":\"x\",\"value\":null,\"valueEncoding\":null,\"valueLength\":-1},{\"name\":\"x\",\"value\":\"\",\"valueEncoding\":\"utf8\",\"valueLength\":0},{\"name\":\"x\",\"value\":\"/w==\",\"valueEncoding\":\"base64\",\"valueLength\":1}],\"length\":8,\"tombstone\":false,\"timestamp\":100,\"timestampType\":\"createTime\"}\n",
+                "{\"offset\":\"1\",\"key\":\"\",\"headers\":[],\"length\":0,\"tombstone\":false,\"timestamp\":101,\"timestampType\":\"createTime\"}\n",
+                "{\"offset\":\"2\",\"key\":null,\"headers\":[],\"length\":-1,\"tombstone\":true,\"timestamp\":102,\"timestampType\":\"createTime\"}\n"
+            )
+        );
+    }
+
+    #[test]
     fn header_slot_storage_is_charged_only_when_metadata_is_required() {
         let fixture = Fixture::new("metadata-accounting", 1);
         let mut headers = OwnedHeaders::new();

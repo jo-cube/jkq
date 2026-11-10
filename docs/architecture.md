@@ -162,8 +162,12 @@ immutable `$vars` reads can participate in those captures. There is no tape,
 mutable parsing copy, worker AST compilation, input tree, or jkq acquisition
 cache or fallback evaluator. jx owns acquisition and expression semantics.
 
-Predicates run in command-line order and require exactly one Boolean result.
-Drop and tombstone actions short-circuit later expressions. Projection consumes
+Each compiled predicate retains its trigger Boolean and diagnostic origin.
+Clap value positions merge mixed `if`/`unless` occurrences in command-line
+order within each stage; the drop stage precedes the tombstone stage. One
+evaluation path requires exactly one Boolean and compares it with the trigger,
+without rewriting the expression. Drop and tombstone actions short-circuit
+later expressions. Projection consumes
 all results before publishing a completion: no results are an error, one
 result is one JSON value, and multiple results form one array payload. Explicit
 arrays remain single values. Lazy evaluation and serialization failures follow
@@ -186,11 +190,47 @@ bytes unchanged; drops and failures retain unused source storage until release.
 See [expression-language.md](expression-language.md) for native jx serialization
 and missing-value behavior.
 
-Existing Kafka tombstones bypass all JSONata work. They remain tombstones by
-default and become drops when `--drop-tombstones` is set. Records selected by
-`--tombstone-if` follow the same option before projection. An identity
-transform also bypasses parsing unless `--on-invalid-json` was supplied
+By default, existing Kafka tombstones bypass all JSONata work. They remain
+tombstones unless `--drop-tombstones` is set. Records selected by
+`--tombstone-if` or `--tombstone-unless` follow the same option before
+projection. An identity transform also bypasses parsing unless `--on-invalid-json` was supplied
 explicitly or a JSON-value envelope was requested.
+
+### Metadata and Deferred Preparation
+
+Worker scheduling depends on evaluation/output requirements, not on JSON
+preparation. Every worker plan retains the same ordered completion path,
+including metadata-only plans that never prepare payloads. Identity raw-byte
+plans still bypass workers. Native Kafka messages remain poller-confined;
+payload copying and bounded admission charges are unchanged. Transform metadata
+requirements are combined with formatter requirements before copying keys,
+headers, and timestamps into owned records.
+
+A conservative source-name precheck (`$meta` or `$eval`, allowing false
+positives in strings/comments) declares the runtime binding only for expressions
+that might access it. Variable names are unescaped in jx; dynamic evaluation is
+included even when its text comes from `$vars`. This keeps existing payload-only
+expressions on their original compiled and serialization paths. There is no
+metadata-field demand analysis or Kafka functionality in jx.
+
+A worker lazily encodes the complete metadata object using envelope byte helpers
+and validates it once into borrowed `jx::RawJson`. The binding is supplied through
+fresh `EvaluationOptions` for each reached expression. The reusable metadata byte
+buffer is worker-local, outside source-byte admission, and discarded when its
+capacity exceeds the existing 16 KiB/source-budget recycling threshold. Large
+keys/headers therefore still cost encoding and transient memory when metadata
+is used; unused metadata after short-circuiting is never encoded.
+
+Default eager preparation and source tombstone bypass are unchanged. With
+`--defer-json`, jx's conservative `InputDependency::Independent` proof permits
+absent-input evaluation; the first reached dependent expression prepares a
+non-null payload through the shared `InputPlan`. Source tombstones always use
+absent input, never a fabricated JSON null. Surviving JSON-value passthrough
+prepares at serialization. A prepared projection without runtime bindings retains
+`PreparedInput::write_json`; bound or absent-input evaluations use
+`Evaluation::write_json`, which shares jx's complete-result serializer, rollback,
+and evaluation-error precedence. There is one worker action flow and no
+poller-side filtering or payload-copy omission.
 
 ## Ordering and Output
 
@@ -210,12 +250,14 @@ One writer owns stdout. By default, formats and JSON envelopes stream directly
 to its buffer, avoiding byte interleaving and an additional record-sized
 staging buffer. With `--payload-format`, the writer formats each non-tombstone
 action into one reused buffer before applying the final output format. Final
-`%s`, `%S`, and `%R` therefore operate on the exact generated payload without
-putting Kafka metadata into JSONata. Drops produce no bytes, tombstones bypass
-payload formatting, and `%L` continues to report the source payload length.
+`%s`, `%S`, and `%R` therefore operate on the exact generated payload
+independently of JSONata metadata access. Drops produce no bytes, tombstones
+bypass payload formatting, and `%L` continues to report the source payload length.
 JSON envelope strings use simd-json's streaming serializer; output accounting
 and I/O error kinds, including broken pipe, are preserved. Broken pipe is normal
 pipeline termination.
+Optional ISO 8601 envelope timestamps are converted only by the writer, with
+range checks before streaming the envelope; source metadata remains numeric.
 For a JSON-value envelope, the writer inserts compact JSON bytes produced by
 the worker or projection and labels them with `payloadEncoding: "json"`.
 
@@ -316,8 +358,9 @@ not finished or a poller, worker, or stdout cannot progress.
 - Every successfully transformed non-tombstone input resolves to exactly one
   action.
 - One input never expands into multiple output records.
-- Existing tombstones bypass JSON and JSONata and remain tombstones unless
-  `--drop-tombstones` is set.
+- By default, source tombstones bypass JSON and JSONata and remain tombstones
+  unless `--drop-tombstones` is set; deferred mode permits expression evaluation
+  with absent input after that drop check.
 - Pass-through preserves exact source payload bytes unless the user explicitly
   requests a JSON-value envelope or payload format.
 - Payload formatting applies only to emitted non-tombstone actions and does not

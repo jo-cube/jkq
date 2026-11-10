@@ -4,32 +4,54 @@ pub mod jsonata;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanCapabilities {
-    pub parses_json: bool,
+    pub needs_worker: bool,
+    pub metadata: bool,
+}
+
+#[derive(Debug)]
+pub struct PredicateSource {
+    pub source: String,
+    pub trigger: bool,
+    pub origin: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Predicate {
+    pub expression: Expression,
+    pub trigger: bool,
+    pub origin: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct TransformPlan {
-    pub drops: Vec<Expression>,
-    pub tombstones: Vec<Expression>,
+    pub drops: Vec<Predicate>,
+    pub tombstones: Vec<Predicate>,
     pub drop_tombstones: bool,
     pub projection: Option<Expression>,
     pub capabilities: PlanCapabilities,
+    pub defer_json: bool,
+    metadata_bindings: Vec<bool>,
 }
 
 impl TransformPlan {
+    pub fn uses_metadata(&self, index: usize) -> bool {
+        self.metadata_bindings[index]
+    }
+
     pub fn input_plan(&self) -> InputPlan<'_> {
         InputPlan::new(
             self.drops
                 .iter()
                 .chain(&self.tombstones)
+                .map(|predicate| &predicate.expression)
                 .chain(&self.projection),
         )
     }
 }
 
 pub fn build_plan(
-    drops: &[String],
-    tombstones: &[String],
+    drops: &[PredicateSource],
+    tombstones: &[PredicateSource],
     drop_tombstones: bool,
     projection: Option<&str>,
     variables: Option<&str>,
@@ -49,28 +71,44 @@ pub fn build_plan(
         Some(value) => CompileOptions::default().constant_binding("vars", value),
         None => CompileOptions::default(),
     };
-    let predicates = |sources: &[String], category: &str| {
+    let predicates = |sources: &[PredicateSource]| {
         sources
             .iter()
-            .enumerate()
-            .map(|(index, source)| {
-                compile_expression(&options, source, &format!("{category} #{}", index + 1))
+            .map(|source| {
+                Ok(Predicate {
+                    expression: compile_expression(&options, &source.source, &source.origin)?,
+                    trigger: source.trigger,
+                    origin: source.origin.clone(),
+                })
             })
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>, String>>()
     };
+    // Binding names are unescaped in JSONata. Include dynamic evaluation and
+    // tolerate false positives (including strings/comments); this only avoids
+    // adding a lexical frame to expressions that cannot refer to $meta.
+    let metadata_bindings: Vec<_> = drops
+        .iter()
+        .chain(tombstones)
+        .map(|predicate| predicate.source.as_str())
+        .chain(projection)
+        .map(uses_metadata)
+        .collect();
     Ok(TransformPlan {
-        drops: predicates(drops, "drop predicate")?,
-        tombstones: predicates(tombstones, "tombstone predicate")?,
+        drops: predicates(drops)?,
+        tombstones: predicates(tombstones)?,
         drop_tombstones,
         projection: projection
             .map(|source| compile_expression(&options, source, "projection"))
             .transpose()?,
         capabilities: PlanCapabilities {
-            parses_json: force_json_validation
+            needs_worker: force_json_validation
                 || !drops.is_empty()
                 || !tombstones.is_empty()
                 || projection.is_some(),
+            metadata: metadata_bindings.iter().any(|&used| used),
         },
+        defer_json: false,
+        metadata_bindings,
     })
 }
 
@@ -79,9 +117,18 @@ fn compile_expression(
     source: &str,
     category: &str,
 ) -> Result<Expression, String> {
+    let options = if uses_metadata(source) {
+        options.clone().binding("meta")
+    } else {
+        options.clone()
+    };
     options
         .compile(source)
         .map_err(|error| format!("{category} JSONata compile error: {error}"))
+}
+
+fn uses_metadata(source: &str) -> bool {
+    source.contains("$meta") || source.contains("$eval")
 }
 
 #[cfg(test)]
@@ -91,7 +138,11 @@ mod tests {
     #[test]
     fn startup_plan_accepts_jsonata_and_reports_parse_errors() {
         build_plan(
-            &[r#"environment != "production""#.to_owned()],
+            &[PredicateSource {
+                source: r#"environment != "production""#.to_owned(),
+                trigger: true,
+                origin: "drop predicate #1".to_owned(),
+            }],
             &[],
             false,
             Some(r#"{"id": id, "total": $sum(items.price)}"#),
@@ -101,7 +152,11 @@ mod tests {
         .unwrap();
 
         let error = build_plan(
-            &[r#"environment === "production""#.to_owned()],
+            &[PredicateSource {
+                source: r#"environment === "production""#.to_owned(),
+                trigger: true,
+                origin: "drop predicate #1".to_owned(),
+            }],
             &[],
             false,
             None,
@@ -143,13 +198,13 @@ mod tests {
             !build_plan(&[], &[], false, None, None, false)
                 .unwrap()
                 .capabilities
-                .parses_json
+                .needs_worker
         );
         assert!(
             build_plan(&[], &[], false, None, None, true)
                 .unwrap()
                 .capabilities
-                .parses_json
+                .needs_worker
         );
     }
 }

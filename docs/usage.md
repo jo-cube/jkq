@@ -137,19 +137,21 @@ without supplying it evaluates as JSONata `Undefined`.
 
 For each non-tombstone input, `jkq`:
 
-1. evaluates repeated `--drop-if` predicates in command-line order, dropping
-   the record on the first `true`;
-2. evaluates repeated `--tombstone-if` predicates in command-line order,
-   tombstoning the record on the first `true`, or dropping it when
-   `--drop-tombstones` is set;
+1. evaluates `--drop-if` and `--drop-unless` predicates together in
+   command-line order, dropping the record on the first trigger;
+2. evaluates `--tombstone-if` and `--tombstone-unless` predicates together in
+   command-line order, tombstoning the record on the first trigger, or dropping
+   it when `--drop-tombstones` is set;
 3. applies the optional `--project` expression to surviving records;
 4. otherwise passes the source payload through, preserving its exact bytes
    unless `--envelope-payload value` is selected.
 
-Each predicate list stops at its first Boolean `true` result. The top-level
-result of an action predicate must be a JSONata Boolean; JSONata truthiness is
-not applied at this external boundary. An existing Kafka tombstone bypasses
-JSON parsing, predicates, and projection. It remains a tombstone by default
+All four options are repeatable. `if` triggers only on Boolean `true` and
+`unless` only on Boolean `false`; missing, null, and non-Boolean results are
+evaluation errors. Each stage stops at its first trigger, and the drop stage
+always runs before the tombstone stage. JSONata truthiness is not applied at
+this external boundary. By default, an existing Kafka tombstone
+bypasses JSON parsing, predicates, and projection. It remains a tombstone by default
 and is dropped when `--drop-tombstones` is set.
 
 Projection results use native jx compact JSON serialization. Zero emitted
@@ -158,6 +160,21 @@ are evaluation errors. A result sequence with multiple items is one JSON array
 payload, never multiple output records. See [expression-language.md](expression-language.md)
 for the complete jkq-to-JSONata integration contract and links to the language
 reference.
+
+`$meta` exposes source topic, partition, exact decimal-string offset, timestamp
+and type, binary-safe key and headers, original `valueLength`, and
+`isTombstone`, without replacing the payload root. Use `--defer-json` to run
+proven input-independent predicates and projections before preparing JSON,
+including over non-JSON values and source tombstones. `--drop-tombstones`
+still takes precedence. This mode changes validation and error ordering;
+see [source metadata and deferred JSON](expression-language.md#source-metadata-and-deferred-json)
+for field encodings, absent-input semantics, and error-policy details.
+
+```sh
+jkq -b localhost:9092 -t events --snapshot --defer-json \
+  --drop-if '$meta.partition = 2' \
+  --project '{"offset": $meta.offset, "bytes": $meta.valueLength}'
+```
 
 ## Output
 
@@ -278,6 +295,15 @@ JSON-value envelopes force JSON validation even when no expressions are used.
 They cannot be combined with `--on-invalid-json pass`, because every emitted
 non-tombstone payload must retain the JSON-value schema.
 
+Envelope `timestamp` is an integer Unix epoch millisecond count by default.
+`-J --timestamp-format iso8601` instead emits a UTC string such as
+`"2024-01-02T03:04:05.006Z"`, always with three fractional-second digits and
+trailing `Z`. Missing timestamps remain `null`, and `timestampType` is unchanged.
+ISO output supports years `0000` through `9999`, including pre-epoch dates;
+a timestamp outside that range fails output before any bytes of that envelope
+are written. Numeric output retains the full signed 64-bit millisecond range.
+The option requires `-J`; `%T` and `$meta.timestamp` remain numeric.
+
 Available timestamp types are `"createTime"` and `"logAppendTime"`. Envelope
 headers contain `name`, `value`, `valueEncoding`, and `valueLength` in source
 order. Envelope field order and framing are compatibility-sensitive and covered
@@ -309,9 +335,9 @@ source payload contents, but native messages deliberately produced by JSONata
 expressions, such as `$error()` and `$assert()` messages, are preserved and may
 contain record data.
 
-When `--on-invalid-json` is omitted and no expression needs JSON, the identity
-path does not parse payloads. Supplying the option explicitly forces JSON
-validation, including for an otherwise identity transform.
+Without `--defer-json`, when `--on-invalid-json` is omitted and no expression
+needs JSON, the identity path does not parse payloads. Supplying the option
+explicitly forces JSON validation, including for an otherwise identity transform.
 
 ## Kafka Configuration
 

@@ -57,13 +57,12 @@ CI runs the same checks.
 
 ## jx dependency
 
-The normal dependency pins the merged upstream jx implementation by immutable
-Git revision. Its public compiler uses the common semantic IR; no backend flag,
-source patch or local path is needed. Cargo.lock must resolve the same revision.
-A separate jx release or tag is not required.
+The normal dependency selects the published jx `v0.2.0` Git tag; `Cargo.lock`
+pins its exact source revision. Its public compiler uses the common semantic IR;
+no backend flag, source patch or local path is needed. Published tags must not move.
 
-When updating the pin, verify that the commit is reachable from upstream main,
-fetch it from GitHub in a clean Cargo Git cache, and run `make check` and a release
+When updating the tag, verify that it resolves to the reviewed commit on upstream
+main, fetch it from GitHub in a clean Cargo Git cache, and run `make check` and a release
 build without local overrides. Regenerate notices and verify release archives
 before releasing jkq.
 
@@ -169,6 +168,7 @@ The direct runtime dependencies are deliberately limited to:
 - `clap`
 - `crossbeam-channel`
 - `signal-hook`
+- `chrono` (UTC envelope timestamp conversion, with no optional features)
 
 `jx` is the sole expression implementation. Its immutable compiled expressions
 are shared across workers together with one borrowed `jx::InputPlan`. Each
@@ -177,6 +177,11 @@ payload is prepared once and reused across independent indexed evaluations.
 dependency and `Cargo.lock` pin the reviewed immutable revision; the release handoff
 above verifies the published tag names that same code. simd-json remains only for the streaming JSON envelope string
 serializer.
+
+`chrono` avoids custom calendar arithmetic for optional ISO 8601 envelope
+output. Its core calendar APIs need no optional features, including allocation,
+clock, local timezone, or timezone database support. Its only required dependency,
+`num-traits`, is already in the expression dependency graph.
 
 Before adding another dependency, confirm that the standard library or an
 existing dependency is insufficient and that the new dependency removes

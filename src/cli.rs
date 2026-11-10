@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use clap::{Parser, ValueEnum};
+use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches, Parser, ValueEnum};
 
 use crate::{
-    output::{CompiledFormat, OutputRequirements},
+    output::{CompiledFormat, OutputRequirements, TimestampFormat},
     transform::{
-        TransformPlan, build_plan,
+        PredicateSource, TransformPlan, build_plan,
         jsonata::{ErrorPolicies, EvaluationPolicy, InvalidJsonPolicy},
     },
 };
@@ -55,15 +55,14 @@ pub struct RawCli {
     /// Capture startup high watermarks as fixed exclusive ends
     #[arg(long)]
     snapshot: bool,
-    /// Drop records when this JSONata predicate returns true; repeatable
-    #[arg(long)]
-    drop_if: Vec<String>,
-    /// Tombstone records when this JSONata predicate returns true; repeatable
-    #[arg(long)]
-    tombstone_if: Vec<String>,
+    #[command(flatten)]
+    predicates: PredicateArgs,
     /// Drop source and predicate-generated tombstones before projection
     #[arg(long)]
     drop_tombstones: bool,
+    /// Prepare JSON only when reached expressions or output require it; inspect source tombstones
+    #[arg(long)]
+    defer_json: bool,
     /// Project each surviving record with this JSONata expression
     #[arg(long)]
     project: Option<String>,
@@ -96,6 +95,9 @@ pub struct RawCli {
         requires = "json_envelope"
     )]
     envelope_payload: EnvelopePayload,
+    /// Format -J timestamps as UTC ISO 8601 instead of Unix milliseconds
+    #[arg(long, value_parser = ["iso8601"], requires = "json_envelope")]
+    timestamp_format: Option<String>,
     /// Flush stdout after every output record
     #[arg(short = 'u', long)]
     unbuffered: bool,
@@ -144,6 +146,119 @@ pub struct RawCli {
     /// Validate local configuration and exit without connecting
     #[arg(long)]
     check: bool,
+}
+
+#[derive(Debug)]
+struct PredicateArgs {
+    drops: Vec<PredicateSource>,
+    tombstones: Vec<PredicateSource>,
+}
+
+impl Args for PredicateArgs {
+    fn augment_args(mut command: Command) -> Command {
+        for (id, flag, help) in [
+            (
+                "drop_if",
+                "drop-if",
+                "Drop records when this JSONata predicate returns Boolean true; repeatable",
+            ),
+            (
+                "drop_unless",
+                "drop-unless",
+                "Drop records when this JSONata predicate returns Boolean false; repeatable",
+            ),
+            (
+                "tombstone_if",
+                "tombstone-if",
+                "Tombstone records when this JSONata predicate returns Boolean true; repeatable",
+            ),
+            (
+                "tombstone_unless",
+                "tombstone-unless",
+                "Tombstone records when this JSONata predicate returns Boolean false; repeatable",
+            ),
+        ] {
+            command = command.arg(
+                Arg::new(id)
+                    .long(flag)
+                    .value_name("EXPR")
+                    .num_args(1)
+                    .action(ArgAction::Append)
+                    .value_parser(clap::value_parser!(String))
+                    .help(help),
+            );
+        }
+        command
+    }
+
+    fn augment_args_for_update(command: Command) -> Command {
+        Self::augment_args(command)
+    }
+}
+
+impl FromArgMatches for PredicateArgs {
+    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            drops: ordered_predicates(
+                matches,
+                [
+                    ("drop_if", true, "drop predicate"),
+                    ("drop_unless", false, "drop-unless predicate"),
+                ],
+            ),
+            tombstones: ordered_predicates(
+                matches,
+                [
+                    ("tombstone_if", true, "tombstone predicate"),
+                    ("tombstone_unless", false, "tombstone-unless predicate"),
+                ],
+            ),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), clap::Error> {
+        let updated = Self::from_arg_matches(matches)?;
+        if matches.contains_id("drop_if") || matches.contains_id("drop_unless") {
+            self.drops = updated.drops;
+        }
+        if matches.contains_id("tombstone_if") || matches.contains_id("tombstone_unless") {
+            self.tombstones = updated.tombstones;
+        }
+        Ok(())
+    }
+}
+
+fn ordered_predicates(
+    matches: &ArgMatches,
+    options: [(&str, bool, &str); 2],
+) -> Vec<PredicateSource> {
+    let mut predicates: Vec<_> = options
+        .into_iter()
+        .flat_map(|(id, trigger, category)| {
+            matches
+                .indices_of(id)
+                .into_iter()
+                .flatten()
+                .zip(matches.get_many::<String>(id).into_iter().flatten())
+                .enumerate()
+                .map(move |(ordinal, (position, source))| {
+                    (
+                        position,
+                        PredicateSource {
+                            source: source.clone(),
+                            trigger,
+                            origin: format!("{category} #{}", ordinal + 1),
+                        },
+                    )
+                })
+        })
+        .collect();
+    // clap retains each value's argv position even when option names differ.
+    predicates.sort_unstable_by_key(|(position, _)| *position);
+    predicates
+        .into_iter()
+        .map(|(_, predicate)| predicate)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -222,6 +337,7 @@ pub struct RuntimeConfig {
     pub limits: RuntimeLimits,
     pub transform: TransformPlan,
     pub output: OutputPlan,
+    pub timestamp_format: TimestampFormat,
     pub errors: ErrorPolicies,
     pub kafka_error: KafkaErrorPolicy,
     pub kafka_properties: BTreeMap<String, String>,
@@ -230,6 +346,22 @@ pub struct RuntimeConfig {
     pub stats_interval: Option<Duration>,
     pub quiet: bool,
     pub check: bool,
+}
+
+impl RuntimeConfig {
+    pub fn needs_worker(&self) -> bool {
+        self.transform.capabilities.needs_worker || self.output.embeds_json()
+    }
+
+    pub fn requirements(&self) -> OutputRequirements {
+        let mut requirements = self.output.requirements();
+        if self.transform.capabilities.metadata {
+            requirements.key = true;
+            requirements.headers = true;
+            requirements.timestamp = true;
+        }
+        requirements
+    }
 }
 
 impl OutputPlan {
@@ -330,8 +462,8 @@ impl RawCli {
                     .to_owned(),
             );
         }
-        let force_json_validation =
-            self.on_invalid_json.is_some() || envelope_payload == EnvelopePayload::Value;
+        let force_json_validation = !self.defer_json
+            && (self.on_invalid_json.is_some() || envelope_payload == EnvelopePayload::Value);
         let invalid_json = match self.on_invalid_json.unwrap_or(RawInvalidJsonPolicy::Fail) {
             RawInvalidJsonPolicy::Fail => InvalidJsonPolicy::Fail,
             RawInvalidJsonPolicy::Drop => InvalidJsonPolicy::Drop,
@@ -351,14 +483,15 @@ impl RawCli {
                     .map_err(|error| format!("cannot read --vars-file {}: {error}", path.display()))
             })
             .transpose()?;
-        let transform = build_plan(
-            &self.drop_if,
-            &self.tombstone_if,
+        let mut transform = build_plan(
+            &self.predicates.drops,
+            &self.predicates.tombstones,
             self.drop_tombstones,
             self.project.as_deref(),
             file_variables.as_deref().or(self.vars.as_deref()),
             force_json_validation,
         )?;
+        transform.defer_json = self.defer_json;
         let output = if self.json_envelope {
             OutputPlan::Envelope(envelope_payload)
         } else {
@@ -433,6 +566,11 @@ impl RawCli {
             },
             transform,
             output,
+            timestamp_format: if self.timestamp_format.is_some() {
+                TimestampFormat::Iso8601
+            } else {
+                TimestampFormat::Milliseconds
+            },
             errors: ErrorPolicies {
                 invalid_json,
                 evaluation,
@@ -765,7 +903,7 @@ mod tests {
         ])
         .unwrap();
         assert!(config.transform.drop_tombstones);
-        assert!(!config.transform.capabilities.parses_json);
+        assert!(!config.transform.capabilities.needs_worker);
     }
 
     #[test]
@@ -989,9 +1127,98 @@ mod tests {
     }
 
     #[test]
+    fn mixed_predicate_compile_errors_identify_the_option_occurrence() {
+        for (if_flag, unless_flag, category) in [
+            ("--drop-if", "--drop-unless", "drop-unless predicate #2"),
+            (
+                "--tombstone-if",
+                "--tombstone-unless",
+                "tombstone-unless predicate #2",
+            ),
+        ] {
+            let error = resolve(&[
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                unless_flag,
+                "true",
+                if_flag,
+                "false",
+                unless_flag,
+                "(",
+            ])
+            .unwrap_err();
+            assert!(error.starts_with(&format!("{category} JSONata compile error")));
+        }
+    }
+
+    #[test]
+    fn deferred_mode_separates_workers_json_and_metadata_requirements() {
+        let identity = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "--defer-json",
+            "--on-invalid-json",
+            "fail",
+        ])
+        .unwrap();
+        assert!(!identity.needs_worker());
+        let metadata = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "--defer-json",
+            "--project",
+            "$meta.offset",
+        ])
+        .unwrap();
+        assert!(metadata.transform.defer_json);
+        assert!(metadata.needs_worker());
+        assert_eq!(
+            metadata.requirements(),
+            OutputRequirements {
+                key: true,
+                headers: true,
+                timestamp: true
+            }
+        );
+        assert_eq!(
+            metadata.output.requirements(),
+            OutputRequirements {
+                key: false,
+                headers: false,
+                timestamp: false
+            }
+        );
+        let payload = resolve(&["jkq", "-b", "x", "-t", "t", "--project", "metadata.id"]).unwrap();
+        assert!(!payload.transform.capabilities.metadata);
+        let value = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "--defer-json",
+            "-J",
+            "--envelope-payload",
+            "value",
+        ])
+        .unwrap();
+        assert!(value.needs_worker());
+        assert!(!value.transform.capabilities.needs_worker);
+    }
+
+    #[test]
     fn explicit_invalid_json_policy_forces_validation_on_the_identity_path() {
         let default = resolve(&["jkq", "-b", "x", "-t", "t", "-p", "0"]).unwrap();
-        assert!(!default.transform.capabilities.parses_json);
+        assert!(!default.transform.capabilities.needs_worker);
 
         for policy in ["fail", "drop", "tombstone", "pass"] {
             let explicit = resolve(&[
@@ -1006,14 +1233,44 @@ mod tests {
                 policy,
             ])
             .unwrap();
-            assert!(explicit.transform.capabilities.parses_json, "{policy}");
+            assert!(explicit.transform.capabilities.needs_worker, "{policy}");
+        }
+    }
+
+    #[test]
+    fn timestamp_format_requires_an_envelope_and_known_representation() {
+        let default = resolve(&["jkq", "-b", "x", "-t", "t", "-J"]).unwrap();
+        assert_eq!(default.timestamp_format, TimestampFormat::Milliseconds);
+        let iso = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-J",
+            "--timestamp-format",
+            "iso8601",
+        ])
+        .unwrap();
+        assert_eq!(iso.timestamp_format, TimestampFormat::Iso8601);
+        assert_eq!(iso.requirements(), default.requirements());
+        assert_eq!(iso.needs_worker(), default.needs_worker());
+        for extra in [
+            vec!["--timestamp-format", "iso8601"],
+            vec!["-J", "--timestamp-format", "unknown"],
+            vec!["-J", "--timestamp-format"],
+            vec!["-J", "--timestamp-format", "iso8601", "-f", "%T"],
+        ] {
+            let mut arguments = vec!["jkq", "-b", "x", "-t", "t"];
+            arguments.extend(extra);
+            assert!(resolve(&arguments).is_err(), "{arguments:?}");
         }
     }
 
     #[test]
     fn json_value_envelope_forces_validation_without_changing_the_default() {
         let default = resolve(&["jkq", "-b", "x", "-t", "t", "-p", "0", "-J"]).unwrap();
-        assert!(!default.transform.capabilities.parses_json);
+        assert!(!default.transform.capabilities.needs_worker);
         assert!(matches!(
             default.output,
             OutputPlan::Envelope(EnvelopePayload::String)
@@ -1032,7 +1289,7 @@ mod tests {
             "value",
         ])
         .unwrap();
-        assert!(value.transform.capabilities.parses_json);
+        assert!(value.transform.capabilities.needs_worker);
         assert!(matches!(
             value.output,
             OutputPlan::Envelope(EnvelopePayload::Value)
@@ -1054,7 +1311,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(!config.transform.capabilities.parses_json);
+        assert!(!config.transform.capabilities.needs_worker);
         assert_eq!(
             config.output.requirements(),
             OutputRequirements {
@@ -1079,7 +1336,7 @@ mod tests {
             r#"{"unused":true}"#,
         ])
         .unwrap();
-        assert!(!identity.transform.capabilities.parses_json);
+        assert!(!identity.transform.capabilities.needs_worker);
 
         let config = resolve(&[
             "jkq",
@@ -1099,7 +1356,7 @@ mod tests {
         ])
         .unwrap();
         assert!(config.check);
-        assert!(config.transform.capabilities.parses_json);
+        assert!(config.transform.capabilities.needs_worker);
 
         let error = resolve(&[
             "jkq",
@@ -1227,6 +1484,14 @@ mod tests {
         assert!(help.contains("Number of Kafka consumers"));
         assert!(help.contains("--consumers <CONSUMERS>"));
         assert!(!help.contains("--jobs"));
+        for flag in [
+            "--drop-if",
+            "--drop-unless",
+            "--tombstone-if",
+            "--tombstone-unless",
+        ] {
+            assert!(help.contains(&format!("{flag} <EXPR>")));
+        }
         assert!(help.contains("Drop source and predicate-generated tombstones before projection"));
         assert!(help.contains("Strict JSON object available as $vars"));
         assert!(help.contains("Read the strict JSON object available as $vars from a file"));
@@ -1235,6 +1500,8 @@ mod tests {
         assert!(help.contains("[default: %s\\n]"));
         assert!(help.contains("Emit a binary-safe jkq JSON envelope instead of -f output"));
         assert!(help.contains("Payload representation for -J envelopes"));
+        assert!(help.contains("--timestamp-format <TIMESTAMP_FORMAT>"));
+        assert!(help.contains("[possible values: iso8601]"));
         assert!(help.contains("does not force JSON parsing"));
         assert!(help.contains("forces validation and compacts pass-through payloads"));
         assert!(help.contains("[default: string]"));
