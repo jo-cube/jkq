@@ -1187,7 +1187,9 @@ fn write_action(
             }
             format.write_to(&output_record, writer)?
         }
-        OutputPlan::Envelope(_) => output::write_envelope(&output_record, writer)?,
+        OutputPlan::Envelope(_) => {
+            output::write_envelope(&output_record, config.timestamp_format, writer)?
+        }
     };
     if config.unbuffered {
         writer.flush()?;
@@ -1510,6 +1512,45 @@ mod tests {
             br#""action":"project","payload":{"id":1},"payloadEncoding":"json","payloadLength":8}
 "#
         ));
+    }
+
+    #[test]
+    fn envelope_timestamp_format_is_writer_local() {
+        let source = SourceRecord {
+            partition: 0,
+            offset: 7,
+            timestamp: Some(Timestamp {
+                milliseconds: -1,
+                kind: crate::output::TimestampType::LogAppendTime,
+            }),
+            key: None,
+            headers: Vec::new(),
+            payload_length: Some(3),
+        };
+        for (arguments, expected) in [
+            (
+                vec!["-J", "--timestamp-format", "iso8601"],
+                concat!(
+                    "{\"topic\":\"events\",\"partition\":0,\"offset\":7,",
+                    "\"timestamp\":\"1969-12-31T23:59:59.999Z\",\"timestampType\":\"logAppendTime\",",
+                    "\"key\":null,\"keyEncoding\":null,\"keyLength\":-1,\"headers\":[],",
+                    "\"action\":\"pass\",\"payload\":\"raw\",\"payloadEncoding\":\"utf8\",\"payloadLength\":3}\n"
+                ),
+            ),
+            (vec!["-f", "%T:%s"], "-1:raw"),
+        ] {
+            let mut output = Vec::new();
+            write_action(
+                &config(&arguments),
+                &mut output,
+                &source,
+                &pass(b"raw"),
+                &mut Vec::new(),
+                &Stats::default(),
+            )
+            .unwrap();
+            assert_eq!(output, expected.as_bytes());
+        }
     }
 
     #[test]

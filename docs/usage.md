@@ -295,6 +295,15 @@ JSON-value envelopes force JSON validation even when no expressions are used.
 They cannot be combined with `--on-invalid-json pass`, because every emitted
 non-tombstone payload must retain the JSON-value schema.
 
+Envelope `timestamp` is an integer Unix epoch millisecond count by default.
+`-J --timestamp-format iso8601` instead emits a UTC string such as
+`"2024-01-02T03:04:05.006Z"`, always with three fractional-second digits and
+trailing `Z`. Missing timestamps remain `null`, and `timestampType` is unchanged.
+ISO output supports years `0000` through `9999`, including pre-epoch dates;
+a timestamp outside that range fails output before any bytes of that envelope
+are written. Numeric output retains the full signed 64-bit millisecond range.
+The option requires `-J`; `%T` and `$meta.timestamp` remain numeric.
+
 Available timestamp types are `"createTime"` and `"logAppendTime"`. Envelope
 headers contain `name`, `value`, `valueEncoding`, and `valueLength` in source
 order. Envelope field order and framing are compatibility-sensitive and covered

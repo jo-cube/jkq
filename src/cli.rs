@@ -9,7 +9,7 @@ use std::{
 use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches, Parser, ValueEnum};
 
 use crate::{
-    output::{CompiledFormat, OutputRequirements},
+    output::{CompiledFormat, OutputRequirements, TimestampFormat},
     transform::{
         PredicateSource, TransformPlan, build_plan,
         jsonata::{ErrorPolicies, EvaluationPolicy, InvalidJsonPolicy},
@@ -95,6 +95,9 @@ pub struct RawCli {
         requires = "json_envelope"
     )]
     envelope_payload: EnvelopePayload,
+    /// Format -J timestamps as UTC ISO 8601 instead of Unix milliseconds
+    #[arg(long, value_parser = ["iso8601"], requires = "json_envelope")]
+    timestamp_format: Option<String>,
     /// Flush stdout after every output record
     #[arg(short = 'u', long)]
     unbuffered: bool,
@@ -334,6 +337,7 @@ pub struct RuntimeConfig {
     pub limits: RuntimeLimits,
     pub transform: TransformPlan,
     pub output: OutputPlan,
+    pub timestamp_format: TimestampFormat,
     pub errors: ErrorPolicies,
     pub kafka_error: KafkaErrorPolicy,
     pub kafka_properties: BTreeMap<String, String>,
@@ -562,6 +566,11 @@ impl RawCli {
             },
             transform,
             output,
+            timestamp_format: if self.timestamp_format.is_some() {
+                TimestampFormat::Iso8601
+            } else {
+                TimestampFormat::Milliseconds
+            },
             errors: ErrorPolicies {
                 invalid_json,
                 evaluation,
@@ -1229,6 +1238,36 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_format_requires_an_envelope_and_known_representation() {
+        let default = resolve(&["jkq", "-b", "x", "-t", "t", "-J"]).unwrap();
+        assert_eq!(default.timestamp_format, TimestampFormat::Milliseconds);
+        let iso = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "-J",
+            "--timestamp-format",
+            "iso8601",
+        ])
+        .unwrap();
+        assert_eq!(iso.timestamp_format, TimestampFormat::Iso8601);
+        assert_eq!(iso.requirements(), default.requirements());
+        assert_eq!(iso.needs_worker(), default.needs_worker());
+        for extra in [
+            vec!["--timestamp-format", "iso8601"],
+            vec!["-J", "--timestamp-format", "unknown"],
+            vec!["-J", "--timestamp-format"],
+            vec!["-J", "--timestamp-format", "iso8601", "-f", "%T"],
+        ] {
+            let mut arguments = vec!["jkq", "-b", "x", "-t", "t"];
+            arguments.extend(extra);
+            assert!(resolve(&arguments).is_err(), "{arguments:?}");
+        }
+    }
+
+    #[test]
     fn json_value_envelope_forces_validation_without_changing_the_default() {
         let default = resolve(&["jkq", "-b", "x", "-t", "t", "-p", "0", "-J"]).unwrap();
         assert!(!default.transform.capabilities.needs_worker);
@@ -1461,6 +1500,8 @@ mod tests {
         assert!(help.contains("[default: %s\\n]"));
         assert!(help.contains("Emit a binary-safe jkq JSON envelope instead of -f output"));
         assert!(help.contains("Payload representation for -J envelopes"));
+        assert!(help.contains("--timestamp-format <TIMESTAMP_FORMAT>"));
+        assert!(help.contains("[possible values: iso8601]"));
         assert!(help.contains("does not force JSON parsing"));
         assert!(help.contains("forces validation and compacts pass-through payloads"));
         assert!(help.contains("[default: string]"));

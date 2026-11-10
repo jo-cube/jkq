@@ -3,6 +3,8 @@ use std::{
     io::{self, Write},
 };
 
+use chrono::{DateTime, Datelike, Timelike, Utc};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FormatToken {
     Literal(Vec<u8>),
@@ -34,6 +36,13 @@ pub struct OutputRequirements {
 pub struct Header {
     pub name: String,
     pub value: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TimestampFormat {
+    #[default]
+    Milliseconds,
+    Iso8601,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,11 +368,24 @@ fn write_optional_length(
 #[cfg(test)]
 pub fn render_envelope(record: &OutputRecord<'_>) -> Vec<u8> {
     let mut output = Vec::new();
-    write_envelope(record, &mut output).expect("writing to a vector cannot fail");
+    write_envelope(record, TimestampFormat::Milliseconds, &mut output)
+        .expect("writing to a vector cannot fail");
     output
 }
 
-pub fn write_envelope(record: &OutputRecord<'_>, output: &mut impl Write) -> io::Result<usize> {
+pub fn write_envelope(
+    record: &OutputRecord<'_>,
+    timestamp_format: TimestampFormat,
+    output: &mut impl Write,
+) -> io::Result<usize> {
+    // Reject unrepresentable dates before streaming any part of this envelope.
+    let iso_timestamp = match timestamp_format {
+        TimestampFormat::Milliseconds => None,
+        TimestampFormat::Iso8601 => record
+            .timestamp
+            .map(|timestamp| iso8601_datetime(timestamp.milliseconds))
+            .transpose()?,
+    };
     let mut written = 0;
     write_bytes(output, b"{\"topic\":", &mut written)?;
     write_json_string(output, record.topic, &mut written)?;
@@ -371,7 +393,27 @@ pub fn write_envelope(record: &OutputRecord<'_>, output: &mut impl Write) -> io:
     write_decimal(output, record.partition, &mut written)?;
     write_bytes(output, b",\"offset\":", &mut written)?;
     write_decimal(output, record.offset, &mut written)?;
-    write_timestamp(output, record.timestamp, &mut written)?;
+    if let Some(date) = iso_timestamp {
+        write_bytes(output, b",\"timestamp\":\"", &mut written)?;
+        write!(
+            &mut CountingWriter {
+                output,
+                written: &mut written
+            },
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            date.year(),
+            date.month(),
+            date.day(),
+            date.hour(),
+            date.minute(),
+            date.second(),
+            date.timestamp_subsec_millis()
+        )?;
+        write_bytes(output, b"\"", &mut written)?;
+        write_timestamp_type(output, record.timestamp, &mut written)?;
+    } else {
+        write_timestamp(output, record.timestamp, &mut written)?;
+    }
     write_bytes_fields(output, "key", record.key, &mut written)?;
     write_headers(output, record.headers, &mut written)?;
     write_bytes(output, b",\"action\":", &mut written)?;
@@ -388,6 +430,19 @@ pub fn write_envelope(record: &OutputRecord<'_>, output: &mut impl Write) -> io:
     Ok(written)
 }
 
+fn iso8601_datetime(milliseconds: i64) -> io::Result<DateTime<Utc>> {
+    DateTime::from_timestamp_millis(milliseconds)
+        .filter(|date| (0..=9999).contains(&date.year()))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Kafka timestamp {milliseconds} is outside the ISO 8601 year range 0000..=9999"
+                ),
+            )
+        })
+}
+
 fn write_timestamp(
     output: &mut impl Write,
     timestamp: Option<Timestamp>,
@@ -398,6 +453,14 @@ fn write_timestamp(
         Some(timestamp) => write_decimal(output, timestamp.milliseconds, written)?,
         None => write_bytes(output, b"null", written)?,
     }
+    write_timestamp_type(output, timestamp, written)
+}
+
+fn write_timestamp_type(
+    output: &mut impl Write,
+    timestamp: Option<Timestamp>,
+    written: &mut usize,
+) -> io::Result<()> {
     write_bytes(output, b",\"timestampType\":", written)?;
     match timestamp.map(|value| value.kind) {
         Some(TimestampType::CreateTime) => write_json_string(output, "createTime", written)?,
@@ -655,6 +718,83 @@ mod tests {
             br#"{"topic":"events","partition":3,"offset":42,"timestamp":null,"timestampType":null,"key":"/w==","keyEncoding":"base64","keyLength":1,"headers":[{"name":"trace","value":"/w==","valueEncoding":"base64","valueLength":1}],"action":"tombstone","payload":null,"payloadEncoding":null,"payloadLength":-1}
 "#
         );
+    }
+
+    #[test]
+    fn envelope_iso8601_changes_only_the_timestamp_representation() {
+        for (milliseconds, expected) in [
+            (0, "1970-01-01T00:00:00.000Z"),
+            (1, "1970-01-01T00:00:00.001Z"),
+            (120, "1970-01-01T00:00:00.120Z"),
+            (999, "1970-01-01T00:00:00.999Z"),
+            (1000, "1970-01-01T00:00:01.000Z"),
+            (-1, "1969-12-31T23:59:59.999Z"),
+            (-1000, "1969-12-31T23:59:59.000Z"),
+            (-1001, "1969-12-31T23:59:58.999Z"),
+            (-86_400_001, "1969-12-30T23:59:59.999Z"),
+            (951_782_400_007, "2000-02-29T00:00:00.007Z"),
+            (-2_203_891_200_000, "1900-03-01T00:00:00.000Z"),
+            (4_107_542_400_000, "2100-03-01T00:00:00.000Z"),
+            (-62_167_219_200_000, "0000-01-01T00:00:00.000Z"),
+            (253_402_300_799_999, "9999-12-31T23:59:59.999Z"),
+        ] {
+            for (kind, type_name) in [
+                (TimestampType::CreateTime, "createTime"),
+                (TimestampType::LogAppendTime, "logAppendTime"),
+            ] {
+                let record = OutputRecord {
+                    timestamp: Some(Timestamp { milliseconds, kind }),
+                    ..record(None, Payload::Tombstone)
+                };
+                let suffix = format!(
+                    ",\"timestampType\":\"{type_name}\",\"key\":null,\"keyEncoding\":null,\"keyLength\":-1,\"headers\":[],\"action\":\"tombstone\",\"payload\":null,\"payloadEncoding\":null,\"payloadLength\":-1}}\n"
+                );
+                let prefix = "{\"topic\":\"events\",\"partition\":3,\"offset\":42,\"timestamp\":";
+                assert_eq!(
+                    render_envelope(&record),
+                    format!("{prefix}{milliseconds}{suffix}").as_bytes()
+                );
+                let mut output = Vec::new();
+                let written =
+                    write_envelope(&record, TimestampFormat::Iso8601, &mut output).unwrap();
+                assert_eq!(output, format!("{prefix}\"{expected}\"{suffix}").as_bytes());
+                assert_eq!(written, output.len());
+            }
+        }
+    }
+
+    #[test]
+    fn envelope_iso8601_preserves_missing_timestamps() {
+        let record = record(None, Payload::Tombstone);
+        let mut output = Vec::new();
+        let written = write_envelope(&record, TimestampFormat::Iso8601, &mut output).unwrap();
+        assert_eq!(output, render_envelope(&record));
+        assert_eq!(written, output.len());
+    }
+
+    #[test]
+    fn envelope_iso8601_rejects_out_of_range_dates_before_writing() {
+        for milliseconds in [i64::MIN, -62_167_219_200_001, 253_402_300_800_000, i64::MAX] {
+            let record = OutputRecord {
+                timestamp: Some(Timestamp {
+                    milliseconds,
+                    kind: TimestampType::CreateTime,
+                }),
+                ..record(None, Payload::Tombstone)
+            };
+            let mut output = b"previous output".to_vec();
+            let error = write_envelope(&record, TimestampFormat::Iso8601, &mut output).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Kafka timestamp {milliseconds} is outside the ISO 8601 year range 0000..=9999"
+                )
+            );
+            assert_eq!(output, b"previous output");
+            let numeric = String::from_utf8(render_envelope(&record)).unwrap();
+            assert!(numeric.contains(&format!("\"timestamp\":{milliseconds},")));
+        }
     }
 
     #[test]

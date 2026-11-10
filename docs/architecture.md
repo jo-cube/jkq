@@ -256,6 +256,8 @@ bypass payload formatting, and `%L` continues to report the source payload lengt
 JSON envelope strings use simd-json's streaming serializer; output accounting
 and I/O error kinds, including broken pipe, are preserved. Broken pipe is normal
 pipeline termination.
+Optional ISO 8601 envelope timestamps are converted only by the writer, with
+range checks before streaming the envelope; source metadata remains numeric.
 For a JSON-value envelope, the writer inserts compact JSON bytes produced by
 the worker or projection and labels them with `payloadEncoding: "json"`.
 
