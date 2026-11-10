@@ -137,18 +137,20 @@ without supplying it evaluates as JSONata `Undefined`.
 
 For each non-tombstone input, `jkq`:
 
-1. evaluates repeated `--drop-if` predicates in command-line order, dropping
-   the record on the first `true`;
-2. evaluates repeated `--tombstone-if` predicates in command-line order,
-   tombstoning the record on the first `true`, or dropping it when
-   `--drop-tombstones` is set;
+1. evaluates `--drop-if` and `--drop-unless` predicates together in
+   command-line order, dropping the record on the first trigger;
+2. evaluates `--tombstone-if` and `--tombstone-unless` predicates together in
+   command-line order, tombstoning the record on the first trigger, or dropping
+   it when `--drop-tombstones` is set;
 3. applies the optional `--project` expression to surviving records;
 4. otherwise passes the source payload through, preserving its exact bytes
    unless `--envelope-payload value` is selected.
 
-Each predicate list stops at its first Boolean `true` result. The top-level
-result of an action predicate must be a JSONata Boolean; JSONata truthiness is
-not applied at this external boundary. By default, an existing Kafka tombstone
+All four options are repeatable. `if` triggers only on Boolean `true` and
+`unless` only on Boolean `false`; missing, null, and non-Boolean results are
+evaluation errors. Each stage stops at its first trigger, and the drop stage
+always runs before the tombstone stage. JSONata truthiness is not applied at
+this external boundary. By default, an existing Kafka tombstone
 bypasses JSON parsing, predicates, and projection. It remains a tombstone by default
 and is dropped when `--drop-tombstones` is set.
 

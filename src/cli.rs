@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use clap::{Parser, ValueEnum};
+use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches, Parser, ValueEnum};
 
 use crate::{
     output::{CompiledFormat, OutputRequirements},
     transform::{
-        TransformPlan, build_plan,
+        PredicateSource, TransformPlan, build_plan,
         jsonata::{ErrorPolicies, EvaluationPolicy, InvalidJsonPolicy},
     },
 };
@@ -55,12 +55,8 @@ pub struct RawCli {
     /// Capture startup high watermarks as fixed exclusive ends
     #[arg(long)]
     snapshot: bool,
-    /// Drop records when this JSONata predicate returns true; repeatable
-    #[arg(long)]
-    drop_if: Vec<String>,
-    /// Tombstone records when this JSONata predicate returns true; repeatable
-    #[arg(long)]
-    tombstone_if: Vec<String>,
+    #[command(flatten)]
+    predicates: PredicateArgs,
     /// Drop source and predicate-generated tombstones before projection
     #[arg(long)]
     drop_tombstones: bool,
@@ -147,6 +143,119 @@ pub struct RawCli {
     /// Validate local configuration and exit without connecting
     #[arg(long)]
     check: bool,
+}
+
+#[derive(Debug)]
+struct PredicateArgs {
+    drops: Vec<PredicateSource>,
+    tombstones: Vec<PredicateSource>,
+}
+
+impl Args for PredicateArgs {
+    fn augment_args(mut command: Command) -> Command {
+        for (id, flag, help) in [
+            (
+                "drop_if",
+                "drop-if",
+                "Drop records when this JSONata predicate returns Boolean true; repeatable",
+            ),
+            (
+                "drop_unless",
+                "drop-unless",
+                "Drop records when this JSONata predicate returns Boolean false; repeatable",
+            ),
+            (
+                "tombstone_if",
+                "tombstone-if",
+                "Tombstone records when this JSONata predicate returns Boolean true; repeatable",
+            ),
+            (
+                "tombstone_unless",
+                "tombstone-unless",
+                "Tombstone records when this JSONata predicate returns Boolean false; repeatable",
+            ),
+        ] {
+            command = command.arg(
+                Arg::new(id)
+                    .long(flag)
+                    .value_name("EXPR")
+                    .num_args(1)
+                    .action(ArgAction::Append)
+                    .value_parser(clap::value_parser!(String))
+                    .help(help),
+            );
+        }
+        command
+    }
+
+    fn augment_args_for_update(command: Command) -> Command {
+        Self::augment_args(command)
+    }
+}
+
+impl FromArgMatches for PredicateArgs {
+    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            drops: ordered_predicates(
+                matches,
+                [
+                    ("drop_if", true, "drop predicate"),
+                    ("drop_unless", false, "drop-unless predicate"),
+                ],
+            ),
+            tombstones: ordered_predicates(
+                matches,
+                [
+                    ("tombstone_if", true, "tombstone predicate"),
+                    ("tombstone_unless", false, "tombstone-unless predicate"),
+                ],
+            ),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), clap::Error> {
+        let updated = Self::from_arg_matches(matches)?;
+        if matches.contains_id("drop_if") || matches.contains_id("drop_unless") {
+            self.drops = updated.drops;
+        }
+        if matches.contains_id("tombstone_if") || matches.contains_id("tombstone_unless") {
+            self.tombstones = updated.tombstones;
+        }
+        Ok(())
+    }
+}
+
+fn ordered_predicates(
+    matches: &ArgMatches,
+    options: [(&str, bool, &str); 2],
+) -> Vec<PredicateSource> {
+    let mut predicates: Vec<_> = options
+        .into_iter()
+        .flat_map(|(id, trigger, category)| {
+            matches
+                .indices_of(id)
+                .into_iter()
+                .flatten()
+                .zip(matches.get_many::<String>(id).into_iter().flatten())
+                .enumerate()
+                .map(move |(ordinal, (position, source))| {
+                    (
+                        position,
+                        PredicateSource {
+                            source: source.clone(),
+                            trigger,
+                            origin: format!("{category} #{}", ordinal + 1),
+                        },
+                    )
+                })
+        })
+        .collect();
+    // clap retains each value's argv position even when option names differ.
+    predicates.sort_unstable_by_key(|(position, _)| *position);
+    predicates
+        .into_iter()
+        .map(|(_, predicate)| predicate)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -371,8 +480,8 @@ impl RawCli {
             })
             .transpose()?;
         let mut transform = build_plan(
-            &self.drop_if,
-            &self.tombstone_if,
+            &self.predicates.drops,
+            &self.predicates.tombstones,
             self.drop_tombstones,
             self.project.as_deref(),
             file_variables.as_deref().or(self.vars.as_deref()),
@@ -1009,6 +1118,34 @@ mod tests {
     }
 
     #[test]
+    fn mixed_predicate_compile_errors_identify_the_option_occurrence() {
+        for (if_flag, unless_flag, category) in [
+            ("--drop-if", "--drop-unless", "drop-unless predicate #2"),
+            (
+                "--tombstone-if",
+                "--tombstone-unless",
+                "tombstone-unless predicate #2",
+            ),
+        ] {
+            let error = resolve(&[
+                "jkq",
+                "-b",
+                "x",
+                "-t",
+                "t",
+                unless_flag,
+                "true",
+                if_flag,
+                "false",
+                unless_flag,
+                "(",
+            ])
+            .unwrap_err();
+            assert!(error.starts_with(&format!("{category} JSONata compile error")));
+        }
+    }
+
+    #[test]
     fn deferred_mode_separates_workers_json_and_metadata_requirements() {
         let identity = resolve(&[
             "jkq",
@@ -1308,6 +1445,14 @@ mod tests {
         assert!(help.contains("Number of Kafka consumers"));
         assert!(help.contains("--consumers <CONSUMERS>"));
         assert!(!help.contains("--jobs"));
+        for flag in [
+            "--drop-if",
+            "--drop-unless",
+            "--tombstone-if",
+            "--tombstone-unless",
+        ] {
+            assert!(help.contains(&format!("{flag} <EXPR>")));
+        }
         assert!(help.contains("Drop source and predicate-generated tombstones before projection"));
         assert!(help.contains("Strict JSON object available as $vars"));
         assert!(help.contains("Read the strict JSON object available as $vars from a file"));

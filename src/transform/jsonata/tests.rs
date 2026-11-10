@@ -1,12 +1,13 @@
 use super::*;
-use crate::transform::build_plan;
+use crate::transform::{PredicateSource, build_plan};
+use clap::Parser;
 
 const FAIL: ErrorPolicies = ErrorPolicies {
     invalid_json: InvalidJsonPolicy::Fail,
     evaluation: EvaluationPolicy::Fail,
 };
 
-fn plan(
+pub(super) fn plan(
     drops: &[&str],
     tombstones: &[&str],
     projection: Option<&str>,
@@ -14,20 +15,36 @@ fn plan(
     validate: bool,
 ) -> TransformPlan {
     build_plan(
-        &drops
-            .iter()
-            .map(|value| (*value).to_owned())
-            .collect::<Vec<_>>(),
-        &tombstones
-            .iter()
-            .map(|value| (*value).to_owned())
-            .collect::<Vec<_>>(),
+        &if_predicates(drops, "drop predicate"),
+        &if_predicates(tombstones, "tombstone predicate"),
         false,
         projection,
         variables,
         validate,
     )
     .unwrap()
+}
+
+fn if_predicates(sources: &[&str], category: &str) -> Vec<PredicateSource> {
+    sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| PredicateSource {
+            source: (*source).to_owned(),
+            trigger: true,
+            origin: format!("{category} #{}", index + 1),
+        })
+        .collect()
+}
+
+fn cli_plan(arguments: &[&str]) -> TransformPlan {
+    let mut command = vec!["jkq", "-b", "x", "-t", "events"];
+    command.extend_from_slice(arguments);
+    crate::cli::RawCli::try_parse_from(command)
+        .unwrap()
+        .resolve()
+        .unwrap()
+        .transform
 }
 
 fn run(plan: &TransformPlan, input: Option<&[u8]>) -> Result<Action, TransformError> {
@@ -112,6 +129,166 @@ fn repeated_predicates_short_circuit_in_command_line_order() {
 }
 
 #[test]
+fn mixed_if_unless_predicates_preserve_order_and_short_circuit() {
+    for (if_flag, unless_flag, action) in [
+        ("--drop-if", "--drop-unless", Action::Drop),
+        ("--tombstone-if", "--tombstone-unless", Action::Tombstone),
+    ] {
+        for (first, value, later) in [
+            (if_flag, "true", unless_flag),
+            (unless_flag, "false", if_flag),
+        ] {
+            let transform = cli_plan(&[
+                first,
+                value,
+                later,
+                "$error('unreachable')",
+                "--project",
+                "$error('unreachable')",
+            ]);
+            assert_eq!(run(&transform, Some(b"{}")).unwrap(), action);
+            let reversed = cli_plan(&[later, "$error('first')", first, value]);
+            assert!(
+                matches!(run(&reversed, Some(b"{}")), Err(TransformError::Evaluation {message,..}) if message.contains("first"))
+            );
+        }
+        let repeated = cli_plan(&[
+            unless_flag,
+            "true",
+            if_flag,
+            "false",
+            unless_flag,
+            "false",
+            unless_flag,
+            "$error('unreachable')",
+        ]);
+        assert_eq!(run(&repeated, Some(b"{}")).unwrap(), action);
+    }
+    let stages = cli_plan(&[
+        "--tombstone-unless",
+        "$error('tombstone stage')",
+        "--drop-unless",
+        "false",
+    ]);
+    assert_eq!(run(&stages, Some(b"{}")).unwrap(), Action::Drop);
+}
+
+#[test]
+fn predicate_polarity_uses_only_the_specified_boolean() {
+    for (flag, trigger, action) in [
+        ("--drop-if", true, Action::Drop),
+        ("--drop-unless", false, Action::Drop),
+        ("--tombstone-if", true, Action::Tombstone),
+        ("--tombstone-unless", false, Action::Tombstone),
+    ] {
+        for value in [false, true] {
+            let transform = cli_plan(&[flag, if value { "true" } else { "false" }]);
+            assert_eq!(
+                run(&transform, Some(b"{ }")).unwrap(),
+                if value == trigger {
+                    action.clone()
+                } else {
+                    Action::PassThrough(PassPayload::Exact(b"{ }".to_vec()))
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn unless_predicates_preserve_metadata_preparation_and_tombstone_rules() {
+    for (flag, action) in [
+        ("--drop-unless", Action::Drop),
+        ("--tombstone-unless", Action::Tombstone),
+    ] {
+        let eager = cli_plan(&[flag, "$meta.partition = 1"]);
+        assert!(matches!(
+            run(&eager, Some(b"\xff")),
+            Err(TransformError::InvalidJson(_))
+        ));
+        let deferred = cli_plan(&["--defer-json", flag, "$meta.partition = 1"]);
+        assert_eq!(run(&deferred, Some(b"\xff")).unwrap(), action);
+        let nontrigger = cli_plan(&["--defer-json", flag, "$meta.partition = 0"]);
+        assert_eq!(
+            run(&nontrigger, Some(b"\xff")).unwrap(),
+            Action::PassThrough(PassPayload::Exact(vec![0xff]))
+        );
+        let tombstone = cli_plan(&[
+            "--defer-json",
+            flag,
+            "$meta.isTombstone",
+            "--project",
+            "$meta.valueLength",
+        ]);
+        assert_eq!(
+            run(&tombstone, None).unwrap(),
+            Action::Project(b"-1".to_vec())
+        );
+        assert_eq!(run(&tombstone, Some(b"null")).unwrap(), action);
+        let dropped = cli_plan(&[
+            "--defer-json",
+            "--drop-tombstones",
+            flag,
+            "$error('unreachable')",
+        ]);
+        assert_eq!(run(&dropped, None).unwrap(), Action::Drop);
+    }
+    let dropped = cli_plan(&[
+        "--tombstone-unless",
+        "false",
+        "--drop-tombstones",
+        "--project",
+        "$error('unreachable')",
+    ]);
+    assert_eq!(run(&dropped, Some(b"{}")).unwrap(), Action::Drop);
+    let staged = cli_plan(&[
+        "--defer-json",
+        "--tombstone-unless",
+        "$meta.partition = 1",
+        "--drop-if",
+        "id = 2",
+    ]);
+    assert!(matches!(
+        run(&staged, Some(b"\xff")),
+        Err(TransformError::InvalidJson(_))
+    ));
+}
+
+#[test]
+fn mixed_predicate_errors_identify_the_option_occurrence() {
+    for (arguments, category) in [
+        (
+            vec![
+                "--drop-unless=true",
+                "--drop-if=false",
+                "--drop-unless=missing",
+            ],
+            "drop-unless predicate #2",
+        ),
+        (
+            vec!["--drop-if=false", "--drop-unless=true", "--drop-if=missing"],
+            "drop predicate #2",
+        ),
+        (
+            vec![
+                "--tombstone-unless=true",
+                "--tombstone-if=false",
+                "--tombstone-unless=missing",
+            ],
+            "tombstone-unless predicate #2",
+        ),
+    ] {
+        let transform = cli_plan(&arguments);
+        assert!(
+            run(&transform, Some(b"{}"))
+                .unwrap_err()
+                .to_string()
+                .starts_with(category)
+        );
+    }
+}
+
+#[test]
 fn action_predicates_require_boolean_results() {
     for expression in [
         "missing",
@@ -124,31 +301,46 @@ fn action_predicates_require_boolean_results() {
         "$sum",
         "/x/",
     ] {
-        let transform = plan(&[expression], &[], None, None, false);
-        let error = run(&transform, Some(b"{}")).unwrap_err();
-        assert!(
-            error.to_string().contains("result must be a Boolean"),
-            "{expression}: {error}"
-        );
+        for flag in [
+            "--drop-if",
+            "--drop-unless",
+            "--tombstone-if",
+            "--tombstone-unless",
+        ] {
+            let transform = cli_plan(&[flag, expression]);
+            let error = run(&transform, Some(b"{}")).unwrap_err();
+            assert!(
+                error.to_string().contains("result must be a Boolean"),
+                "{flag} {expression}: {error}"
+            );
+        }
     }
 }
 
 #[test]
 fn source_tombstones_bypass_evaluation() {
-    let transform = plan(
-        &["$error(\"must not run\")"],
-        &[],
-        Some("missing"),
-        None,
-        false,
-    );
-    assert_eq!(run(&transform, None).unwrap(), Action::Tombstone);
+    for flag in [
+        "--drop-if",
+        "--drop-unless",
+        "--tombstone-if",
+        "--tombstone-unless",
+    ] {
+        let transform = cli_plan(&[flag, "$error('must not run')", "--project", "missing"]);
+        assert_eq!(run(&transform, None).unwrap(), Action::Tombstone);
+    }
 }
 
 #[test]
 fn drop_tombstones_applies_before_projection() {
-    let transform =
-        build_plan(&[], &["deleted".to_owned()], true, Some("id"), None, false).unwrap();
+    let transform = build_plan(
+        &[],
+        &if_predicates(&["deleted"], "tombstone predicate"),
+        true,
+        Some("id"),
+        None,
+        false,
+    )
+    .unwrap();
 
     assert_eq!(run(&transform, None).unwrap(), Action::Drop);
     assert_eq!(
@@ -160,7 +352,15 @@ fn drop_tombstones_applies_before_projection() {
         Action::Project(b"1".to_vec())
     );
 
-    let transform = build_plan(&[], &["deleted".to_owned()], true, None, None, false).unwrap();
+    let transform = build_plan(
+        &[],
+        &if_predicates(&["deleted"], "tombstone predicate"),
+        true,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(
         run(&transform, Some(br#"{"deleted":true}"#)).unwrap(),
         Action::Drop
@@ -198,8 +398,13 @@ fn invalid_json_policies_preserve_exact_pass_bytes() {
 
 #[test]
 fn evaluation_errors_and_undefined_follow_policy() {
-    for projection in ["$error(\"failure\")", "missing"] {
-        let transform = plan(&[], &[], Some(projection), None, false);
+    let mut transforms: Vec<_> = ["$error(\"failure\")", "missing"]
+        .into_iter()
+        .map(|projection| plan(&[], &[], Some(projection), None, false))
+        .collect();
+    transforms
+        .extend(["--drop-unless", "--tombstone-unless"].map(|flag| cli_plan(&[flag, "missing"])));
+    for transform in transforms {
         for (policy, expected) in [
             (EvaluationPolicy::Drop, Action::Drop),
             (EvaluationPolicy::Tombstone, Action::Tombstone),
@@ -647,13 +852,20 @@ fn scalar_predicates_use_native_paths_comparisons_and_boolean_rules() {
 
 #[test]
 fn validation_precedes_short_circuit_actions_and_user_errors() {
-    for predicate in ["true", r#"$error("must not run")"#] {
-        let transform = plan(&[predicate], &[], None, None, false);
-        for input in [br#"{"ignored":}"#.as_slice(), b"{} trailing", b"{\xff}"] {
-            assert!(matches!(
-                run(&transform, Some(input)),
-                Err(TransformError::InvalidJson(_))
-            ));
+    for (flag, trigger) in [
+        ("--drop-if", "true"),
+        ("--drop-unless", "false"),
+        ("--tombstone-if", "true"),
+        ("--tombstone-unless", "false"),
+    ] {
+        for predicate in [trigger, r#"$error("must not run")"#] {
+            let transform = cli_plan(&[flag, predicate]);
+            for input in [br#"{"ignored":}"#.as_slice(), b"{} trailing", b"{\xff}"] {
+                assert!(matches!(
+                    run(&transform, Some(input)),
+                    Err(TransformError::InvalidJson(_))
+                ));
+            }
         }
     }
 }
@@ -724,18 +936,29 @@ fn predicates_require_one_complete_boolean_result() {
     for expression in [
         "items.flag",
         r#"items.(flag ? true : $error("late predicate"))"#,
+        r#"items.(flag ? false : $error("late predicate"))"#,
     ] {
-        let transform = plan(&[expression], &[], None, None, false);
-        let error = run(
-            &transform,
-            Some(br#"{"items":[{"flag":true},{"flag":false}]}"#),
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .starts_with("drop predicate #1 evaluation error")
-        );
+        for (flag, category) in [
+            ("--drop-if", "drop predicate"),
+            ("--drop-unless", "drop-unless predicate"),
+            ("--tombstone-if", "tombstone predicate"),
+            ("--tombstone-unless", "tombstone-unless predicate"),
+        ] {
+            let transform = cli_plan(&[flag, expression]);
+            let error = run(
+                &transform,
+                Some(br#"{"items":[{"flag":true},{"flag":false}]}"#),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("{category} #1 evaluation error"))
+            );
+            if expression.contains("$error") {
+                assert!(error.to_string().contains("late predicate"));
+            }
+        }
     }
     for (drops, tombstones, category) in [
         (

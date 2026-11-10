@@ -162,8 +162,12 @@ immutable `$vars` reads can participate in those captures. There is no tape,
 mutable parsing copy, worker AST compilation, input tree, or jkq acquisition
 cache or fallback evaluator. jx owns acquisition and expression semantics.
 
-Predicates run in command-line order and require exactly one Boolean result.
-Drop and tombstone actions short-circuit later expressions. Projection consumes
+Each compiled predicate retains its trigger Boolean and diagnostic origin.
+Clap value positions merge mixed `if`/`unless` occurrences in command-line
+order within each stage; the drop stage precedes the tombstone stage. One
+evaluation path requires exactly one Boolean and compares it with the trigger,
+without rewriting the expression. Drop and tombstone actions short-circuit
+later expressions. Projection consumes
 all results before publishing a completion: no results are an error, one
 result is one JSON value, and multiple results form one array payload. Explicit
 arrays remain single values. Lazy evaluation and serialization failures follow
@@ -188,8 +192,8 @@ and missing-value behavior.
 
 By default, existing Kafka tombstones bypass all JSONata work. They remain
 tombstones unless `--drop-tombstones` is set. Records selected by
-`--tombstone-if` follow the same option before projection. An identity
-transform also bypasses parsing unless `--on-invalid-json` was supplied
+`--tombstone-if` or `--tombstone-unless` follow the same option before
+projection. An identity transform also bypasses parsing unless `--on-invalid-json` was supplied
 explicitly or a JSON-value envelope was requested.
 
 ### Metadata and Deferred Preparation

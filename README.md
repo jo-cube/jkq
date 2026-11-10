@@ -11,7 +11,7 @@ processing without validating payload JSON. See the [expression contract](docs/e
 
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \
-  --drop-if 'environment != "production"' \
+  --drop-unless 'environment = "production"' \
   --project '{"id": id, "total": $sum(items.price)}' \
   -f '%p\t%o\t%R%s\n'
 ```
@@ -26,8 +26,8 @@ A successfully processed input record produces one of four actions:
 
 Kafka tombstones bypass JSON parsing and expression evaluation and remain
 tombstones by default. `--drop-tombstones` drops them, as well as records
-selected by `--tombstone-if`, before projection. Records stay in source order
-within each partition by default; there is no global order across partitions.
+selected by `--tombstone-if` or `--tombstone-unless`, before projection. Records
+stay in source order within each partition by default; there is no global order across partitions.
 
 Admission limits bound source work, rather than total process memory. Native
 Kafka batches, JSONata intermediates, and expanded output remain outside that

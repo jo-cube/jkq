@@ -29,11 +29,11 @@ without creating a Kafka consumer.
 For each non-tombstone input record that needs JSON, `jkq` validates the
 payload and:
 
-1. evaluates `--drop-if` expressions in command-line order, dropping the
-   record at the first Boolean `true`;
-2. evaluates `--tombstone-if` expressions in command-line order, tombstoning
-   the record at the first Boolean `true`, or dropping it when
-   `--drop-tombstones` is set;
+1. evaluates `--drop-if` and `--drop-unless` expressions together in
+   command-line order, dropping the record at the first trigger;
+2. evaluates `--tombstone-if` and `--tombstone-unless` expressions together
+   in command-line order, tombstoning the record at the first trigger, or
+   dropping it when `--drop-tombstones` is set;
 3. evaluates `--project` for surviving records, when present;
 4. otherwise passes through the source payload, preserving its exact bytes
    unless `--envelope-payload value` requests compact JSON serialization.
@@ -109,10 +109,35 @@ source copying, admission accounting, and ownership until completion.
 
 ## Action Predicates
 
-The top-level result of `--drop-if` and `--tombstone-if` must be the JSONata
-Boolean `true` or `false`. `Undefined`, null, numbers, strings, arrays,
-objects, functions, and regular expressions are evaluation errors governed by
-`--on-eval-error`.
+All four action predicates require exactly one JSONata Boolean result:
+
+| Option | Triggers on |
+|---|---|
+| `--drop-if`, `--tombstone-if` | Boolean `true` |
+| `--drop-unless`, `--tombstone-unless` | Boolean `false` |
+
+Missing, null, numbers, strings, arrays, objects, functions, and regular
+expressions are evaluation errors governed by `--on-eval-error`; `unless`
+does not coerce them to false. Expressions are compiled directly without
+rewriting through `$not`.
+
+All options are repeatable. Mixed `if`/`unless` occurrences retain command-line
+order within their action stage and stop at the first trigger. The drop stage
+always precedes the tombstone stage, regardless of interleaving on the command
+line. A trigger skips remaining predicates and projection. `--drop-tombstones`
+also drops records selected by either tombstone option. Metadata access,
+deferred preparation, and source tombstone defaults are identical for both
+polarities.
+
+```sh
+--drop-unless 'environment = "production"' \
+  --drop-if 'disabled = true' \
+  --tombstone-unless 'retained = true'
+```
+
+Compile and evaluation diagnostics identify each option's occurrence number,
+for example `drop-unless predicate #2`. Existing `if` diagnostics retain
+`drop predicate #N` and `tombstone predicate #N` labels.
 
 This strict embedding boundary applies only to the final action result. Native
 JSONata effective-Boolean rules still apply inside path filters, conditionals,

@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    output::{Header, Timestamp, TimestampType},
-    transform::build_plan,
-};
+use crate::output::{Header, Timestamp, TimestampType};
 
 const FAIL: ErrorPolicies = ErrorPolicies {
     invalid_json: InvalidJsonPolicy::Fail,
@@ -10,18 +7,13 @@ const FAIL: ErrorPolicies = ErrorPolicies {
 };
 
 fn make_plan(drops: &[&str], tombstones: &[&str], projection: Option<&str>) -> TransformPlan {
-    let mut plan = build_plan(
-        &drops.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
-        &tombstones
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect::<Vec<_>>(),
-        false,
+    let mut plan = super::tests::plan(
+        drops,
+        tombstones,
         projection,
         Some(r#"{"code":"$meta.offset","n":7}"#),
         false,
-    )
-    .unwrap();
+    );
     plan.defer_json = true;
     plan
 }

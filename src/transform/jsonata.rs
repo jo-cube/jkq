@@ -125,12 +125,18 @@ impl<'a> Worker<'a> {
             };
             // The closure runs once, only if a reached expression can refer to $meta.
             let meta = LazyCell::new(|| prepare_metadata(&mut self.metadata, metadata));
-            for (index, expression) in self
+            for (index, (expression, predicate)) in self
                 .plan
                 .drops
                 .iter()
                 .chain(&self.plan.tombstones)
-                .chain(&self.plan.projection)
+                .map(|predicate| (&predicate.expression, Some(predicate)))
+                .chain(
+                    self.plan
+                        .projection
+                        .iter()
+                        .map(|expression| (expression, None)),
+                )
                 .enumerate()
             {
                 if input.is_none()
@@ -142,25 +148,14 @@ impl<'a> Worker<'a> {
                         .map_err(|error| TransformError::InvalidJson(error.to_string()))?;
                 }
                 let meta = self.plan.uses_metadata(index).then(|| *meta);
-                if index < self.plan.drops.len() + self.plan.tombstones.len() {
-                    let (category, position) = if index < self.plan.drops.len() {
-                        ("drop predicate", index)
-                    } else {
-                        ("tombstone predicate", index - self.plan.drops.len())
-                    };
+                if let Some(predicate) = predicate {
                     let value = evaluate(expression, input.as_ref(), index, meta)
                         .and_then(Evaluation::single)
-                        .map_err(|error| {
-                            evaluation_error(category, Some(position), error.to_string())
-                        })?;
+                        .map_err(|error| evaluation_error(&predicate.origin, error.to_string()))?;
                     let matched = value.as_ref().and_then(jx::Value::as_bool).ok_or_else(|| {
-                        evaluation_error(
-                            category,
-                            Some(position),
-                            "result must be a Boolean".to_owned(),
-                        )
+                        evaluation_error(&predicate.origin, "result must be a Boolean".to_owned())
                     })?;
-                    if matched {
+                    if matched == predicate.trigger {
                         return Ok(Some(
                             if index < self.plan.drops.len() || self.plan.drop_tombstones {
                                 Action::Drop
@@ -182,11 +177,10 @@ impl<'a> Worker<'a> {
                             .map_err(jx::ConsumeError::Evaluation)
                             .and_then(|evaluation| evaluation.write_json(&mut self.output)),
                     }
-                    .map_err(|error| evaluation_error("projection", None, error.to_string()))?;
+                    .map_err(|error| evaluation_error("projection", error.to_string()))?;
                     if !present {
                         return Err(evaluation_error(
                             "projection",
-                            None,
                             "projection emitted no results".to_owned(),
                         ));
                     }
@@ -208,9 +202,7 @@ impl<'a> Worker<'a> {
                     .expect("prepared envelope payload")
                     .as_raw()
                     .write_compact(&mut self.output)
-                    .map_err(|error| {
-                        evaluation_error("envelope payload", None, error.to_string())
-                    })?;
+                    .map_err(|error| evaluation_error("envelope payload", error.to_string()))?;
             }
             Ok(None)
         })();
@@ -354,12 +346,9 @@ fn invalid_json(
     }
 }
 
-fn evaluation_error(category: &str, index: Option<usize>, message: String) -> TransformError {
+fn evaluation_error(category: &str, message: String) -> TransformError {
     TransformError::Evaluation {
-        category: index.map_or_else(
-            || category.to_owned(),
-            |index| format!("{category} #{}", index + 1),
-        ),
+        category: category.to_owned(),
         message,
     }
 }
@@ -371,8 +360,12 @@ fn execute(
     policies: ErrorPolicies,
 ) -> Result<Action, TransformError> {
     let input_plan = plan.input_plan();
+    let metadata = SourceMetadata {
+        value_length: payload.as_ref().map(Vec::len),
+        ..test_metadata()
+    };
     Worker::new(plan, &input_plan, false, usize::MAX)
-        .execute_report(&mut payload, &test_metadata(), policies)
+        .execute_report(&mut payload, &metadata, policies)
         .map(|execution| execution.action)
 }
 
