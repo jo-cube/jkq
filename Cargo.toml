@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 crossbeam-channel = "0.5.16"
-jx = { git = "https://github.com/jo-cube/jx.git", rev = "fb187d80a88e3f6b72491e0b49b6d7976b2abdfa" }
+jx = { git = "https://github.com/jo-cube/jx.git", tag = "v0.2.0" }
 rdkafka = { version = "0.39.0", default-features = false, features = ["libz", "ssl-vendored", "zstd"] }
 signal-hook = "0.4.4"
 simd-json = "=0.17.3"

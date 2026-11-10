@@ -6,6 +6,8 @@ Kafka metadata and tombstones, and streams record data to stdout with
 predictable per-partition ordering.
 
 Filtering and projection expressions use [JSONata](https://jsonata.org/).
+Source metadata is available as `$meta`; opt-in `--defer-json` allows metadata-only
+processing without validating payload JSON. See the [expression contract](docs/expression-language.md#source-metadata-and-deferred-json).
 
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \

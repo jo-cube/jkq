@@ -80,7 +80,7 @@ fn json_value_pass_compacts_payload_and_retains_source_length() {
     let source = b"{\n  \"a\": 1\n}";
     let input_plan = transform.input_plan();
     let execution = Worker::new(&transform, &input_plan, true, usize::MAX)
-        .execute_report(&mut Some(source.to_vec()), FAIL)
+        .execute_report(&mut Some(source.to_vec()), &test_metadata(), FAIL)
         .unwrap();
 
     assert_eq!(
@@ -183,6 +183,7 @@ fn invalid_json_policies_preserve_exact_pass_bytes() {
         let result = Worker::new(&transform, &input_plan, false, usize::MAX)
             .execute_report(
                 &mut Some(invalid.clone()),
+                &test_metadata(),
                 ErrorPolicies {
                     invalid_json: policy,
                     evaluation: EvaluationPolicy::Fail,
@@ -207,6 +208,7 @@ fn evaluation_errors_and_undefined_follow_policy() {
             let result = Worker::new(&transform, &input_plan, false, usize::MAX)
                 .execute_report(
                     &mut Some(b"{}".to_vec()),
+                    &test_metadata(),
                     ErrorPolicies {
                         invalid_json: InvalidJsonPolicy::Fail,
                         evaluation: policy,
@@ -361,7 +363,7 @@ fn nested_vars_and_lookup_are_shared_across_record_actions() {
     ] {
         assert_eq!(
             worker
-                .execute_report(&mut Some(input.as_bytes().to_vec()), FAIL)
+                .execute_report(&mut Some(input.as_bytes().to_vec()), &test_metadata(), FAIL)
                 .unwrap()
                 .action,
             expected,
@@ -388,7 +390,11 @@ fn vars_shadowing_closures_and_eval_keep_native_lexical_state() {
         for _ in 0..3 {
             assert_eq!(
                 worker
-                    .execute_report(&mut Some(br#"{"code":"$vars.n"}"#.to_vec()), FAIL)
+                    .execute_report(
+                        &mut Some(br#"{"code":"$vars.n"}"#.to_vec()),
+                        &test_metadata(),
+                        FAIL
+                    )
                     .unwrap()
                     .action,
                 Action::Project(expected.as_bytes().to_vec()),
@@ -409,7 +415,7 @@ fn evaluator_root_and_assignments_do_not_leak_between_records() {
     ] {
         assert_eq!(
             worker
-                .execute_report(&mut Some(input.to_vec()), FAIL)
+                .execute_report(&mut Some(input.to_vec()), &test_metadata(), FAIL)
                 .unwrap()
                 .action,
             Action::Project(expected.to_vec())
@@ -480,6 +486,7 @@ fn late_projection_failures_never_publish_partial_results() {
             let mut worker = Worker::new(&transform, &input_plan, false, usize::MAX);
             let result = worker.execute_report(
                 &mut Some(bad.to_vec()),
+                &test_metadata(),
                 ErrorPolicies {
                     evaluation: policy,
                     ..FAIL
@@ -507,7 +514,11 @@ fn late_projection_failures_never_publish_partial_results() {
             assert!(worker.output.is_empty());
             assert_eq!(
                 worker
-                    .execute_report(&mut Some(br#"{"items":[{"v":4}]}"#.to_vec()), FAIL)
+                    .execute_report(
+                        &mut Some(br#"{"items":[{"v":4}]}"#.to_vec()),
+                        &test_metadata(),
+                        FAIL
+                    )
                     .unwrap()
                     .action,
                 Action::Project(expected.as_bytes().to_vec())
@@ -530,7 +541,11 @@ fn expression_bindings_assignments_and_roots_are_independent() {
     for id in [1, 2, 1] {
         assert_eq!(
             worker
-                .execute_report(&mut Some(format!(r#"{{"id":{id}}}"#).into_bytes()), FAIL)
+                .execute_report(
+                    &mut Some(format!(r#"{{"id":{id}}}"#).into_bytes()),
+                    &test_metadata(),
+                    FAIL
+                )
                 .unwrap()
                 .action,
             Action::Project(format!(r#"{{"id":{id},"tenant":"acme"}}"#).into_bytes())
@@ -654,7 +669,7 @@ fn compact_serialization_preserves_borrowed_tokens_and_native_results() {
     let transform = plan(&[], &[], None, None, true);
     let input_plan = transform.input_plan();
     let result = Worker::new(&transform, &input_plan, true, usize::MAX)
-        .execute_report(&mut Some(input.to_vec()), FAIL)
+        .execute_report(&mut Some(input.to_vec()), &test_metadata(), FAIL)
         .unwrap();
     assert_eq!(
         result.action,
@@ -696,7 +711,7 @@ fn evaluated_pass_preserves_every_source_byte() {
     for _ in 0..2 {
         assert_eq!(
             worker
-                .execute_report(&mut Some(source.to_vec()), FAIL)
+                .execute_report(&mut Some(source.to_vec()), &test_metadata(), FAIL)
                 .unwrap()
                 .action,
             Action::PassThrough(PassPayload::Exact(source.to_vec()))
@@ -774,7 +789,11 @@ fn shared_nested_paths_preserve_actions_duplicates_missing_and_arrays() {
     ] {
         assert_eq!(
             worker
-                .execute_report(&mut Some(source.as_bytes().to_vec()), FAIL)
+                .execute_report(
+                    &mut Some(source.as_bytes().to_vec()),
+                    &test_metadata(),
+                    FAIL
+                )
                 .unwrap()
                 .action,
             expected,
@@ -822,7 +841,7 @@ fn shared_predicates_and_json_value_pass_serialize_the_complete_root() {
     let input_plan = transform.input_plan();
     let source = br#" { "id":1, "id":2, "deleted":false, "unused": [3, 4] } "#;
     let result = Worker::new(&transform, &input_plan, true, usize::MAX)
-        .execute_report(&mut Some(source.to_vec()), FAIL)
+        .execute_report(&mut Some(source.to_vec()), &test_metadata(), FAIL)
         .unwrap();
     assert_eq!(
         result.action,
@@ -843,7 +862,10 @@ fn projection_recycles_source_storage_without_retaining_oversized_capacity() {
         bytes.extend_from_slice(br#"{"id":1}"#);
         let mut source = Some(bytes);
         assert_eq!(
-            worker.execute_report(&mut source, FAIL).unwrap().action,
+            worker
+                .execute_report(&mut source, &test_metadata(), FAIL)
+                .unwrap()
+                .action,
             Action::Project(b"1".to_vec())
         );
         assert!(source.is_none());
@@ -892,8 +914,11 @@ fn unused_source_storage_survives_actions_and_evaluation_failures() {
         let transform = plan(&drops, &tombstones, projection, None, false);
         let input_plan = transform.input_plan();
         let mut source = Some(source_bytes.to_vec());
-        let _ =
-            Worker::new(&transform, &input_plan, false, 128).execute_report(&mut source, policies);
+        let _ = Worker::new(&transform, &input_plan, false, 128).execute_report(
+            &mut source,
+            &test_metadata(),
+            policies,
+        );
         assert_eq!(source.as_deref(), Some(source_bytes));
     }
 }
@@ -919,6 +944,7 @@ fn failed_projection_releases_oversized_output_scratch() {
     let execution = worker
         .execute_report(
             &mut source,
+            &test_metadata(),
             ErrorPolicies {
                 invalid_json: InvalidJsonPolicy::Fail,
                 evaluation: EvaluationPolicy::Drop,

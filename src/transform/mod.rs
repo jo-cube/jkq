@@ -4,7 +4,8 @@ pub mod jsonata;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanCapabilities {
-    pub parses_json: bool,
+    pub needs_worker: bool,
+    pub metadata: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -14,9 +15,15 @@ pub struct TransformPlan {
     pub drop_tombstones: bool,
     pub projection: Option<Expression>,
     pub capabilities: PlanCapabilities,
+    pub defer_json: bool,
+    metadata_bindings: Vec<bool>,
 }
 
 impl TransformPlan {
+    pub fn uses_metadata(&self, index: usize) -> bool {
+        self.metadata_bindings[index]
+    }
+
     pub fn input_plan(&self) -> InputPlan<'_> {
         InputPlan::new(
             self.drops
@@ -58,6 +65,16 @@ pub fn build_plan(
             })
             .collect::<Result<Vec<_>, _>>()
     };
+    // Binding names are unescaped in JSONata. Include dynamic evaluation and
+    // tolerate false positives (including strings/comments); this only avoids
+    // adding a lexical frame to expressions that cannot refer to $meta.
+    let metadata_bindings: Vec<_> = drops
+        .iter()
+        .chain(tombstones)
+        .map(String::as_str)
+        .chain(projection)
+        .map(uses_metadata)
+        .collect();
     Ok(TransformPlan {
         drops: predicates(drops, "drop predicate")?,
         tombstones: predicates(tombstones, "tombstone predicate")?,
@@ -66,11 +83,14 @@ pub fn build_plan(
             .map(|source| compile_expression(&options, source, "projection"))
             .transpose()?,
         capabilities: PlanCapabilities {
-            parses_json: force_json_validation
+            needs_worker: force_json_validation
                 || !drops.is_empty()
                 || !tombstones.is_empty()
                 || projection.is_some(),
+            metadata: metadata_bindings.iter().any(|&used| used),
         },
+        defer_json: false,
+        metadata_bindings,
     })
 }
 
@@ -79,9 +99,18 @@ fn compile_expression(
     source: &str,
     category: &str,
 ) -> Result<Expression, String> {
+    let options = if uses_metadata(source) {
+        options.clone().binding("meta")
+    } else {
+        options.clone()
+    };
     options
         .compile(source)
         .map_err(|error| format!("{category} JSONata compile error: {error}"))
+}
+
+fn uses_metadata(source: &str) -> bool {
+    source.contains("$meta") || source.contains("$eval")
 }
 
 #[cfg(test)]
@@ -143,13 +172,13 @@ mod tests {
             !build_plan(&[], &[], false, None, None, false)
                 .unwrap()
                 .capabilities
-                .parses_json
+                .needs_worker
         );
         assert!(
             build_plan(&[], &[], false, None, None, true)
                 .unwrap()
                 .capabilities
-                .parses_json
+                .needs_worker
         );
     }
 }

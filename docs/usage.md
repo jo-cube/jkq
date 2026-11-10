@@ -148,8 +148,8 @@ For each non-tombstone input, `jkq`:
 
 Each predicate list stops at its first Boolean `true` result. The top-level
 result of an action predicate must be a JSONata Boolean; JSONata truthiness is
-not applied at this external boundary. An existing Kafka tombstone bypasses
-JSON parsing, predicates, and projection. It remains a tombstone by default
+not applied at this external boundary. By default, an existing Kafka tombstone
+bypasses JSON parsing, predicates, and projection. It remains a tombstone by default
 and is dropped when `--drop-tombstones` is set.
 
 Projection results use native jx compact JSON serialization. Zero emitted
@@ -158,6 +158,21 @@ are evaluation errors. A result sequence with multiple items is one JSON array
 payload, never multiple output records. See [expression-language.md](expression-language.md)
 for the complete jkq-to-JSONata integration contract and links to the language
 reference.
+
+`$meta` exposes source topic, partition, exact decimal-string offset, timestamp
+and type, binary-safe key and headers, original `valueLength`, and
+`isTombstone`, without replacing the payload root. Use `--defer-json` to run
+proven input-independent predicates and projections before preparing JSON,
+including over non-JSON values and source tombstones. `--drop-tombstones`
+still takes precedence. This mode changes validation and error ordering;
+see [source metadata and deferred JSON](expression-language.md#source-metadata-and-deferred-json)
+for field encodings, absent-input semantics, and error-policy details.
+
+```sh
+jkq -b localhost:9092 -t events --snapshot --defer-json \
+  --drop-if '$meta.partition = 2' \
+  --project '{"offset": $meta.offset, "bytes": $meta.valueLength}'
+```
 
 ## Output
 
@@ -309,9 +324,9 @@ source payload contents, but native messages deliberately produced by JSONata
 expressions, such as `$error()` and `$assert()` messages, are preserved and may
 contain record data.
 
-When `--on-invalid-json` is omitted and no expression needs JSON, the identity
-path does not parse payloads. Supplying the option explicitly forces JSON
-validation, including for an otherwise identity transform.
+Without `--defer-json`, when `--on-invalid-json` is omitted and no expression
+needs JSON, the identity path does not parse payloads. Supplying the option
+explicitly forces JSON validation, including for an otherwise identity transform.
 
 ## Kafka Configuration
 

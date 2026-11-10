@@ -268,7 +268,7 @@ impl KafkaInput {
             partitions,
             remaining_partitions,
             max_inflight_per_partition: assignment.max_inflight_per_partition,
-            requirements: config.output.requirements(),
+            requirements: config.requirements(),
             exit_at_end: config.exit_at_end,
             error_policy: config.kafka_error,
             quiet: config.quiet,

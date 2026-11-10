@@ -111,6 +111,50 @@ fn broken_pipe_is_quiet_success() {
 }
 
 #[test]
+fn deferred_metadata_processes_invalid_payloads_before_payload_errors() {
+    let fixture = Fixture::new("deferred-process");
+    fixture.produce(b"not JSON");
+    fixture.produce(br#"{"id":1}"#);
+    let child = fixture
+        .command()
+        .args([
+            "--snapshot",
+            "--defer-json",
+            "--on-invalid-json",
+            "fail",
+            "--drop-if",
+            "$meta.offset = '0'",
+            "--drop-if",
+            "id = 2",
+            "--project",
+            "[$meta.offset,id]",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = wait(child);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"[\"1\",1]\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let child = fixture
+        .command()
+        .args(["--snapshot", "--project", "$meta.offset"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = wait(child);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("invalid JSON")
+    );
+}
+
+#[test]
 fn check_validates_locally_without_connecting() {
     let child = Command::new(env!("CARGO_BIN_EXE_jkq"))
         .args([

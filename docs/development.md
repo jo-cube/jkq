@@ -57,13 +57,12 @@ CI runs the same checks.
 
 ## jx dependency
 
-The normal dependency pins the merged upstream jx implementation by immutable
-Git revision. Its public compiler uses the common semantic IR; no backend flag,
-source patch or local path is needed. Cargo.lock must resolve the same revision.
-A separate jx release or tag is not required.
+The normal dependency selects the published jx `v0.2.0` Git tag; `Cargo.lock`
+pins its exact source revision. Its public compiler uses the common semantic IR;
+no backend flag, source patch or local path is needed. Published tags must not move.
 
-When updating the pin, verify that the commit is reachable from upstream main,
-fetch it from GitHub in a clean Cargo Git cache, and run `make check` and a release
+When updating the tag, verify that it resolves to the reviewed commit on upstream
+main, fetch it from GitHub in a clean Cargo Git cache, and run `make check` and a release
 build without local overrides. Regenerate notices and verify release archives
 before releasing jkq.
 

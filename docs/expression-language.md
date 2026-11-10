@@ -42,11 +42,70 @@ Workers validate each payload once into a borrowed `jx::RawJson` and reuse it
 across expressions without constructing a JSON tree; see
 [expression execution](architecture.md#expression-execution).
 
-Existing Kafka tombstones bypass JSON parsing and every expression. A
-source tombstone remains a tombstone by default and is dropped when
+By default, existing Kafka tombstones bypass JSON parsing and every expression.
+A source tombstone remains a tombstone by default and is dropped when
 `--drop-tombstones` is set. A successfully evaluated input record produces one
 action; a JSONata result sequence never expands into multiple jkq output
 records.
+
+## Source Metadata and Deferred JSON
+
+`$meta` is an evaluation-local lexical binding. Bare paths, `$`, and `$$` keep
+referring to the payload. Each predicate and projection receives a fresh
+binding; local assignments, parameters, closures, and `$eval` follow normal
+JSONata lexical rules. `$vars` remains an immutable compile-time binding.
+
+| Field | Representation |
+|---|---|
+| `topic`, `partition` | source topic string and partition number |
+| `offset` | canonical decimal **string**, preserving all signed 64-bit offsets |
+| `timestamp` | Unix milliseconds, or JSON null when unavailable |
+| `timestampType` | `"createTime"`, `"logAppendTime"`, or JSON null |
+| `key`, `keyEncoding`, `keyLength` | same binary-safe fields as the JSON envelope |
+| `headers` | ordered array of `{name, value, valueEncoding, valueLength}`; duplicate names retained |
+| `valueLength` | original payload byte length; `-1` for a source tombstone, `0` for empty bytes |
+| `isTombstone` | whether the source value was Kafka null, regardless of subsequent actions |
+
+Keys and header values are UTF-8 strings with encoding `"utf8"` or padded
+base64 strings with encoding `"base64"`. A null byte value has JSON null value
+and encoding, and length `-1`; an empty value is `""`, `"utf8"`, and `0`.
+Missing fields produce JSONata `Undefined`. Offset string equality is exact;
+string ordering is lexicographic. Explicit `$number($meta.offset)` uses
+JSONata binary64 arithmetic and may lose precision above 2^53.
+
+```sh
+--defer-json --drop-if '$meta.partition = 2' \
+  --project '{"offset": $meta.offset, "length": $meta.valueLength}'
+```
+
+Without `--defer-json`, non-null payloads that need evaluation are validated
+before any expression, and source tombstones bypass every expression.
+`--defer-json` changes that contract explicitly:
+
+- Reached expressions proven independent of the original focus and root run
+  without input preparation, even over malformed JSON or arbitrary bytes.
+- The first reached expression that may need input prepares the complete
+  non-null payload once, shared across remaining expressions. Proof is
+  conservative: uncertain closures, dynamic evaluation, and unsupported cases
+  may require preparation even if they only use metadata in practice.
+  A mixed payload/metadata expression is prepared as a unit; short-circuiting
+  inside that expression does not defer preparation of its payload.
+- Predicate stages and command-line ordering do not change. Earlier drops or
+  tombstones skip all later preparation, expressions, and projection.
+- Source tombstones participate with **absent input**, not JSON `null`.
+  `$meta.isTombstone` is true; `$` and `$$` are missing. They can be projected
+  into ordinary output records. `--drop-tombstones` still drops them first.
+- Without projection, source bytes pass through exactly. A surviving tombstone
+  remains a tombstone. A JSON-value envelope prepares a surviving non-null
+  passthrough payload when it needs serialization; a projection is already JSON.
+
+In deferred mode, `--on-invalid-json` selects the policy for preparation that
+is actually reached; supplying it does not force early validation. An earlier
+metadata action or evaluation error can therefore precede an invalid-JSON
+error. Evaluation errors retain `--on-eval-error` behavior. JSON text `null`,
+empty bytes, absent input, and Kafka tombstones remain distinct. Deferred mode
+skips payload validation/acquisition and unnecessary serialization, but retains
+source copying, admission accounting, and ownership until completion.
 
 ## Action Predicates
 
@@ -75,7 +134,9 @@ including an empty array. The entire evaluation and serialization must finish
 before a successful action is published, so a late evaluation error cannot
 emit a partial record.
 
-Serialization uses `jx::PreparedInput::write_json` and native jx value encoding.
+Serialization uses jx's shared complete-result serializer through
+`PreparedInput::write_json`, `PreparedInput::write_json_with`, or
+`Evaluation::write_json`, and native jx value encoding.
 Evaluation continues after an encoding failure; a later evaluation error takes
 precedence. Borrowed values retain number and escape spelling and duplicate object
 members; only whitespace outside strings is removed. Constructed values use jx's native JSON encoding. Retained

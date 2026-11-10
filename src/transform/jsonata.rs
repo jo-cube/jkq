@@ -1,6 +1,10 @@
-use std::{fmt, mem};
+use std::{cell::LazyCell, fmt, mem};
 
-use jx::{Evaluation, InputPlan, PreparedInput};
+use jx::{
+    Evaluation, EvaluationOptions, Expression, InputDependency, InputPlan, PreparedInput, RawJson,
+};
+
+use crate::output::{SourceMetadata, write_metadata};
 
 use super::TransformPlan;
 
@@ -78,6 +82,7 @@ pub(crate) struct Worker<'a> {
     input_plan: &'a InputPlan<'a>,
     embeds_json: bool,
     output: Vec<u8>,
+    metadata: Vec<u8>,
     max_recycled_capacity: usize,
 }
 
@@ -93,6 +98,7 @@ impl<'a> Worker<'a> {
             input_plan,
             embeds_json,
             output: Vec::new(),
+            metadata: Vec::new(),
             max_recycled_capacity,
         }
     }
@@ -100,78 +106,148 @@ impl<'a> Worker<'a> {
     pub fn execute_report(
         &mut self,
         source: &mut Option<Vec<u8>>,
+        metadata: &SourceMetadata<'_>,
         policies: ErrorPolicies,
     ) -> Result<Execution, TransformError> {
-        let Some(payload) = source.as_ref() else {
+        if source.is_none() && (self.plan.drop_tombstones || !self.plan.defer_json) {
             return evaluation_result(Ok(self.tombstone_action()), policies.evaluation);
-        };
-        if !self.plan.capabilities.parses_json {
-            return evaluation_result(
-                Ok(Action::PassThrough(PassPayload::Exact(
-                    source.take().expect("source payload"),
-                ))),
-                policies.evaluation,
-            );
         }
-        let input = match self.input_plan.prepare(payload) {
-            Ok(input) => input,
-            Err(error) => return invalid_json(policies.invalid_json, source, error.to_string()),
-        };
-        match self.evaluate_predicates(&input) {
-            Ok(Some(action)) => return evaluation_result(Ok(action), policies.evaluation),
-            Err(error) => return evaluation_result(Err(error), policies.evaluation),
-            Ok(None) => {}
-        }
-
-        let source_length = payload.len();
         self.output.clear();
-        let (result, category) = if self.plan.projection.is_some() {
-            (
+        let result = (|| {
+            let payload = source.as_deref();
+            let mut input = if !self.plan.defer_json && self.plan.capabilities.needs_worker {
+                payload
+                    .map(|bytes| self.input_plan.prepare(bytes))
+                    .transpose()
+                    .map_err(|error| TransformError::InvalidJson(error.to_string()))?
+            } else {
+                None
+            };
+            // The closure runs once, only if a reached expression can refer to $meta.
+            let meta = LazyCell::new(|| prepare_metadata(&mut self.metadata, metadata));
+            for (index, expression) in self
+                .plan
+                .drops
+                .iter()
+                .chain(&self.plan.tombstones)
+                .chain(&self.plan.projection)
+                .enumerate()
+            {
+                if input.is_none()
+                    && expression.input_dependency() == InputDependency::MayRequireInput
+                {
+                    input = payload
+                        .map(|bytes| self.input_plan.prepare(bytes))
+                        .transpose()
+                        .map_err(|error| TransformError::InvalidJson(error.to_string()))?;
+                }
+                let meta = self.plan.uses_metadata(index).then(|| *meta);
+                if index < self.plan.drops.len() + self.plan.tombstones.len() {
+                    let (category, position) = if index < self.plan.drops.len() {
+                        ("drop predicate", index)
+                    } else {
+                        ("tombstone predicate", index - self.plan.drops.len())
+                    };
+                    let value = evaluate(expression, input.as_ref(), index, meta)
+                        .and_then(Evaluation::single)
+                        .map_err(|error| {
+                            evaluation_error(category, Some(position), error.to_string())
+                        })?;
+                    let matched = value.as_ref().and_then(jx::Value::as_bool).ok_or_else(|| {
+                        evaluation_error(
+                            category,
+                            Some(position),
+                            "result must be a Boolean".to_owned(),
+                        )
+                    })?;
+                    if matched {
+                        return Ok(Some(
+                            if index < self.plan.drops.len() || self.plan.drop_tombstones {
+                                Action::Drop
+                            } else {
+                                Action::Tombstone
+                            },
+                        ));
+                    }
+                } else {
+                    // Retain the ordinary prepared serializer's optimized delivery path.
+                    let present = match (input.as_ref(), meta) {
+                        (Some(input), None) => input.write_json(index, &mut self.output),
+                        (Some(input), Some(meta)) => input.write_json_with(
+                            index,
+                            metadata_options(Some(meta)),
+                            &mut self.output,
+                        ),
+                        (None, _) => evaluate(expression, input.as_ref(), index, meta)
+                            .map_err(jx::ConsumeError::Evaluation)
+                            .and_then(|evaluation| evaluation.write_json(&mut self.output)),
+                    }
+                    .map_err(|error| evaluation_error("projection", None, error.to_string()))?;
+                    if !present {
+                        return Err(evaluation_error(
+                            "projection",
+                            None,
+                            "projection emitted no results".to_owned(),
+                        ));
+                    }
+                }
+            }
+            if self.plan.projection.is_none()
+                && self.embeds_json
+                && let Some(payload) = payload
+            {
+                if input.is_none() {
+                    input = Some(
+                        self.input_plan
+                            .prepare(payload)
+                            .map_err(|error| TransformError::InvalidJson(error.to_string()))?,
+                    );
+                }
                 input
-                    .write_json(
-                        self.plan.drops.len() + self.plan.tombstones.len(),
-                        &mut self.output,
-                    )
-                    .map_err(|error| error.to_string())
-                    .and_then(|present| {
-                        if present {
-                            Ok(())
-                        } else {
-                            Err("projection emitted no results".to_owned())
-                        }
-                    }),
-                "projection",
-            )
-        } else if self.embeds_json {
-            (
-                input
+                    .as_ref()
+                    .expect("prepared envelope payload")
                     .as_raw()
                     .write_compact(&mut self.output)
-                    .map_err(|error| error.to_string()),
-                "envelope payload",
-            )
-        } else {
-            return evaluation_result(
-                Ok(Action::PassThrough(PassPayload::Exact(
-                    source.take().expect("source payload"),
-                ))),
-                policies.evaluation,
-            );
-        };
-        if let Err(message) = result {
-            if self.output.capacity() > self.max_recycled_capacity {
-                self.output = Vec::new();
-            } else {
-                self.output.clear();
+                    .map_err(|error| {
+                        evaluation_error("envelope payload", None, error.to_string())
+                    })?;
             }
+            Ok(None)
+        })();
+        if self.metadata.capacity() > self.max_recycled_capacity {
+            self.metadata = Vec::new();
+        }
+        match result {
+            Ok(Some(action)) => return evaluation_result(Ok(action), policies.evaluation),
+            Err(error) => {
+                if self.output.capacity() > self.max_recycled_capacity {
+                    self.output = Vec::new();
+                } else {
+                    self.output.clear();
+                }
+                return match error {
+                    TransformError::InvalidJson(message) => {
+                        invalid_json(policies.invalid_json, source, message)
+                    }
+                    error => evaluation_result(Err(error), policies.evaluation),
+                };
+            }
+            Ok(None) => {}
+        }
+        let source_length = source.as_ref().map(Vec::len);
+        if self.plan.projection.is_none() && (!self.embeds_json || source_length.is_none()) {
             return evaluation_result(
-                Err(evaluation_error(category, None, message)),
+                Ok(match source.take() {
+                    Some(bytes) => Action::PassThrough(PassPayload::Exact(bytes)),
+                    None => Action::Tombstone,
+                }),
                 policies.evaluation,
             );
         }
-        // Results no longer borrow the source. Recycle its allocation for the next output.
-        let mut payload = source.take().expect("source payload");
-        let bytes = if payload.capacity() <= self.max_recycled_capacity {
+        // All results have been consumed; recycle source storage only after borrows end.
+        let bytes = if let Some(mut payload) = source.take()
+            && payload.capacity() <= self.max_recycled_capacity
+        {
             payload.clear();
             mem::replace(&mut self.output, payload)
         } else {
@@ -182,48 +258,10 @@ impl<'a> Worker<'a> {
         } else {
             Action::PassThrough(PassPayload::Json {
                 bytes,
-                source_length,
+                source_length: source_length.expect("source payload"),
             })
         };
         evaluation_result(Ok(action), policies.evaluation)
-    }
-
-    fn evaluate_predicates(
-        &self,
-        input: &PreparedInput<'_, 'a, '_>,
-    ) -> Result<Option<Action>, TransformError> {
-        for index in 0..self.plan.drops.len() {
-            if self.predicate(input, index, "drop predicate", index)? {
-                return Ok(Some(Action::Drop));
-            }
-        }
-        for index in 0..self.plan.tombstones.len() {
-            if self.predicate(
-                input,
-                self.plan.drops.len() + index,
-                "tombstone predicate",
-                index,
-            )? {
-                return Ok(Some(self.tombstone_action()));
-            }
-        }
-        Ok(None)
-    }
-
-    fn predicate(
-        &self,
-        input: &PreparedInput<'_, 'a, '_>,
-        expression_index: usize,
-        category: &'static str,
-        index: usize,
-    ) -> Result<bool, TransformError> {
-        let value = input
-            .evaluate(expression_index)
-            .and_then(Evaluation::single)
-            .map_err(|error| evaluation_error(category, Some(index), error.to_string()))?;
-        value.as_ref().and_then(jx::Value::as_bool).ok_or_else(|| {
-            evaluation_error(category, Some(index), "result must be a Boolean".to_owned())
-        })
     }
 
     fn tombstone_action(&self) -> Action {
@@ -232,6 +270,40 @@ impl<'a> Worker<'a> {
         } else {
             Action::Tombstone
         }
+    }
+}
+
+fn prepare_metadata<'i>(buffer: &'i mut Vec<u8>, metadata: &SourceMetadata<'_>) -> RawJson<'i> {
+    buffer.clear();
+    write_metadata(metadata, buffer);
+    jx::validate(buffer).expect("source metadata is valid JSON")
+}
+
+fn evaluate<'e, 'i>(
+    expression: &'e Expression,
+    input: Option<&PreparedInput<'_, 'e, 'i>>,
+    index: usize,
+    metadata: Option<RawJson<'i>>,
+) -> Result<Evaluation<'e, 'i>, jx::Error> {
+    match (input, metadata) {
+        (Some(input), None) => input.evaluate(index),
+        (input, metadata) => {
+            let options = metadata_options(metadata);
+            match input {
+                Some(input) => input.evaluate_with(index, options),
+                None => expression.evaluate_with(None, options),
+            }
+        }
+    }
+}
+
+fn metadata_options<'e, 'i>(metadata: Option<RawJson<'i>>) -> EvaluationOptions<'e, 'i> {
+    EvaluationOptions {
+        bindings: metadata
+            .map(|raw| ("meta", jx::Value::Raw(raw)))
+            .into_iter()
+            .collect(),
+        ..Default::default()
     }
 }
 
@@ -300,9 +372,25 @@ fn execute(
 ) -> Result<Action, TransformError> {
     let input_plan = plan.input_plan();
     Worker::new(plan, &input_plan, false, usize::MAX)
-        .execute_report(&mut payload, policies)
+        .execute_report(&mut payload, &test_metadata(), policies)
         .map(|execution| execution.action)
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn test_metadata() -> SourceMetadata<'static> {
+    SourceMetadata {
+        topic: "events",
+        partition: 0,
+        offset: 0,
+        timestamp: None,
+        key: None,
+        headers: &[],
+        value_length: Some(0),
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests;

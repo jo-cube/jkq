@@ -92,6 +92,16 @@ impl EmittedAction {
     }
 }
 
+pub struct SourceMetadata<'a> {
+    pub topic: &'a str,
+    pub partition: i32,
+    pub offset: i64,
+    pub timestamp: Option<Timestamp>,
+    pub key: Option<&'a [u8]>,
+    pub headers: &'a [Header],
+    pub value_length: Option<usize>,
+}
+
 pub struct OutputRecord<'a> {
     pub topic: &'a str,
     pub partition: i32,
@@ -361,31 +371,10 @@ pub fn write_envelope(record: &OutputRecord<'_>, output: &mut impl Write) -> io:
     write_decimal(output, record.partition, &mut written)?;
     write_bytes(output, b",\"offset\":", &mut written)?;
     write_decimal(output, record.offset, &mut written)?;
-    write_bytes(output, b",\"timestamp\":", &mut written)?;
-    match record.timestamp {
-        Some(timestamp) => write_decimal(output, timestamp.milliseconds, &mut written)?,
-        None => write_bytes(output, b"null", &mut written)?,
-    }
-    write_bytes(output, b",\"timestampType\":", &mut written)?;
-    match record.timestamp.map(|value| value.kind) {
-        Some(TimestampType::CreateTime) => write_json_string(output, "createTime", &mut written)?,
-        Some(TimestampType::LogAppendTime) => {
-            write_json_string(output, "logAppendTime", &mut written)?
-        }
-        None => write_bytes(output, b"null", &mut written)?,
-    }
+    write_timestamp(output, record.timestamp, &mut written)?;
     write_bytes_fields(output, "key", record.key, &mut written)?;
-    write_bytes(output, b",\"headers\":[", &mut written)?;
-    for (index, header) in record.headers.iter().enumerate() {
-        if index != 0 {
-            write_bytes(output, b",", &mut written)?;
-        }
-        write_bytes(output, b"{\"name\":", &mut written)?;
-        write_json_string(output, &header.name, &mut written)?;
-        write_bytes_fields(output, "value", header.value.as_deref(), &mut written)?;
-        write_bytes(output, b"}", &mut written)?;
-    }
-    write_bytes(output, b"],\"action\":", &mut written)?;
+    write_headers(output, record.headers, &mut written)?;
+    write_bytes(output, b",\"action\":", &mut written)?;
     write_json_string(output, record.action.as_str(), &mut written)?;
     match record.payload {
         Payload::Tombstone => write_bytes_fields(output, "payload", None, &mut written)?,
@@ -397,6 +386,75 @@ pub fn write_envelope(record: &OutputRecord<'_>, output: &mut impl Write) -> io:
     }
     write_bytes(output, b"}\n", &mut written)?;
     Ok(written)
+}
+
+fn write_timestamp(
+    output: &mut impl Write,
+    timestamp: Option<Timestamp>,
+    written: &mut usize,
+) -> io::Result<()> {
+    write_bytes(output, b",\"timestamp\":", written)?;
+    match timestamp {
+        Some(timestamp) => write_decimal(output, timestamp.milliseconds, written)?,
+        None => write_bytes(output, b"null", written)?,
+    }
+    write_bytes(output, b",\"timestampType\":", written)?;
+    match timestamp.map(|value| value.kind) {
+        Some(TimestampType::CreateTime) => write_json_string(output, "createTime", written)?,
+        Some(TimestampType::LogAppendTime) => write_json_string(output, "logAppendTime", written)?,
+        None => write_bytes(output, b"null", written)?,
+    }
+    Ok(())
+}
+
+fn write_headers(
+    output: &mut impl Write,
+    headers: &[Header],
+    written: &mut usize,
+) -> io::Result<()> {
+    write_bytes(output, b",\"headers\":[", written)?;
+    for (index, header) in headers.iter().enumerate() {
+        if index != 0 {
+            write_bytes(output, b",", written)?;
+        }
+        write_bytes(output, b"{\"name\":", written)?;
+        write_json_string(output, &header.name, written)?;
+        write_bytes_fields(output, "value", header.value.as_deref(), written)?;
+        write_bytes(output, b"}", written)?;
+    }
+    write_bytes(output, b"]", written)
+}
+
+pub fn write_metadata(record: &SourceMetadata<'_>, output: &mut Vec<u8>) {
+    // Use the envelope's byte conventions; offsets are strings for exact JSONata comparisons.
+    let mut written = 0;
+    (|| -> io::Result<()> {
+        write_bytes(output, b"{\"topic\":", &mut written)?;
+        write_json_string(output, record.topic, &mut written)?;
+        write_bytes(output, b",\"partition\":", &mut written)?;
+        write_decimal(output, record.partition, &mut written)?;
+        write_bytes(output, b",\"offset\":\"", &mut written)?;
+        write_decimal(output, record.offset, &mut written)?;
+        write_bytes(output, b"\"", &mut written)?;
+        write_timestamp(output, record.timestamp, &mut written)?;
+        write_bytes_fields(output, "key", record.key, &mut written)?;
+        write_headers(output, record.headers, &mut written)?;
+        write_bytes(output, b",\"valueLength\":", &mut written)?;
+        match record.value_length {
+            Some(length) => write_decimal(output, length, &mut written)?,
+            None => write_decimal(output, -1, &mut written)?,
+        }
+        write_bytes(
+            output,
+            if record.value_length.is_none() {
+                b",\"isTombstone\":true}"
+            } else {
+                b",\"isTombstone\":false}"
+            },
+            &mut written,
+        )
+    })()
+    .expect("writing metadata to a vector cannot fail");
 }
 
 fn write_json_fields(
