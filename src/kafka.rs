@@ -1,12 +1,17 @@
 mod fetch;
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::Duration,
+};
 
 use rdkafka::{
     ClientConfig,
     consumer::{BaseConsumer, Consumer},
     error::{KafkaError, RDKafkaErrorCode},
-    message::{Headers, Timestamp as KafkaTimestamp},
+    message::Timestamp as KafkaTimestamp,
     topic_partition_list::{Offset, TopicPartitionList},
 };
 
@@ -84,6 +89,7 @@ struct PartitionRange {
     partition: i32,
     start: Offset,
     end_exclusive: Option<i64>,
+    initially_done: bool,
 }
 
 struct ConsumerAssignment {
@@ -144,9 +150,16 @@ impl KafkaInput {
             .map(|partition| {
                 let start = match config.start {
                     StartPosition::Beginning => {
-                        watermarks.as_ref().map_or(Offset::Beginning, |watermarks| {
-                            Offset::Offset(watermarks[partition].0)
-                        })
+                        if config.range_sharding {
+                            Offset::Offset(
+                                watermarks
+                                    .as_ref()
+                                    .expect("range sharding requires watermarks")[partition]
+                                    .0,
+                            )
+                        } else {
+                            Offset::Beginning
+                        }
                     }
                     StartPosition::End => Offset::Offset(
                         watermarks.as_ref().expect("end requires watermarks")[partition].1,
@@ -200,10 +213,22 @@ impl KafkaInput {
 
         let ranges = partitions
             .iter()
-            .map(|partition| PartitionRange {
-                partition: *partition,
-                start: starts[partition],
-                end_exclusive: fixed_ends.as_ref().map(|ends| ends[partition]),
+            .map(|partition| {
+                let start = starts[partition];
+                let end_exclusive = fixed_ends.as_ref().map(|ends| ends[partition]);
+                let initially_done = match (start, end_exclusive) {
+                    (Offset::Offset(start), Some(end)) => start >= end,
+                    (Offset::Beginning, Some(end)) => watermarks
+                        .as_ref()
+                        .is_some_and(|marks| marks[partition].0 >= end),
+                    _ => false,
+                };
+                PartitionRange {
+                    partition: *partition,
+                    start,
+                    end_exclusive,
+                    initially_done,
+                }
             })
             .collect::<Vec<_>>();
         if config.range_sharding {
@@ -255,8 +280,7 @@ impl KafkaInput {
             .ranges
             .into_iter()
             .map(|range| {
-                let done = matches!((range.start, range.end_exclusive),
-                    (Offset::Offset(start), Some(end)) if start >= end);
+                let done = range.initially_done;
                 (range.partition, PartitionState { range, done })
             })
             .collect::<BTreeMap<_, _>>();
@@ -352,7 +376,27 @@ impl KafkaInput {
         if matches!(state.range.start, Offset::Offset(start) if message.offset() < start) {
             return Ok(PollEvent::Idle);
         }
-        let retained_bytes = retained_bytes(&message, self.requirements)?;
+        let (headers, retained_bytes) = match extract_headers_and_charge(
+            &message,
+            self.requirements,
+            &self.topic,
+            partition,
+            message.offset(),
+        ) {
+            Ok(extracted) => extracted,
+            Err(HeaderExtractError::InvalidUtf8(message))
+                if self.error_policy == KafkaErrorPolicy::Continue =>
+            {
+                if !self.quiet {
+                    eprintln!("jkq: Kafka record error: {message}");
+                }
+                return Ok(PollEvent::Idle);
+            }
+            Err(HeaderExtractError::InvalidUtf8(message)) => {
+                return Err(format!("Kafka record error: {message}"));
+            }
+            Err(HeaderExtractError::Overflow(message)) => return Err(message),
+        };
         let record = OwnedRecord {
             partition,
             offset: message.offset(),
@@ -366,19 +410,7 @@ impl KafkaInput {
                 .key
                 .then(|| message.key().map(<[u8]>::to_vec))
                 .flatten(),
-            headers: if self.requirements.headers {
-                let mut owned = Vec::new();
-                if let Some(headers) = message.headers() {
-                    owned = Vec::with_capacity(headers.count());
-                    owned.extend(headers.iter().map(|header| Header {
-                        name: header.key.to_owned(),
-                        value: header.value.map(<[u8]>::to_vec),
-                    }));
-                }
-                owned
-            } else {
-                Vec::new()
-            },
+            headers,
             payload: message
                 .payload()
                 .map(|bytes| self.payload_buffers.copy(bytes)),
@@ -475,6 +507,7 @@ fn consumer_assignments(
                     partition: range.partition,
                     start: Offset::Offset(next),
                     end_exclusive: Some(shard_end),
+                    initially_done: next >= shard_end,
                 }],
                 // Static allowances sum to at most the original partition budget.
                 max_inflight_per_partition: max_inflight_per_partition / count,
@@ -485,32 +518,60 @@ fn consumer_assignments(
     Ok(assignments)
 }
 
-fn retained_bytes(
+enum HeaderExtractError {
+    InvalidUtf8(String),
+    Overflow(String),
+}
+
+fn extract_headers_and_charge(
     message: &fetch::NativeMessage<'_>,
     requirements: OutputRequirements,
-) -> Result<usize, String> {
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Result<(Vec<Header>, usize), HeaderExtractError> {
     let mut bytes = message.payload().map_or(0, <[u8]>::len);
     if requirements.key {
-        bytes = bytes
-            .checked_add(message.key_len())
-            .ok_or_else(|| "record retained-byte charge overflowed usize".to_owned())?;
+        bytes = bytes.checked_add(message.key_len()).ok_or_else(|| {
+            HeaderExtractError::Overflow("record retained-byte charge overflowed usize".into())
+        })?;
     }
+    let mut owned = Vec::new();
     if requirements.headers
         && let Some(headers) = message.headers()
     {
-        bytes = headers
-            .count()
+        let count = headers.count();
+        bytes = count
             .checked_mul(std::mem::size_of::<Header>())
             .and_then(|slots| bytes.checked_add(slots))
-            .ok_or_else(|| "record retained-byte charge overflowed usize".to_owned())?;
-        for header in headers.iter() {
+            .ok_or_else(|| {
+                HeaderExtractError::Overflow("record retained-byte charge overflowed usize".into())
+            })?;
+        owned.reserve(count);
+        for index in 0..count {
+            let Some(header) = headers.try_get(index) else {
+                break;
+            };
+            let header = header.map_err(|error| {
+                HeaderExtractError::InvalidUtf8(format!(
+                    "non-UTF-8 header name at {topic} partition {partition} offset {offset}: {error}"
+                ))
+            })?;
             bytes = bytes
-                .checked_add(header.key.len())
+                .checked_add(header.name.len())
                 .and_then(|bytes| bytes.checked_add(header.value.map_or(0, <[u8]>::len)))
-                .ok_or_else(|| "record retained-byte charge overflowed usize".to_owned())?;
+                .ok_or_else(|| {
+                    HeaderExtractError::Overflow(
+                        "record retained-byte charge overflowed usize".into(),
+                    )
+                })?;
+            owned.push(Header {
+                name: header.name.to_owned(),
+                value: header.value.map(<[u8]>::to_vec),
+            });
         }
     }
-    Ok(bytes)
+    Ok((owned, bytes))
 }
 
 pub fn validate_config(config: &RuntimeConfig) -> Result<(), String> {
@@ -552,20 +613,55 @@ fn client_creation_error(error: KafkaError) -> String {
     }
 }
 
+const WATERMARK_WORKERS: usize = 16;
+
 fn fetch_watermarks(
     consumer: &BaseConsumer,
     topic: &str,
     partitions: &[i32],
 ) -> Result<BTreeMap<i32, (i64, i64)>, String> {
-    partitions
-        .iter()
-        .map(|partition| {
-            consumer
-                .fetch_watermarks(topic, *partition, METADATA_TIMEOUT)
-                .map(|watermarks| (*partition, watermarks))
-                .map_err(|error| watermark_error(topic, *partition, error))
-        })
-        .collect()
+    if partitions.len() <= 2 {
+        return partitions
+            .iter()
+            .map(|partition| {
+                consumer
+                    .fetch_watermarks(topic, *partition, METADATA_TIMEOUT)
+                    .map(|watermarks| (*partition, watermarks))
+                    .map_err(|error| watermark_error(topic, *partition, error))
+            })
+            .collect();
+    }
+    let next = AtomicUsize::new(0);
+    let workers = partitions.len().min(WATERMARK_WORKERS);
+    let results = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(|| {
+                let mut local = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&partition) = partitions.get(index) else {
+                        break;
+                    };
+                    let entry = consumer
+                        .fetch_watermarks(topic, partition, METADATA_TIMEOUT)
+                        .map(|watermarks| (partition, watermarks))
+                        .map_err(|error| watermark_error(topic, partition, error));
+                    let failed = entry.is_err();
+                    local.push(entry);
+                    if failed {
+                        break;
+                    }
+                }
+                local
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("watermark worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    results.into_iter().collect()
 }
 
 fn watermarks_required(start: &StartPosition, end: Option<&EndPosition>) -> bool {
@@ -814,6 +910,7 @@ mod tests {
             partition,
             start: Offset::Offset(start),
             end_exclusive: Some(end),
+            initially_done: start >= end,
         }
     }
 
@@ -1040,5 +1137,57 @@ mod tests {
         let message = client_creation_error(error);
         assert!(message.contains("secret.password"));
         assert!(!message.contains("do-not-print"));
+    }
+
+    #[test]
+    fn beginning_snapshot_keeps_symbolic_beginning_and_parallel_watermarks_cover_all_partitions() {
+        use clap::Parser;
+        use rdkafka::{
+            mocking::MockCluster,
+            producer::{BaseProducer, BaseRecord, Producer},
+        };
+        let cluster = MockCluster::new(1).unwrap();
+        cluster.create_topic("parallel-marks", 8, 1).unwrap();
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .create()
+            .unwrap();
+        for partition in [0, 3, 7] {
+            producer
+                .send(
+                    BaseRecord::<(), [u8]>::to("parallel-marks")
+                        .partition(partition)
+                        .payload(b"{}"),
+                )
+                .map_err(|(error, _)| error)
+                .unwrap();
+        }
+        producer.flush(Duration::from_secs(5)).unwrap();
+
+        let config = crate::cli::RawCli::try_parse_from([
+            "jkq",
+            "-b",
+            &cluster.bootstrap_servers(),
+            "-t",
+            "parallel-marks",
+            "--snapshot",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap();
+        let inputs = KafkaInput::prepare(&config).unwrap();
+        assert_eq!(inputs.len(), 1);
+        let input = &inputs[0];
+        assert_eq!(input.partitions.len(), 8);
+        for (partition, state) in &input.partitions {
+            assert_eq!(state.range.start, Offset::Beginning);
+            if [0, 3, 7].contains(partition) {
+                assert!(!state.done);
+                assert_eq!(state.range.end_exclusive, Some(1));
+            } else {
+                assert!(state.done);
+                assert_eq!(state.range.end_exclusive, Some(0));
+            }
+        }
     }
 }

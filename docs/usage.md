@@ -74,7 +74,9 @@ The default start is `beginning`. `-o, --offset` accepts:
 | `42` | absolute offset 42 |
 | `-100` | 100 records before the current high watermark, clamped to the low watermark |
 | `s@1720000000000` | first offset at or after this Unix timestamp in milliseconds |
-| `e@1720000000000` | exclusive timestamp end |
+| `s@2026-01-02T03:04:05Z` | first offset at or after this RFC 3339 / ISO 8601 timestamp |
+| `s@-1h` | first offset at or after a relative duration before now (`ms`, `s`, `m`, `h`, `d`) |
+| `e@1720000000000` | exclusive timestamp end (also accepts ISO 8601 and relative `-duration` forms) |
 
 A successful timestamp lookup with no matching record resolves to the current
 high watermark. A failed partition lookup is a startup error, even with
@@ -117,7 +119,7 @@ Transform options are compiled before consumption:
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \
   --vars '{"tenant":"acme","cutoff":1000,"statuses":["open","pending"]}' \
-  --drop-if 'tenant != $vars.tenant or $not(status in $vars.statuses)' \
+  --keep-if 'tenant = $vars.tenant and status in $vars.statuses' \
   --tombstone-if 'deleted = true' \
   --project '{
     "id": id,
@@ -127,6 +129,13 @@ jkq -b localhost:9092 -t events -p 0 --snapshot \
 ```
 
 All expressions use native [JSONata](https://jsonata.org/) syntax and semantics.
+Every predicate and projection option also has a `-file` counterpart
+(`--drop-if-file`, `--drop-unless-file`, `--keep-if-file`,
+`--tombstone-if-file`, `--tombstone-unless-file`, and `--project-file`) that
+reads UTF-8 JSONata source from disk. `--project` and `--project-file` are
+mutually exclusive; predicate file options participate in command-line order
+alongside inline predicates.
+
 `--vars <object>` accepts one strict JSON object and binds it as `$vars` for
 every expression. `--vars-file <path>` reads the same object from a UTF-8 file;
 the two options are mutually exclusive. File errors, invalid JSON, and
@@ -137,22 +146,50 @@ without supplying it evaluates as JSONata `Undefined`.
 
 For each non-tombstone input, `jkq`:
 
-1. evaluates `--drop-if` and `--drop-unless` predicates together in
-   command-line order, dropping the record on the first trigger;
-2. evaluates `--tombstone-if` and `--tombstone-unless` predicates together in
-   command-line order, tombstoning the record on the first trigger, or dropping
-   it when `--drop-tombstones` is set;
-3. applies the optional `--project` expression to surviving records;
+1. evaluates `--drop-if`, `--drop-unless`, and `--keep-if` predicates (and their
+   `-file` variants) together in command-line order, dropping the record on the
+   first trigger;
+2. evaluates `--tombstone-if` and `--tombstone-unless` predicates (and their
+   `-file` variants) together in command-line order, tombstoning the record on
+   the first trigger, or dropping it when `--drop-tombstones` is set;
+3. applies the optional `--project` / `--project-file` expression to surviving
+   records;
 4. otherwise passes the source payload through, preserving its exact bytes
    unless `--envelope-payload value` is selected.
 
-All four options are repeatable. `if` triggers only on Boolean `true` and
-`unless` only on Boolean `false`; missing, null, and non-Boolean results are
+All predicate options are repeatable. `--drop-if` and `--tombstone-if` trigger
+only on Boolean `true`; `--drop-unless`, `--keep-if`, and `--tombstone-unless`
+trigger only on Boolean `false`. Missing, null, and non-Boolean results are
 evaluation errors. Each stage stops at its first trigger, and the drop stage
 always runs before the tombstone stage. JSONata truthiness is not applied at
-this external boundary. By default, an existing Kafka tombstone
-bypasses JSON parsing, predicates, and projection. It remains a tombstone by default
-and is dropped when `--drop-tombstones` is set.
+this external boundary. In JSONata, comparing a missing field with `!=` (such as
+`tenant != "acme"`) evaluates to `false`, which silently keeps records missing
+that field; prefer positive filters like `--keep-if 'tenant = "acme"'` or
+`--drop-if '$not(tenant = "acme")'`.
+
+**Source tombstones and metadata predicates:**
+
+- `--drop-tombstones` drops both source Kafka tombstones and predicate-generated
+  tombstones immediately.
+- Otherwise, predicates proven independent of the payload (such as
+  `--keep-if '$meta.key = "user-42"'`) evaluate on source tombstones by default,
+  so filtering a compacted topic by key or metadata drops tombstones for other
+  keys without requiring `--defer-json`.
+- Payload-dependent predicates and `--project` skip source tombstones by
+  default, so surviving tombstones remain tombstones instead of failing or being
+  rewritten into JSON.
+- **Combined metadata+payload expressions:** a single predicate that inspects
+  both metadata and payload (such as
+  `--keep-if '$meta.key = "user-42" and status = "active"'`) depends on the
+  payload and therefore skips source tombstones. Split metadata and payload
+  checks into separate flags when you want tombstones filtered by metadata too:
+
+```sh
+jkq -b localhost:9092 -t users --snapshot \
+  --keep-if '$meta.key = "user-42"' \
+  --keep-if 'status = "active"' \
+  --project '{"id": id, "status": status}' -J
+```
 
 Projection results use native jx compact JSON serialization. Zero emitted
 results, function values (including regex functions), and serialization failures
@@ -163,11 +200,12 @@ reference.
 
 `$meta` exposes source topic, partition, exact decimal-string offset, timestamp
 and type, binary-safe key and headers, original `valueLength`, and
-`isTombstone`, without replacing the payload root. Use `--defer-json` to run
-proven input-independent predicates and projections before preparing JSON,
-including over non-JSON values and source tombstones. `--drop-tombstones`
-still takes precedence. This mode changes validation and error ordering;
-see [source metadata and deferred JSON](expression-language.md#source-metadata-and-deferred-json)
+`isTombstone`, without replacing the payload root. Use `--defer-json` to skip
+validating payload JSON before metadata-only drops (for example over mixed or
+non-JSON topics), or to evaluate payload-dependent predicates and `--project`
+over source tombstones with absent input. `--drop-tombstones` still takes
+precedence. This mode changes validation and error ordering; see
+[source metadata and deferred JSON](expression-language.md#source-metadata-and-deferred-json)
 for field encodings, absent-input semantics, and error-policy details.
 
 ```sh

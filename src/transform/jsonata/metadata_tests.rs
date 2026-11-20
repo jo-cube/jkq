@@ -120,15 +120,27 @@ fn plan_only_metadata() -> TransformPlan {
 
 #[test]
 fn eager_defaults_and_drop_tombstones_keep_precedence() {
+    // Metadata-only predicates evaluate on source tombstones by default.
     let mut plan = make_plan(&["$meta.isTombstone"], &[], Some("$meta.offset"));
     plan.defer_json = false;
-    assert_eq!(run(&plan, None).unwrap(), Action::Tombstone);
+    assert_eq!(run(&plan, None).unwrap(), Action::Drop);
+    // Non-tombstone records still undergo eager JSON validation without --defer-json.
     assert!(matches!(
         run(&plan, Some(b"bad")),
         Err(TransformError::InvalidJson(_))
     ));
+    // Surviving source tombstones bypass projection without --defer-json, even
+    // when the projection is metadata-only; --defer-json opts into projecting them.
+    let mut project_only = make_plan(&[], &[], Some("$meta.offset"));
+    project_only.defer_json = false;
+    assert_eq!(run(&project_only, None).unwrap(), Action::Tombstone);
+    project_only.defer_json = true;
+    assert_eq!(
+        run(&project_only, None).unwrap(),
+        Action::Project(br#""9007199254740993""#.to_vec())
+    );
+    // --drop-tombstones still drops source tombstones before any expression.
     plan.defer_json = true;
-    assert_eq!(run(&plan, None).unwrap(), Action::Drop);
     plan.drop_tombstones = true;
     plan.projection = Some(
         jx::CompileOptions::default()
@@ -136,6 +148,84 @@ fn eager_defaults_and_drop_tombstones_keep_precedence() {
             .unwrap(),
     );
     assert_eq!(run(&plan, None).unwrap(), Action::Drop);
+}
+
+#[test]
+fn compacted_topic_key_filter_and_combined_expression_tombstone_contract() {
+    let split = super::tests::cli_plan(&[
+        "--keep-if",
+        "$meta.key = 'user-42'",
+        "--keep-if",
+        "status = 'active'",
+        "--project",
+        r#"{"id": id}"#,
+    ]);
+    let input_plan = split.input_plan();
+    let mut worker = Worker::new(&split, &input_plan, false, 16 * 1024);
+
+    let other_meta = SourceMetadata {
+        key: Some(b"user-99"),
+        ..metadata(None)
+    };
+    let target_meta = SourceMetadata {
+        key: Some(b"user-42"),
+        ..metadata(None)
+    };
+    // Other keys' tombstones are dropped by the metadata-only predicate #1.
+    assert_eq!(
+        worker
+            .execute_report(&mut None, &other_meta, FAIL)
+            .unwrap()
+            .action,
+        Action::Drop
+    );
+    // Matching key's tombstone survives #1, skips payload predicate #2 and --project,
+    // and remains a tombstone.
+    assert_eq!(
+        worker
+            .execute_report(&mut None, &target_meta, FAIL)
+            .unwrap()
+            .action,
+        Action::Tombstone
+    );
+    let mut inactive = Some(br#"{"id":1,"status":"inactive"}"#.to_vec());
+    let inactive_meta = SourceMetadata {
+        key: Some(b"user-42"),
+        ..metadata(Some(inactive.as_ref().unwrap().len()))
+    };
+    assert_eq!(
+        worker
+            .execute_report(&mut inactive, &inactive_meta, FAIL)
+            .unwrap()
+            .action,
+        Action::Drop
+    );
+    let mut active = Some(br#"{"id":1,"status":"active"}"#.to_vec());
+    let active_meta = SourceMetadata {
+        key: Some(b"user-42"),
+        ..metadata(Some(active.as_ref().unwrap().len()))
+    };
+    assert_eq!(
+        worker
+            .execute_report(&mut active, &active_meta, FAIL)
+            .unwrap()
+            .action,
+        Action::Project(br#"{"id":1}"#.to_vec())
+    );
+
+    // A single combined metadata+payload expression depends on the payload and
+    // therefore skips source tombstones by default.
+    let combined =
+        super::tests::cli_plan(&["--keep-if", "$meta.key = 'user-42' and status = 'active'"]);
+    let combined_input = combined.input_plan();
+    let mut combined_worker = Worker::new(&combined, &combined_input, false, 16 * 1024);
+    assert_eq!(
+        combined_worker
+            .execute_report(&mut None, &other_meta, FAIL)
+            .unwrap()
+            .action,
+        Action::Tombstone
+    );
 }
 
 #[test]
@@ -314,10 +404,24 @@ fn metadata_scratch_is_lazy_and_does_not_retain_oversized_headers() {
         Action::Drop
     );
     assert_eq!(worker.metadata.capacity(), 0);
+    // A plan that only demands valueLength/isTombstone skips encoding the 8 KiB header
+    // and reuses its small metadata scratch buffer.
     let plan = plan_only_metadata();
     let input_plan = plan.input_plan();
     let mut worker = Worker::new(&plan, &input_plan, false, 128);
     assert!(worker.execute_report(&mut None, &metadata, FAIL).is_ok());
+    assert!(worker.metadata.capacity() > 0 && worker.metadata.capacity() <= 128);
+    // A plan that reads $meta.headers encodes the oversized header and discards scratch.
+    let with_headers = make_plan(&[], &[], Some("$count($meta.headers)"));
+    let input_plan = with_headers.input_plan();
+    let mut worker = Worker::new(&with_headers, &input_plan, false, 128);
+    assert_eq!(
+        worker
+            .execute_report(&mut None, &metadata, FAIL)
+            .unwrap()
+            .action,
+        Action::Project(b"1".to_vec())
+    );
     assert_eq!(worker.metadata.capacity(), 0);
 }
 

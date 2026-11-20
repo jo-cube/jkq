@@ -5,7 +5,7 @@ use rdkafka::{
     bindings as sys,
     consumer::{BaseConsumer, Consumer, ConsumerContext, DefaultConsumerContext},
     error::{KafkaError, KafkaResult, RDKafkaErrorCode},
-    message::{Header, Headers, Timestamp},
+    message::Timestamp,
     topic_partition_list::TopicPartitionList,
 };
 
@@ -244,14 +244,24 @@ impl NativeMessage<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct NativeHeader<'a> {
+    pub name: &'a str,
+    pub value: Option<&'a [u8]>,
+}
+
 pub(super) struct NativeHeaders(*mut sys::rd_kafka_headers_t);
 
-impl Headers for NativeHeaders {
-    fn count(&self) -> usize {
+impl NativeHeaders {
+    pub(super) fn count(&self) -> usize {
         // SAFETY: NativeHeaders is created and borrowed from a live message only.
         unsafe { sys::rd_kafka_header_cnt(self.0) }
     }
-    fn try_get(&self, index: usize) -> Option<Header<'_, &[u8]>> {
+
+    pub(super) fn try_get(
+        &self,
+        index: usize,
+    ) -> Option<Result<NativeHeader<'_>, std::str::Utf8Error>> {
         let (mut name, mut value, mut len) = (ptr::null(), ptr::null(), 0);
         // SAFETY: live headers, valid outputs; returned bytes/name borrow them.
         let error =
@@ -259,15 +269,12 @@ impl Headers for NativeHeaders {
         if error != sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
             return None;
         }
-        // SAFETY: librdkafka returns a NUL-terminated header name, decoded as UTF-8
-        // with the same precondition as rust-rdkafka. A non-null value has len
-        // valid bytes.
-        Some(unsafe {
-            Header {
-                key: CStr::from_ptr(name).to_str().unwrap(),
-                value: (!value.is_null()).then(|| std::slice::from_raw_parts(value.cast(), len)),
-            }
-        })
+        // SAFETY: librdkafka returns a NUL-terminated header name and, when non-null,
+        // `len` valid value bytes borrowed from the live message.
+        let name = unsafe { CStr::from_ptr(name) }.to_str();
+        let value =
+            (!value.is_null()).then(|| unsafe { std::slice::from_raw_parts(value.cast(), len) });
+        Some(name.map(|name| NativeHeader { name, value }))
     }
 }
 
@@ -277,7 +284,7 @@ mod tests {
     use rdkafka::{
         ClientConfig,
         client::ClientContext,
-        message::OwnedHeaders,
+        message::{Header, OwnedHeaders},
         mocking::MockCluster,
         producer::{BaseProducer, BaseRecord, Producer},
         topic_partition_list::Offset,
@@ -395,9 +402,27 @@ mod tests {
                     );
                     let headers = message.headers().unwrap();
                     assert_eq!(headers.count(), 3);
-                    assert_eq!(headers.get(0).value, None);
-                    assert_eq!(headers.get(1).value, Some(b"".as_slice()));
-                    assert_eq!(headers.get(2).value, Some(b"\xff\0".as_slice()));
+                    assert_eq!(
+                        headers.try_get(0).unwrap().unwrap(),
+                        NativeHeader {
+                            name: "null",
+                            value: None
+                        }
+                    );
+                    assert_eq!(
+                        headers.try_get(1).unwrap().unwrap(),
+                        NativeHeader {
+                            name: "empty",
+                            value: Some(b"".as_slice())
+                        }
+                    );
+                    assert_eq!(
+                        headers.try_get(2).unwrap().unwrap(),
+                        NativeHeader {
+                            name: "binary",
+                            value: Some(b"\xff\0".as_slice())
+                        }
+                    );
                     assert!(headers.try_get(3).is_none());
                     seen += 1;
                 }
@@ -461,5 +486,27 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("existing assignment"));
+    }
+
+    #[test]
+    fn non_utf8_header_name_returns_error_instead_of_panicking() {
+        // SAFETY: construct and destroy a temporary librdkafka headers list with invalid UTF-8 name.
+        unsafe {
+            let raw = sys::rd_kafka_headers_new(1);
+            assert!(!raw.is_null());
+            let bad_name: [u8; 2] = [0xff, 0xfe];
+            let err = sys::rd_kafka_header_add(
+                raw,
+                bad_name.as_ptr().cast(),
+                bad_name.len() as isize,
+                b"v".as_ptr().cast(),
+                1,
+            );
+            assert_eq!(err, sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR);
+            let headers = NativeHeaders(raw);
+            assert_eq!(headers.count(), 1);
+            assert!(headers.try_get(0).unwrap().is_err());
+            sys::rd_kafka_headers_destroy(raw);
+        }
     }
 }

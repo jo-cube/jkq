@@ -1,11 +1,13 @@
 use jx::{CompileOptions, Expression, InputPlan, OwnedValue, ValueType};
 
+use crate::output::MetadataFields;
+
 pub mod jsonata;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanCapabilities {
     pub needs_worker: bool,
-    pub metadata: bool,
+    pub metadata: MetadataFields,
 }
 
 #[derive(Debug)]
@@ -83,30 +85,37 @@ pub fn build_plan(
             })
             .collect::<Result<Vec<_>, String>>()
     };
-    // Binding names are unescaped in JSONata. Include dynamic evaluation and
-    // tolerate false positives (including strings/comments); this only avoids
-    // adding a lexical frame to expressions that cannot refer to $meta.
-    let metadata_bindings: Vec<_> = drops
+    let drops = predicates(drops)?;
+    let tombstones = predicates(tombstones)?;
+    let projection = projection
+        .map(|source| compile_expression(&options, source, "projection"))
+        .transpose()?;
+    let mut metadata_fields = MetadataFields::NONE;
+    let mut metadata_bindings =
+        Vec::with_capacity(drops.len() + tombstones.len() + usize::from(projection.is_some()));
+    for expression in drops
         .iter()
-        .chain(tombstones)
-        .map(|predicate| predicate.source.as_str())
-        .chain(projection)
-        .map(uses_metadata)
-        .collect();
+        .chain(&tombstones)
+        .map(|predicate| &predicate.expression)
+        .chain(&projection)
+    {
+        let demand = expression.binding_demand("meta");
+        let used = demand != jx::BindingDemand::Unused;
+        metadata_bindings.push(used);
+        metadata_fields.merge(MetadataFields::from_demand(demand));
+    }
     Ok(TransformPlan {
-        drops: predicates(drops)?,
-        tombstones: predicates(tombstones)?,
-        drop_tombstones,
-        projection: projection
-            .map(|source| compile_expression(&options, source, "projection"))
-            .transpose()?,
         capabilities: PlanCapabilities {
             needs_worker: force_json_validation
                 || !drops.is_empty()
                 || !tombstones.is_empty()
                 || projection.is_some(),
-            metadata: metadata_bindings.iter().any(|&used| used),
+            metadata: metadata_fields,
         },
+        drops,
+        tombstones,
+        drop_tombstones,
+        projection,
         defer_json: false,
         metadata_bindings,
     })
@@ -117,14 +126,21 @@ fn compile_expression(
     source: &str,
     category: &str,
 ) -> Result<Expression, String> {
+    // Pre-check avoids adding a lexical scope frame to expressions that cannot
+    // refer to $meta; jx's binding_demand then eliminates false positives and
+    // identifies exact accessed fields.
     let options = if uses_metadata(source) {
         options.clone().binding("meta")
     } else {
         options.clone()
     };
-    options
-        .compile(source)
-        .map_err(|error| format!("{category} JSONata compile error: {error}"))
+    options.compile(source).map_err(|error| {
+        let location = error
+            .location(source)
+            .map(|(line, column)| format!(" at {line}:{column}"))
+            .unwrap_or_default();
+        format!("{category} JSONata compile error{location}: {error}")
+    })
 }
 
 fn uses_metadata(source: &str) -> bool {

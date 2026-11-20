@@ -3,9 +3,10 @@ use std::{
     fs,
     path::PathBuf,
     str::FromStr,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use chrono::DateTime;
 use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches, Parser, ValueEnum};
 
 use crate::{
@@ -22,10 +23,71 @@ const DEFAULT_MAX_INFLIGHT_PER_PARTITION: usize = 8_192;
 const MAX_CONSUMERS: usize = 128;
 pub(crate) const MAX_ASSIGNED_PARTITIONS: usize = 100_000;
 
+const LONG_HELP: &str = "\
+RECORD PIPELINE:
+  1. Drop stage: --drop-if, --drop-unless, --keep-if (and *-file variants)
+     evaluate in command-line order; first match drops the record.
+  2. Tombstone stage: --tombstone-if, --tombstone-unless (and *-file variants)
+     evaluate in command-line order; first match tombstones (or drops with
+     --drop-tombstones).
+  3. Output: --project / --project-file reshapes surviving records; otherwise
+     exact source bytes pass through.
+
+TOMBSTONES & METADATA PREDICATES:
+  - --drop-tombstones drops both source Kafka tombstones and predicate-generated
+    tombstones immediately.
+  - Metadata-only predicates (e.g. --keep-if '$meta.key = \"user-42\"') run on
+    both normal records and source tombstones automatically -- no --defer-json
+    needed.
+  - Payload predicates (e.g. --keep-if 'status = \"active\"') and --project skip
+    source tombstones by default so surviving tombstones remain tombstones.
+  - IMPORTANT: A single combined metadata+payload predicate (e.g.
+    --keep-if '$meta.key = \"user-42\" and status = \"active\"') depends on the
+    payload and therefore skips tombstones. Split metadata and payload checks
+    into separate flags when you want tombstones filtered by key/metadata too:
+      --keep-if '$meta.key = \"user-42\"' --keep-if 'status = \"active\"'
+  - Use --defer-json to skip JSON validation before metadata drops, or to let
+    source tombstones evaluate payload expressions / --project with absent input.
+
+JSONATA NOTES ($meta, $vars, missing fields):
+  - All predicates require a strict Boolean result (true/false).
+  - In JSONata, missing != \"x\" evaluates to false (keeping missing records).
+    Prefer positive checks such as --keep-if 'tenant = $vars.tenant' or
+    --drop-if '$not(tenant = $vars.tenant)'.
+  - $meta fields: topic, partition, offset (decimal string), timestamp (ms|null),
+    timestampType (\"createTime\"|\"logAppendTime\"|null), key, keyEncoding,
+    keyLength, headers ([{name,value,valueEncoding,valueLength}]),
+    valueLength (-1 for tombstones), isTombstone (boolean).
+  - $vars: immutable strict JSON object supplied via --vars or --vars-file.
+
+OFFSETS (-o / --offset):
+  beginning | end | <offset> | -<last_n>
+  s@<epoch_ms | ISO-8601 | -duration>   start timestamp (e.g. s@2026-01-02T00:00:00Z, s@-1h)
+  e@<epoch_ms | ISO-8601 | -duration>   exclusive end timestamp (durations: ms, s, m, h, d)
+
+FORMAT PLACEHOLDERS (-f / --payload-format):
+  %t topic  %p partition  %o offset  %T timestamp_ms (-1)  %a action
+  %k key    %K key_len (-1)  %h headers  %% literal %
+  %s post-transform payload  %S payload_len (-1 tombstone)  %L source_len  %R 4B BE len
+
+EXAMPLES:
+  # All records (including tombstones) for one key on a compacted topic:
+  jkq -b localhost:9092 -t users --snapshot --keep-if '$meta.key = \"user-42\"' -J
+
+  # Filter by key (including tombstones) and project non-tombstone payloads:
+  jkq -b localhost:9092 -t users --snapshot \\
+    --keep-if '$meta.key = \"user-42\"' --project '{\"id\": id, \"email\": email}' -J
+
+  # Last hour of production events without tombstones:
+  jkq -b localhost:9092 -t events -o s@-1h --snapshot --drop-tombstones \\
+    --keep-if 'environment = \"production\"'
+";
+
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Filter and transform JSON records from directly assigned Kafka partitions"
+    about = "Filter and transform JSON records from directly assigned Kafka partitions",
+    after_long_help = LONG_HELP
 )]
 pub struct RawCli {
     /// Comma-separated bootstrap broker list
@@ -64,8 +126,11 @@ pub struct RawCli {
     #[arg(long)]
     defer_json: bool,
     /// Project each surviving record with this JSONata expression
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_file")]
     project: Option<String>,
+    /// Read the --project JSONata expression from a UTF-8 file
+    #[arg(long, value_name = "PATH", conflicts_with = "project")]
+    project_file: Option<PathBuf>,
     /// Strict JSON object available as $vars
     #[arg(long, value_name = "OBJECT")]
     vars: Option<String>,
@@ -149,39 +214,104 @@ pub struct RawCli {
 }
 
 #[derive(Debug)]
+struct RawPredicate {
+    value: String,
+    is_file: bool,
+    flag: &'static str,
+    trigger: bool,
+    origin: String,
+}
+
+impl RawPredicate {
+    fn resolve(self) -> Result<PredicateSource, String> {
+        let source = if self.is_file {
+            fs::read_to_string(&self.value)
+                .map_err(|error| format!("cannot read --{} {}: {error}", self.flag, self.value))?
+        } else {
+            self.value
+        };
+        Ok(PredicateSource {
+            source,
+            trigger: self.trigger,
+            origin: self.origin,
+        })
+    }
+}
+
+#[derive(Debug)]
 struct PredicateArgs {
-    drops: Vec<PredicateSource>,
-    tombstones: Vec<PredicateSource>,
+    drops: Vec<RawPredicate>,
+    tombstones: Vec<RawPredicate>,
 }
 
 impl Args for PredicateArgs {
     fn augment_args(mut command: Command) -> Command {
-        for (id, flag, help) in [
+        for (id, flag, value_name, help) in [
             (
                 "drop_if",
                 "drop-if",
+                "EXPR",
                 "Drop records when this JSONata predicate returns Boolean true; repeatable",
+            ),
+            (
+                "drop_if_file",
+                "drop-if-file",
+                "PATH",
+                "Read a --drop-if JSONata predicate from a UTF-8 file; repeatable",
             ),
             (
                 "drop_unless",
                 "drop-unless",
+                "EXPR",
                 "Drop records when this JSONata predicate returns Boolean false; repeatable",
+            ),
+            (
+                "drop_unless_file",
+                "drop-unless-file",
+                "PATH",
+                "Read a --drop-unless JSONata predicate from a UTF-8 file; repeatable",
+            ),
+            (
+                "keep_if",
+                "keep-if",
+                "EXPR",
+                "Keep only records where this JSONata predicate returns Boolean true (drops on false); repeatable",
+            ),
+            (
+                "keep_if_file",
+                "keep-if-file",
+                "PATH",
+                "Read a --keep-if JSONata predicate from a UTF-8 file; repeatable",
             ),
             (
                 "tombstone_if",
                 "tombstone-if",
+                "EXPR",
                 "Tombstone records when this JSONata predicate returns Boolean true; repeatable",
+            ),
+            (
+                "tombstone_if_file",
+                "tombstone-if-file",
+                "PATH",
+                "Read a --tombstone-if JSONata predicate from a UTF-8 file; repeatable",
             ),
             (
                 "tombstone_unless",
                 "tombstone-unless",
+                "EXPR",
                 "Tombstone records when this JSONata predicate returns Boolean false; repeatable",
+            ),
+            (
+                "tombstone_unless_file",
+                "tombstone-unless-file",
+                "PATH",
+                "Read a --tombstone-unless JSONata predicate from a UTF-8 file; repeatable",
             ),
         ] {
             command = command.arg(
                 Arg::new(id)
                     .long(flag)
-                    .value_name("EXPR")
+                    .value_name(value_name)
                     .num_args(1)
                     .action(ArgAction::Append)
                     .value_parser(clap::value_parser!(String))
@@ -201,16 +331,70 @@ impl FromArgMatches for PredicateArgs {
         Ok(Self {
             drops: ordered_predicates(
                 matches,
-                [
-                    ("drop_if", true, "drop predicate"),
-                    ("drop_unless", false, "drop-unless predicate"),
+                &[
+                    ("drop_if", "drop-if", false, true, "drop predicate"),
+                    (
+                        "drop_if_file",
+                        "drop-if-file",
+                        true,
+                        true,
+                        "drop-if-file predicate",
+                    ),
+                    (
+                        "drop_unless",
+                        "drop-unless",
+                        false,
+                        false,
+                        "drop-unless predicate",
+                    ),
+                    (
+                        "drop_unless_file",
+                        "drop-unless-file",
+                        true,
+                        false,
+                        "drop-unless-file predicate",
+                    ),
+                    ("keep_if", "keep-if", false, false, "keep-if predicate"),
+                    (
+                        "keep_if_file",
+                        "keep-if-file",
+                        true,
+                        false,
+                        "keep-if-file predicate",
+                    ),
                 ],
             ),
             tombstones: ordered_predicates(
                 matches,
-                [
-                    ("tombstone_if", true, "tombstone predicate"),
-                    ("tombstone_unless", false, "tombstone-unless predicate"),
+                &[
+                    (
+                        "tombstone_if",
+                        "tombstone-if",
+                        false,
+                        true,
+                        "tombstone predicate",
+                    ),
+                    (
+                        "tombstone_if_file",
+                        "tombstone-if-file",
+                        true,
+                        true,
+                        "tombstone-if-file predicate",
+                    ),
+                    (
+                        "tombstone_unless",
+                        "tombstone-unless",
+                        false,
+                        false,
+                        "tombstone-unless predicate",
+                    ),
+                    (
+                        "tombstone_unless_file",
+                        "tombstone-unless-file",
+                        true,
+                        false,
+                        "tombstone-unless-file predicate",
+                    ),
                 ],
             ),
         })
@@ -218,10 +402,28 @@ impl FromArgMatches for PredicateArgs {
 
     fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), clap::Error> {
         let updated = Self::from_arg_matches(matches)?;
-        if matches.contains_id("drop_if") || matches.contains_id("drop_unless") {
+        if [
+            "drop_if",
+            "drop_if_file",
+            "drop_unless",
+            "drop_unless_file",
+            "keep_if",
+            "keep_if_file",
+        ]
+        .into_iter()
+        .any(|id| matches.contains_id(id))
+        {
             self.drops = updated.drops;
         }
-        if matches.contains_id("tombstone_if") || matches.contains_id("tombstone_unless") {
+        if [
+            "tombstone_if",
+            "tombstone_if_file",
+            "tombstone_unless",
+            "tombstone_unless_file",
+        ]
+        .into_iter()
+        .any(|id| matches.contains_id(id))
+        {
             self.tombstones = updated.tombstones;
         }
         Ok(())
@@ -230,22 +432,24 @@ impl FromArgMatches for PredicateArgs {
 
 fn ordered_predicates(
     matches: &ArgMatches,
-    options: [(&str, bool, &str); 2],
-) -> Vec<PredicateSource> {
+    options: &[(&str, &'static str, bool, bool, &str)],
+) -> Vec<RawPredicate> {
     let mut predicates: Vec<_> = options
-        .into_iter()
-        .flat_map(|(id, trigger, category)| {
+        .iter()
+        .flat_map(|&(id, flag, is_file, trigger, category)| {
             matches
                 .indices_of(id)
                 .into_iter()
                 .flatten()
                 .zip(matches.get_many::<String>(id).into_iter().flatten())
                 .enumerate()
-                .map(move |(ordinal, (position, source))| {
+                .map(move |(ordinal, (position, value))| {
                     (
                         position,
-                        PredicateSource {
-                            source: source.clone(),
+                        RawPredicate {
+                            value: value.clone(),
+                            is_file,
+                            flag,
                             trigger,
                             origin: format!("{category} #{}", ordinal + 1),
                         },
@@ -355,11 +559,10 @@ impl RuntimeConfig {
 
     pub fn requirements(&self) -> OutputRequirements {
         let mut requirements = self.output.requirements();
-        if self.transform.capabilities.metadata {
-            requirements.key = true;
-            requirements.headers = true;
-            requirements.timestamp = true;
-        }
+        let meta = self.transform.capabilities.metadata;
+        requirements.key |= meta.needs_key();
+        requirements.headers |= meta.needs_headers();
+        requirements.timestamp |= meta.needs_timestamp();
         requirements
     }
 }
@@ -483,11 +686,32 @@ impl RawCli {
                     .map_err(|error| format!("cannot read --vars-file {}: {error}", path.display()))
             })
             .transpose()?;
+        let drops = self
+            .predicates
+            .drops
+            .into_iter()
+            .map(RawPredicate::resolve)
+            .collect::<Result<Vec<_>, _>>()?;
+        let tombstones = self
+            .predicates
+            .tombstones
+            .into_iter()
+            .map(RawPredicate::resolve)
+            .collect::<Result<Vec<_>, _>>()?;
+        let file_projection = self
+            .project_file
+            .as_ref()
+            .map(|path| {
+                fs::read_to_string(path).map_err(|error| {
+                    format!("cannot read --project-file {}: {error}", path.display())
+                })
+            })
+            .transpose()?;
         let mut transform = build_plan(
-            &self.predicates.drops,
-            &self.predicates.tombstones,
+            &drops,
+            &tombstones,
             self.drop_tombstones,
-            self.project.as_deref(),
+            file_projection.as_deref().or(self.project.as_deref()),
             file_variables.as_deref().or(self.vars.as_deref()),
             force_json_validation,
         )?;
@@ -659,7 +883,7 @@ fn resolve_offsets(
             if end.is_some() {
                 return Err("only one end boundary may be specified".to_owned());
             }
-            end = Some(EndPosition::TimestampMillis(parse_nonnegative_i64(
+            end = Some(EndPosition::TimestampMillis(parse_timestamp_millis(
                 value,
                 "end timestamp",
             )?));
@@ -673,7 +897,7 @@ fn resolve_offsets(
         } else if raw == "end" {
             StartPosition::End
         } else if let Some(value) = raw.strip_prefix("s@") {
-            StartPosition::TimestampMillis(parse_nonnegative_i64(value, "start timestamp")?)
+            StartPosition::TimestampMillis(parse_timestamp_millis(value, "start timestamp")?)
         } else {
             let value =
                 i64::from_str(raw).map_err(|_| format!("unsupported offset position {raw:?}"))?;
@@ -687,15 +911,62 @@ fn resolve_offsets(
     Ok((start.unwrap_or(StartPosition::Beginning), end))
 }
 
-fn parse_nonnegative_i64(value: &str, label: &str) -> Result<i64, String> {
-    let value = value
-        .parse::<i64>()
-        .map_err(|_| format!("{label} must be milliseconds since Unix epoch"))?;
-    if value < 0 {
-        Err(format!("{label} must be non-negative"))
-    } else {
-        Ok(value)
+fn parse_timestamp_millis(value: &str, label: &str) -> Result<i64, String> {
+    if let Some(relative) = value.strip_prefix('-') {
+        let duration = parse_relative_duration(relative).map_err(|_| {
+            format!(
+                "{label} must be Unix epoch milliseconds, RFC 3339/ISO 8601, or a relative duration (for example -1h or -5m)"
+            )
+        })?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+            .as_millis();
+        let delta_ms = duration.as_millis();
+        let target = now_ms
+            .checked_sub(delta_ms)
+            .ok_or_else(|| format!("{label} precedes the Unix epoch"))?;
+        return i64::try_from(target).map_err(|_| format!("{label} exceeds supported range"));
     }
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return value
+            .parse::<i64>()
+            .map_err(|_| format!("{label} exceeds supported range"));
+    }
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        let millis = parsed.timestamp_millis();
+        if millis < 0 {
+            return Err(format!("{label} must be non-negative"));
+        }
+        return Ok(millis);
+    }
+    Err(format!(
+        "{label} must be Unix epoch milliseconds, RFC 3339/ISO 8601, or a relative duration (for example -1h or -5m)"
+    ))
+}
+
+fn parse_relative_duration(value: &str) -> Result<Duration, String> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1_u64)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1_000)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60_000)
+    } else if let Some(value) = value.strip_suffix('h') {
+        (value, 3_600_000)
+    } else if let Some(value) = value.strip_suffix('d') {
+        (value, 86_400_000)
+    } else {
+        return Err("duration must end in ms, s, m, h, or d".to_owned());
+    };
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| "duration must contain a positive integer".to_owned())?;
+    let milliseconds = number
+        .checked_mul(multiplier)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "duration must be positive and representable".to_owned())?;
+    Ok(Duration::from_millis(milliseconds))
 }
 
 fn parse_property(value: &str) -> Result<(&str, &str), String> {
@@ -1184,6 +1455,33 @@ mod tests {
         assert_eq!(
             metadata.requirements(),
             OutputRequirements {
+                key: false,
+                headers: false,
+                timestamp: false
+            }
+        );
+        let key_only = resolve(&[
+            "jkq",
+            "-b",
+            "x",
+            "-t",
+            "t",
+            "--keep-if",
+            "$meta.key = 'user-42'",
+        ])
+        .unwrap();
+        assert_eq!(
+            key_only.requirements(),
+            OutputRequirements {
+                key: true,
+                headers: false,
+                timestamp: false
+            }
+        );
+        let whole_meta = resolve(&["jkq", "-b", "x", "-t", "t", "--project", "$meta"]).unwrap();
+        assert_eq!(
+            whole_meta.requirements(),
+            OutputRequirements {
                 key: true,
                 headers: true,
                 timestamp: true
@@ -1198,7 +1496,7 @@ mod tests {
             }
         );
         let payload = resolve(&["jkq", "-b", "x", "-t", "t", "--project", "metadata.id"]).unwrap();
-        assert!(!payload.transform.capabilities.metadata);
+        assert!(payload.transform.capabilities.metadata.is_empty());
         let value = resolve(&[
             "jkq",
             "-b",
@@ -1487,11 +1785,25 @@ mod tests {
         for flag in [
             "--drop-if",
             "--drop-unless",
+            "--keep-if",
             "--tombstone-if",
             "--tombstone-unless",
         ] {
             assert!(help.contains(&format!("{flag} <EXPR>")));
         }
+        for flag in [
+            "--drop-if-file",
+            "--drop-unless-file",
+            "--keep-if-file",
+            "--tombstone-if-file",
+            "--tombstone-unless-file",
+            "--project-file",
+        ] {
+            assert!(help.contains(&format!("{flag} <PATH>")));
+        }
+        assert!(help.contains("TOMBSTONES & METADATA PREDICATES:"));
+        assert!(help.contains("combined metadata+payload predicate"));
+        assert!(help.contains("$meta fields:"));
         assert!(help.contains("Drop source and predicate-generated tombstones before projection"));
         assert!(help.contains("Strict JSON object available as $vars"));
         assert!(help.contains("Read the strict JSON object available as $vars from a file"));
@@ -1505,5 +1817,108 @@ mod tests {
         assert!(help.contains("does not force JSON parsing"));
         assert!(help.contains("forces validation and compacts pass-through payloads"));
         assert!(help.contains("[default: string]"));
+    }
+
+    #[test]
+    fn keep_if_expression_files_and_compile_locations_resolve_in_order() {
+        let dir = std::env::temp_dir().join(format!("jkq-expr-files-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let drop_file = dir.join("drop.jsonata");
+        let keep_file = dir.join("keep.jsonata");
+        let proj_file = dir.join("proj.jsonata");
+        fs::write(&drop_file, "disabled = true").unwrap();
+        fs::write(&keep_file, "$meta.key = 'k1'").unwrap();
+        fs::write(&proj_file, "{\"id\": id}").unwrap();
+
+        let config = resolve(&[
+            "jkq",
+            "-b",
+            "localhost",
+            "-t",
+            "events",
+            "--keep-if-file",
+            keep_file.to_str().unwrap(),
+            "--drop-if-file",
+            drop_file.to_str().unwrap(),
+            "--keep-if",
+            "status = 'ok'",
+            "--project-file",
+            proj_file.to_str().unwrap(),
+        ])
+        .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(config.transform.drops.len(), 3);
+        assert!(!config.transform.drops[0].trigger);
+        assert_eq!(
+            config.transform.drops[0].origin,
+            "keep-if-file predicate #1"
+        );
+        assert!(config.transform.drops[1].trigger);
+        assert_eq!(
+            config.transform.drops[1].origin,
+            "drop-if-file predicate #1"
+        );
+        assert!(!config.transform.drops[2].trigger);
+        assert_eq!(config.transform.drops[2].origin, "keep-if predicate #1");
+        assert!(config.transform.projection.is_some());
+
+        let err = resolve(&[
+            "jkq",
+            "-b",
+            "localhost",
+            "-t",
+            "events",
+            "--project",
+            "id\n+ [",
+        ])
+        .unwrap_err();
+        assert!(err.contains("at 2:"), "{err}");
+    }
+
+    #[test]
+    fn timestamp_boundaries_accept_iso8601_and_relative_durations() {
+        let iso = resolve(&[
+            "jkq",
+            "-b",
+            "localhost",
+            "-t",
+            "events",
+            "-o",
+            "s@2026-01-02T03:04:05Z",
+            "-o",
+            "e@2026-01-02T04:04:05+01:00",
+        ])
+        .unwrap();
+        assert_eq!(iso.start, StartPosition::TimestampMillis(1767323045000));
+        assert_eq!(iso.end, Some(EndPosition::TimestampMillis(1767323045000)));
+
+        let rel = resolve(&[
+            "jkq",
+            "-b",
+            "localhost",
+            "-t",
+            "events",
+            "-o",
+            "s@-1h",
+            "-o",
+            "e@-5m",
+        ])
+        .unwrap();
+        let (StartPosition::TimestampMillis(start), Some(EndPosition::TimestampMillis(end))) =
+            (rel.start, rel.end)
+        else {
+            panic!("expected resolved timestamps");
+        };
+        assert!(end > start);
+        let diff = end - start;
+        assert!((54 * 60 * 1000..=56 * 60 * 1000).contains(&diff), "{diff}");
+
+        for bad in ["s@-1", "s@bad", "s@1969-12-31T23:59:59Z", "e@-0s"] {
+            assert!(
+                resolve(&["jkq", "-b", "localhost", "-t", "events", "-o", bad]).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

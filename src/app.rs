@@ -55,12 +55,8 @@ impl From<PipelineError> for AppError {
 
 pub fn run(config: RuntimeConfig) -> Result<(), AppError> {
     let stdout = io::stdout();
-    let lock = stdout.lock();
-    if config.unbuffered {
-        run_with_writer(&config, lock)
-    } else {
-        run_with_writer(&config, BufWriter::with_capacity(STDOUT_BUFFER_BYTES, lock))
-    }
+    let writer = BufWriter::with_capacity(STDOUT_BUFFER_BYTES, stdout.lock());
+    run_with_writer(&config, writer)
 }
 
 fn run_with_writer(config: &RuntimeConfig, mut writer: impl Write) -> Result<(), AppError> {

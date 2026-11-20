@@ -2,9 +2,10 @@ use std::{cell::LazyCell, fmt, mem};
 
 use jx::{
     Evaluation, EvaluationOptions, Expression, InputDependency, InputPlan, PreparedInput, RawJson,
+    execution::Workspace,
 };
 
-use crate::output::{SourceMetadata, write_metadata};
+use crate::output::{MetadataFields, SourceMetadata, write_metadata_fields};
 
 use super::TransformPlan;
 
@@ -81,6 +82,7 @@ pub(crate) struct Worker<'a> {
     plan: &'a TransformPlan,
     input_plan: &'a InputPlan<'a>,
     embeds_json: bool,
+    workspace: Workspace,
     output: Vec<u8>,
     metadata: Vec<u8>,
     max_recycled_capacity: usize,
@@ -97,6 +99,7 @@ impl<'a> Worker<'a> {
             plan,
             input_plan,
             embeds_json,
+            workspace: Workspace::default(),
             output: Vec::new(),
             metadata: Vec::new(),
             max_recycled_capacity,
@@ -109,22 +112,29 @@ impl<'a> Worker<'a> {
         metadata: &SourceMetadata<'_>,
         policies: ErrorPolicies,
     ) -> Result<Execution, TransformError> {
-        if source.is_none() && (self.plan.drop_tombstones || !self.plan.defer_json) {
-            return evaluation_result(Ok(self.tombstone_action()), policies.evaluation);
+        if source.is_none() && self.plan.drop_tombstones {
+            return evaluation_result(Ok(Action::Drop), policies.evaluation);
         }
         self.output.clear();
+        let metadata_fields = self.plan.capabilities.metadata;
+        let is_tombstone = source.is_none();
         let result = (|| {
             let payload = source.as_deref();
+            let mut workspace = Some(&mut self.workspace);
             let mut input = if !self.plan.defer_json && self.plan.capabilities.needs_worker {
                 payload
-                    .map(|bytes| self.input_plan.prepare(bytes))
+                    .map(|bytes| {
+                        self.input_plan
+                            .prepare_with_workspace(bytes, workspace.take().expect("workspace"))
+                    })
                     .transpose()
                     .map_err(|error| TransformError::InvalidJson(error.to_string()))?
             } else {
                 None
             };
-            // The closure runs once, only if a reached expression can refer to $meta.
-            let meta = LazyCell::new(|| prepare_metadata(&mut self.metadata, metadata));
+            // The closure runs once, only if a reached expression refers to $meta.
+            let meta =
+                LazyCell::new(|| prepare_metadata(&mut self.metadata, metadata, metadata_fields));
             for (index, (expression, predicate)) in self
                 .plan
                 .drops
@@ -139,11 +149,25 @@ impl<'a> Worker<'a> {
                 )
                 .enumerate()
             {
+                if is_tombstone && !self.plan.defer_json {
+                    // Without --defer-json, source tombstones evaluate only
+                    // input-independent predicates (such as $meta.key checks).
+                    // Payload-dependent predicates and all projections are
+                    // skipped so surviving tombstones remain tombstones.
+                    if predicate.is_none()
+                        || expression.input_dependency() != InputDependency::Independent
+                    {
+                        continue;
+                    }
+                }
                 if input.is_none()
                     && expression.input_dependency() == InputDependency::MayRequireInput
                 {
                     input = payload
-                        .map(|bytes| self.input_plan.prepare(bytes))
+                        .map(|bytes| {
+                            self.input_plan
+                                .prepare_with_workspace(bytes, workspace.take().expect("workspace"))
+                        })
                         .transpose()
                         .map_err(|error| TransformError::InvalidJson(error.to_string()))?;
                 }
@@ -193,7 +217,7 @@ impl<'a> Worker<'a> {
                 if input.is_none() {
                     input = Some(
                         self.input_plan
-                            .prepare(payload)
+                            .prepare_with_workspace(payload, workspace.take().expect("workspace"))
                             .map_err(|error| TransformError::InvalidJson(error.to_string()))?,
                     );
                 }
@@ -227,7 +251,9 @@ impl<'a> Worker<'a> {
             Ok(None) => {}
         }
         let source_length = source.as_ref().map(Vec::len);
-        if self.plan.projection.is_none() && (!self.embeds_json || source_length.is_none()) {
+        if (self.plan.projection.is_none() || (is_tombstone && !self.plan.defer_json))
+            && (!self.embeds_json || source_length.is_none())
+        {
             return evaluation_result(
                 Ok(match source.take() {
                     Some(bytes) => Action::PassThrough(PassPayload::Exact(bytes)),
@@ -255,19 +281,15 @@ impl<'a> Worker<'a> {
         };
         evaluation_result(Ok(action), policies.evaluation)
     }
-
-    fn tombstone_action(&self) -> Action {
-        if self.plan.drop_tombstones {
-            Action::Drop
-        } else {
-            Action::Tombstone
-        }
-    }
 }
 
-fn prepare_metadata<'i>(buffer: &'i mut Vec<u8>, metadata: &SourceMetadata<'_>) -> RawJson<'i> {
+fn prepare_metadata<'i>(
+    buffer: &'i mut Vec<u8>,
+    metadata: &SourceMetadata<'_>,
+    fields: MetadataFields,
+) -> RawJson<'i> {
     buffer.clear();
-    write_metadata(metadata, buffer);
+    write_metadata_fields(metadata, fields, buffer);
     jx::validate(buffer).expect("source metadata is valid JSON")
 }
 
