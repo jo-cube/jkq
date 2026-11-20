@@ -477,6 +477,7 @@ pub fn run_pipeline(
         .unzip();
     let started = Instant::now();
     let first_failure = Arc::new(OnceLock::new());
+    let writer_aborted = Arc::new(AtomicBool::new(false));
     let shared_admission = Arc::new(SharedAdmission::new(config.limits, config.count_limit));
     let needs_worker = config.needs_worker();
     let evaluators = if needs_worker {
@@ -563,11 +564,19 @@ pub fn run_pipeline(
                 let worker_stats = Arc::clone(&stats);
                 let worker_shutdown = Arc::clone(&shutdown);
                 let worker_failure = Arc::clone(&first_failure);
+                let worker_aborted = Arc::clone(&writer_aborted);
                 match thread::Builder::new()
                     .name(format!("jkq-worker-{index}"))
                     .spawn_scoped(scope, move || {
                         guard_thread(&worker_shutdown, &worker_failure, "compute worker", || {
-                            worker_loop(config, input_plan, receiver, sender, worker_stats)
+                            worker_loop(
+                                config,
+                                input_plan,
+                                receiver,
+                                sender,
+                                worker_stats,
+                                &worker_aborted,
+                            )
                         });
                     }) {
                     Ok(worker) => workers.push(worker),
@@ -586,12 +595,13 @@ pub fn run_pipeline(
         drop(work_rx);
         drop(completion_tx);
 
-        let _ = writer_loop(
+        let _ = writer_loop_with_abort(
             config,
             writer,
             completion_rx,
             release_txs,
             Arc::clone(&shutdown),
+            &writer_aborted,
             Arc::clone(&stats),
             Arc::clone(&first_failure),
         );
@@ -871,6 +881,7 @@ fn worker_loop(
     work_rx: Receiver<RecordBatch>,
     completion_tx: Sender<CompletionBatch>,
     stats: Arc<Stats>,
+    writer_aborted: &AtomicBool,
 ) {
     let mut worker = jsonata::Worker::new(
         &config.transform,
@@ -897,37 +908,41 @@ fn worker_loop(
             } = record;
             let source_tombstone = payload.is_none();
             let payload_length = payload.as_ref().map(Vec::len);
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                worker.execute_report(
-                    &mut payload,
-                    &crate::output::SourceMetadata {
-                        topic: &config.topic,
-                        partition,
-                        offset,
-                        timestamp,
-                        key: key.as_deref(),
-                        headers: &headers,
-                        value_length: payload_length,
-                    },
-                    config.errors,
-                )
-            }));
-            let outcome = match result {
-                Ok(Ok(execution)) => {
-                    stats.transformed(&execution.action, execution.issue, source_tombstone);
-                    CompletionOutcome::Action(execution.action)
-                }
-                Ok(Err(transform_error)) => {
-                    stats.failed(&transform_error);
-                    CompletionOutcome::Fatal(format!(
-                        "transform failed at {} partition {partition} offset {offset}: {transform_error}",
+            let outcome = if writer_aborted.load(Ordering::Relaxed) {
+                CompletionOutcome::Action(Action::Drop)
+            } else {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    worker.execute_report(
+                        &mut payload,
+                        &crate::output::SourceMetadata {
+                            topic: &config.topic,
+                            partition,
+                            offset,
+                            timestamp,
+                            key: key.as_deref(),
+                            headers: &headers,
+                            value_length: payload_length,
+                        },
+                        config.errors,
+                    )
+                }));
+                match result {
+                    Ok(Ok(execution)) => {
+                        stats.transformed(&execution.action, execution.issue, source_tombstone);
+                        CompletionOutcome::Action(execution.action)
+                    }
+                    Ok(Err(transform_error)) => {
+                        stats.failed(&transform_error);
+                        CompletionOutcome::Fatal(format!(
+                            "transform failed at {} partition {partition} offset {offset}: {transform_error}",
+                            config.topic
+                        ))
+                    }
+                    Err(_) => CompletionOutcome::Fatal(format!(
+                        "compute worker panicked at {} partition {partition} offset {offset}",
                         config.topic
-                    ))
+                    )),
                 }
-                Err(_) => CompletionOutcome::Fatal(format!(
-                    "compute worker panicked at {} partition {partition} offset {offset}",
-                    config.topic
-                )),
             };
             completions.push(Completion {
                 consumer,
@@ -958,12 +973,37 @@ fn worker_loop(
     }
 }
 
+#[cfg(test)]
 fn writer_loop(
     config: &RuntimeConfig,
     writer: &mut impl Write,
     completion_rx: Receiver<CompletionBatch>,
     release_txs: Vec<Sender<Vec<Release>>>,
     shutdown: Arc<AtomicBool>,
+    stats: Arc<Stats>,
+    first_failure: Arc<OnceLock<RecordedFailure>>,
+) -> Result<(), PipelineError> {
+    let writer_aborted = AtomicBool::new(false);
+    writer_loop_with_abort(
+        config,
+        writer,
+        completion_rx,
+        release_txs,
+        shutdown,
+        &writer_aborted,
+        stats,
+        first_failure,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn writer_loop_with_abort(
+    config: &RuntimeConfig,
+    writer: &mut impl Write,
+    completion_rx: Receiver<CompletionBatch>,
+    release_txs: Vec<Sender<Vec<Release>>>,
+    shutdown: Arc<AtomicBool>,
+    writer_aborted: &AtomicBool,
     stats: Arc<Stats>,
     first_failure: Arc<OnceLock<RecordedFailure>>,
 ) -> Result<(), PipelineError> {
@@ -975,6 +1015,7 @@ fn writer_loop(
             &completion_rx,
             &release_txs,
             &shutdown,
+            writer_aborted,
             &stats,
             &first_failure,
         )
@@ -982,19 +1023,24 @@ fn writer_loop(
     .unwrap_or_else(|| Err(PipelineError::Runtime("output writer panicked".to_owned())))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_completions(
     config: &RuntimeConfig,
     writer: &mut impl Write,
     completion_rx: &Receiver<CompletionBatch>,
     release_txs: &[Sender<Vec<Release>>],
     shutdown: &AtomicBool,
+    writer_aborted: &AtomicBool,
     stats: &Stats,
     first_failure: &OnceLock<RecordedFailure>,
 ) -> Result<(), PipelineError> {
     let mut orderer = Orderer::default();
     let mut ready = Vec::new();
     let mut failure = match first_failure.get() {
-        Some(RecordedFailure::Startup(message)) => Some(PipelineError::Runtime(message.clone())),
+        Some(RecordedFailure::Startup(message)) => {
+            writer_aborted.store(true, Ordering::Relaxed);
+            Some(PipelineError::Runtime(message.clone()))
+        }
         _ => None,
     };
     let mut payload_buffer = Vec::new();
@@ -1013,6 +1059,7 @@ fn write_completions(
                         &mut failure,
                         first_failure,
                         shutdown,
+                        writer_aborted,
                         PipelineError::Runtime(message),
                     );
                 }
@@ -1028,6 +1075,7 @@ fn write_completions(
                                 &mut failure,
                                 first_failure,
                                 shutdown,
+                                writer_aborted,
                                 PipelineError::Runtime(message.clone()),
                             );
                         }
@@ -1044,6 +1092,7 @@ fn write_completions(
                                     &mut failure,
                                     first_failure,
                                     shutdown,
+                                    writer_aborted,
                                     PipelineError::Output(error),
                                 );
                             }
@@ -1075,6 +1124,7 @@ fn write_completions(
             &mut failure,
             first_failure,
             shutdown,
+            writer_aborted,
             PipelineError::Runtime(
                 "completion channel closed with a partition sequence gap".to_owned(),
             ),
@@ -1087,6 +1137,7 @@ fn write_completions(
             &mut failure,
             first_failure,
             shutdown,
+            writer_aborted,
             PipelineError::Output(error),
         );
     }
@@ -1097,10 +1148,12 @@ fn writer_failure(
     failure: &mut Option<PipelineError>,
     first: &OnceLock<RecordedFailure>,
     shutdown: &AtomicBool,
+    writer_aborted: &AtomicBool,
     error: PipelineError,
 ) {
     record_failure(first, &error);
     failure.get_or_insert(error);
+    writer_aborted.store(true, Ordering::Relaxed);
     shutdown.store(true, Ordering::SeqCst);
 }
 
@@ -1787,6 +1840,7 @@ mod tests {
                 work_rx,
                 completion_tx,
                 Arc::clone(&stats),
+                &AtomicBool::new(false),
             );
             let batches = completion_rx.iter().collect::<Vec<_>>();
             let (completion_tx, completion_rx) = bounded(3);
@@ -1954,6 +2008,7 @@ mod tests {
                 work_rx,
                 completion_tx,
                 Arc::new(Stats::default()),
+                &AtomicBool::new(false),
             );
             let batches = completion_rx.iter().collect::<Vec<_>>();
             let (completion_tx, completion_rx) = bounded(3);
@@ -2165,6 +2220,7 @@ mod tests {
                     work_rx,
                     completion_tx.clone(),
                     Arc::clone(&stats),
+                    &AtomicBool::new(false),
                 );
             }
             drop(completion_tx);
@@ -2322,6 +2378,7 @@ mod tests {
             work_rx,
             completion_tx,
             Arc::new(Stats::default()),
+            &AtomicBool::new(false),
         );
         let mut output = Vec::new();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2413,5 +2470,45 @@ mod tests {
             assert_eq!(releases.len(), 1);
             assert_eq!(releases[0].payload.as_deref(), Some(b"data".as_slice()));
         }
+    }
+
+    #[test]
+    fn worker_loop_skips_evaluation_when_writer_aborted() {
+        let config = config(&["--drop-if", "$error('must not evaluate')"]);
+        let input_plan = config.transform.input_plan();
+        let (work_tx, work_rx) = bounded(1);
+        let (completion_tx, completion_rx) = bounded(1);
+        work_tx
+            .send(RecordBatch {
+                consumer: 0,
+                items: vec![WorkItem {
+                    sequence: 0,
+                    record: OwnedRecord {
+                        partition: 0,
+                        offset: 0,
+                        timestamp: None,
+                        key: None,
+                        headers: Vec::new(),
+                        payload: Some(b"{}".to_vec()),
+                        retained_bytes: 2,
+                    },
+                }],
+            })
+            .unwrap();
+        drop(work_tx);
+        worker_loop(
+            &config,
+            &input_plan,
+            work_rx,
+            completion_tx,
+            Arc::new(Stats::default()),
+            &AtomicBool::new(true),
+        );
+        let batch = completion_rx.recv().unwrap();
+        assert_eq!(batch.items.len(), 1);
+        assert!(matches!(
+            batch.items[0].outcome,
+            CompletionOutcome::Action(Action::Drop)
+        ));
     }
 }
