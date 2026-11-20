@@ -57,7 +57,7 @@ CI runs the same checks.
 
 ## jx dependency
 
-The normal dependency selects the published jx `v0.2.0` Git tag; `Cargo.lock`
+The normal dependency selects the published jx `v0.3.0` Git tag; `Cargo.lock`
 pins its exact source revision. Its public compiler uses the common semantic IR;
 no backend flag, source patch or local path is needed. Published tags must not move.
 
@@ -164,24 +164,24 @@ The direct runtime dependencies are deliberately limited to:
 
 - `rdkafka`
 - `jx` ([upstream repository](https://github.com/jo-cube/jx))
-- `simd-json`
 - `clap`
 - `crossbeam-channel`
 - `signal-hook`
-- `chrono` (UTC envelope timestamp conversion, with no optional features)
+- `chrono` (UTC ISO 8601 envelope formatting and RFC 3339 offset timestamps, with no optional features)
 
 `jx` is the sole expression implementation. Its immutable compiled expressions
-are shared across workers together with one borrowed `jx::InputPlan`. Each
-payload is prepared once and reused across independent indexed evaluations.
-`$vars` is an immutable compile-time binding shared across expressions. The Git
-dependency and `Cargo.lock` pin the reviewed immutable revision; the release handoff
-above verifies the published tag names that same code. simd-json remains only for the streaming JSON envelope string
-serializer.
+are shared across workers together with one borrowed `jx::InputPlan` and
+worker-local `jx::execution::Workspace`. Each payload is prepared once and
+reused across independent indexed evaluations. `$vars` is an immutable
+compile-time binding shared across expressions. The Git dependency and
+`Cargo.lock` pin the reviewed immutable revision; the release handoff above
+verifies the published tag names that same code.
 
 `chrono` avoids custom calendar arithmetic for optional ISO 8601 envelope
-output. Its core calendar APIs need no optional features, including allocation,
-clock, local timezone, or timezone database support. Its only required dependency,
-`num-traits`, is already in the expression dependency graph.
+output and RFC 3339 `-o s@`/`e@` timestamp boundaries. Its core calendar APIs
+need no optional features, including allocation, clock, local timezone, or
+timezone database support. Its only required dependency, `num-traits`, is
+already in the expression dependency graph.
 
 Before adding another dependency, confirm that the standard library or an
 existing dependency is insufficient and that the new dependency removes

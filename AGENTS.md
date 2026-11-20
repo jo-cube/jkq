@@ -67,7 +67,7 @@ Expected initial runtime dependencies are limited to:
 
 - `rdkafka`
 - `jx`
-- `simd-json`
+- `chrono`
 - `clap`
 - `crossbeam-channel`
 - `signal-hook`
@@ -92,7 +92,7 @@ These invariants must remain true unless the owning behavior or architecture doc
 - Consumption uses direct partition assignment only.
 - One invocation consumes one topic and directly assigns either explicitly selected partitions or every partition discovered at startup.
 - Each assigned partition has one Kafka consumer, except explicit unordered bounded range sharding, where non-overlapping half-open ranges have independent owners.
-- Existing Kafka tombstones bypass JSON parsing and remain tombstones by default.
+- Existing Kafka tombstones bypass JSON parsing, payload-dependent predicates, and projections by default (while input-independent metadata predicates evaluate on them unless `--drop-tombstones` is set) and remain tombstones if they survive.
 - Every non-tombstone input produces exactly one action: drop, tombstone, pass through, or project.
 - One input record never expands into multiple output records.
 - `-c` counts admitted Kafka input records, including records later dropped or tombstoned.

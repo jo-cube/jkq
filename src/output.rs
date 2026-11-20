@@ -25,6 +25,109 @@ enum FormatToken {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledFormat(Vec<FormatToken>);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetadataFields {
+    pub topic: bool,
+    pub partition: bool,
+    pub offset: bool,
+    pub timestamp: bool,
+    pub timestamp_type: bool,
+    pub key: bool,
+    pub key_encoding: bool,
+    pub key_length: bool,
+    pub headers: bool,
+    pub value_length: bool,
+    pub is_tombstone: bool,
+}
+
+impl MetadataFields {
+    pub const NONE: Self = Self {
+        topic: false,
+        partition: false,
+        offset: false,
+        timestamp: false,
+        timestamp_type: false,
+        key: false,
+        key_encoding: false,
+        key_length: false,
+        headers: false,
+        value_length: false,
+        is_tombstone: false,
+    };
+
+    pub const ALL: Self = Self {
+        topic: true,
+        partition: true,
+        offset: true,
+        timestamp: true,
+        timestamp_type: true,
+        key: true,
+        key_encoding: true,
+        key_length: true,
+        headers: true,
+        value_length: true,
+        is_tombstone: true,
+    };
+
+    pub fn from_demand(demand: jx::BindingDemand<'_>) -> Self {
+        match demand {
+            jx::BindingDemand::Unused => Self::NONE,
+            jx::BindingDemand::All => Self::ALL,
+            jx::BindingDemand::Fields(fields) => {
+                let mut mask = Self::NONE;
+                for field in fields {
+                    match field.as_ref() {
+                        "topic" => mask.topic = true,
+                        "partition" => mask.partition = true,
+                        "offset" => mask.offset = true,
+                        "timestamp" => mask.timestamp = true,
+                        "timestampType" => mask.timestamp_type = true,
+                        "key" => mask.key = true,
+                        "keyEncoding" => mask.key_encoding = true,
+                        "keyLength" => mask.key_length = true,
+                        "headers" => mask.headers = true,
+                        "valueLength" => mask.value_length = true,
+                        "isTombstone" => mask.is_tombstone = true,
+                        _ => {}
+                    }
+                }
+                mask
+            }
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.topic |= other.topic;
+        self.partition |= other.partition;
+        self.offset |= other.offset;
+        self.timestamp |= other.timestamp;
+        self.timestamp_type |= other.timestamp_type;
+        self.key |= other.key;
+        self.key_encoding |= other.key_encoding;
+        self.key_length |= other.key_length;
+        self.headers |= other.headers;
+        self.value_length |= other.value_length;
+        self.is_tombstone |= other.is_tombstone;
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(self) -> bool {
+        self == Self::NONE
+    }
+
+    pub fn needs_key(self) -> bool {
+        self.key || self.key_encoding || self.key_length
+    }
+
+    pub fn needs_headers(self) -> bool {
+        self.headers
+    }
+
+    pub fn needs_timestamp(self) -> bool {
+        self.timestamp || self.timestamp_type
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutputRequirements {
     pub key: bool,
@@ -326,32 +429,101 @@ fn write_bytes(output: &mut impl Write, bytes: &[u8], written: &mut usize) -> io
     output.write_all(bytes)
 }
 
+trait DecimalInt {
+    fn write_decimal_to(self, buf: &mut [u8; 24]) -> &[u8];
+}
+
+impl DecimalInt for i32 {
+    fn write_decimal_to(self, buf: &mut [u8; 24]) -> &[u8] {
+        i64::from(self).write_decimal_to(buf)
+    }
+}
+
+impl DecimalInt for i64 {
+    fn write_decimal_to(self, buf: &mut [u8; 24]) -> &[u8] {
+        let negative = self < 0;
+        let mut value = self.unsigned_abs();
+        let mut cursor = buf.len();
+        loop {
+            cursor -= 1;
+            buf[cursor] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        if negative {
+            cursor -= 1;
+            buf[cursor] = b'-';
+        }
+        &buf[cursor..]
+    }
+}
+
+impl DecimalInt for usize {
+    fn write_decimal_to(self, buf: &mut [u8; 24]) -> &[u8] {
+        let mut value = self;
+        let mut cursor = buf.len();
+        loop {
+            cursor -= 1;
+            buf[cursor] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        &buf[cursor..]
+    }
+}
+
 fn write_decimal(
     output: &mut impl Write,
-    value: impl fmt::Display,
+    value: impl DecimalInt,
     written: &mut usize,
 ) -> io::Result<()> {
-    write!(&mut CountingWriter { output, written }, "{value}")
+    let mut buf = [0u8; 24];
+    write_bytes(output, value.write_decimal_to(&mut buf), written)
 }
 
-struct CountingWriter<'a, W> {
-    output: &'a mut W,
-    written: &'a mut usize,
-}
-
-impl<W: Write> Write for CountingWriter<'_, W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let count = self.output.write(bytes)?;
-        *self.written = self
-            .written
-            .checked_add(count)
-            .ok_or_else(|| io::Error::other("formatted record length overflowed usize"))?;
-        Ok(count)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.output.flush()
-    }
+fn write_iso8601(
+    output: &mut impl Write,
+    date: DateTime<Utc>,
+    written: &mut usize,
+) -> io::Result<()> {
+    let year = date.year() as u32;
+    let month = date.month();
+    let day = date.day();
+    let hour = date.hour();
+    let minute = date.minute();
+    let second = date.second();
+    let millis = date.timestamp_subsec_millis();
+    let buf = [
+        b'0' + ((year / 1000) % 10) as u8,
+        b'0' + ((year / 100) % 10) as u8,
+        b'0' + ((year / 10) % 10) as u8,
+        b'0' + (year % 10) as u8,
+        b'-',
+        b'0' + (month / 10) as u8,
+        b'0' + (month % 10) as u8,
+        b'-',
+        b'0' + (day / 10) as u8,
+        b'0' + (day % 10) as u8,
+        b'T',
+        b'0' + (hour / 10) as u8,
+        b'0' + (hour % 10) as u8,
+        b':',
+        b'0' + (minute / 10) as u8,
+        b'0' + (minute % 10) as u8,
+        b':',
+        b'0' + (second / 10) as u8,
+        b'0' + (second % 10) as u8,
+        b'.',
+        b'0' + ((millis / 100) % 10) as u8,
+        b'0' + ((millis / 10) % 10) as u8,
+        b'0' + (millis % 10) as u8,
+        b'Z',
+    ];
+    write_bytes(output, &buf, written)
 }
 
 fn write_optional_length(
@@ -395,20 +567,7 @@ pub fn write_envelope(
     write_decimal(output, record.offset, &mut written)?;
     if let Some(date) = iso_timestamp {
         write_bytes(output, b",\"timestamp\":\"", &mut written)?;
-        write!(
-            &mut CountingWriter {
-                output,
-                written: &mut written
-            },
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-            date.year(),
-            date.month(),
-            date.day(),
-            date.hour(),
-            date.minute(),
-            date.second(),
-            date.timestamp_subsec_millis()
-        )?;
+        write_iso8601(output, date, &mut written)?;
         write_bytes(output, b"\"", &mut written)?;
         write_timestamp_type(output, record.timestamp, &mut written)?;
     } else {
@@ -488,34 +647,132 @@ fn write_headers(
     write_bytes(output, b"]", written)
 }
 
-pub fn write_metadata(record: &SourceMetadata<'_>, output: &mut Vec<u8>) {
+pub fn write_metadata_fields(
+    record: &SourceMetadata<'_>,
+    fields: MetadataFields,
+    output: &mut Vec<u8>,
+) {
     // Use the envelope's byte conventions; offsets are strings for exact JSONata comparisons.
     let mut written = 0;
     (|| -> io::Result<()> {
-        write_bytes(output, b"{\"topic\":", &mut written)?;
-        write_json_string(output, record.topic, &mut written)?;
-        write_bytes(output, b",\"partition\":", &mut written)?;
-        write_decimal(output, record.partition, &mut written)?;
-        write_bytes(output, b",\"offset\":\"", &mut written)?;
-        write_decimal(output, record.offset, &mut written)?;
-        write_bytes(output, b"\"", &mut written)?;
-        write_timestamp(output, record.timestamp, &mut written)?;
-        write_bytes_fields(output, "key", record.key, &mut written)?;
-        write_headers(output, record.headers, &mut written)?;
-        write_bytes(output, b",\"valueLength\":", &mut written)?;
-        match record.value_length {
-            Some(length) => write_decimal(output, length, &mut written)?,
-            None => write_decimal(output, -1, &mut written)?,
+        write_bytes(output, b"{", &mut written)?;
+        let mut comma = false;
+        let sep = |output: &mut Vec<u8>, comma: &mut bool, written: &mut usize| -> io::Result<()> {
+            if *comma {
+                write_bytes(output, b",", written)?;
+            }
+            *comma = true;
+            Ok(())
+        };
+        if fields.topic {
+            sep(output, &mut comma, &mut written)?;
+            write_bytes(output, b"\"topic\":", &mut written)?;
+            write_json_string(output, record.topic, &mut written)?;
         }
-        write_bytes(
-            output,
-            if record.value_length.is_none() {
-                b",\"isTombstone\":true}"
+        if fields.partition {
+            sep(output, &mut comma, &mut written)?;
+            write_bytes(output, b"\"partition\":", &mut written)?;
+            write_decimal(output, record.partition, &mut written)?;
+        }
+        if fields.offset {
+            sep(output, &mut comma, &mut written)?;
+            write_bytes(output, b"\"offset\":\"", &mut written)?;
+            write_decimal(output, record.offset, &mut written)?;
+            write_bytes(output, b"\"", &mut written)?;
+        }
+        if fields.timestamp {
+            sep(output, &mut comma, &mut written)?;
+            write_bytes(output, b"\"timestamp\":", &mut written)?;
+            match record.timestamp {
+                Some(timestamp) => write_decimal(output, timestamp.milliseconds, &mut written)?,
+                None => write_bytes(output, b"null", &mut written)?,
+            }
+        }
+        if fields.timestamp_type {
+            sep(output, &mut comma, &mut written)?;
+            write_bytes(output, b"\"timestampType\":", &mut written)?;
+            match record.timestamp.map(|value| value.kind) {
+                Some(TimestampType::CreateTime) => {
+                    write_bytes(output, b"\"createTime\"", &mut written)?;
+                }
+                Some(TimestampType::LogAppendTime) => {
+                    write_bytes(output, b"\"logAppendTime\"", &mut written)?;
+                }
+                None => write_bytes(output, b"null", &mut written)?,
+            }
+        }
+        if fields.key || fields.key_encoding || fields.key_length {
+            let utf8_key = if fields.key || fields.key_encoding {
+                record.key.map(std::str::from_utf8)
             } else {
-                b",\"isTombstone\":false}"
-            },
-            &mut written,
-        )
+                None
+            };
+            if fields.key {
+                sep(output, &mut comma, &mut written)?;
+                write_bytes(output, b"\"key\":", &mut written)?;
+                match utf8_key {
+                    None => write_bytes(output, b"null", &mut written)?,
+                    Some(Ok(text)) => write_json_string(output, text, &mut written)?,
+                    Some(Err(_)) => {
+                        write_bytes(output, b"\"", &mut written)?;
+                        write_base64(output, record.key.expect("key bytes"), &mut written)?;
+                        write_bytes(output, b"\"", &mut written)?;
+                    }
+                }
+            }
+            if fields.key_encoding {
+                sep(output, &mut comma, &mut written)?;
+                write_bytes(output, b"\"keyEncoding\":", &mut written)?;
+                match utf8_key {
+                    None => write_bytes(output, b"null", &mut written)?,
+                    Some(Ok(_)) => write_bytes(output, b"\"utf8\"", &mut written)?,
+                    Some(Err(_)) => write_bytes(output, b"\"base64\"", &mut written)?,
+                }
+            }
+            if fields.key_length {
+                sep(output, &mut comma, &mut written)?;
+                write_bytes(output, b"\"keyLength\":", &mut written)?;
+                match record.key {
+                    Some(bytes) => write_decimal(output, bytes.len(), &mut written)?,
+                    None => write_decimal(output, -1, &mut written)?,
+                }
+            }
+        }
+        if fields.headers {
+            sep(output, &mut comma, &mut written)?;
+            write_bytes(output, b"\"headers\":[", &mut written)?;
+            for (index, header) in record.headers.iter().enumerate() {
+                if index != 0 {
+                    write_bytes(output, b",", &mut written)?;
+                }
+                write_bytes(output, b"{\"name\":", &mut written)?;
+                write_json_string(output, &header.name, &mut written)?;
+                write_bytes_fields(output, "value", header.value.as_deref(), &mut written)?;
+                write_bytes(output, b"}", &mut written)?;
+            }
+            write_bytes(output, b"]", &mut written)?;
+        }
+        if fields.value_length {
+            sep(output, &mut comma, &mut written)?;
+            write_bytes(output, b"\"valueLength\":", &mut written)?;
+            match record.value_length {
+                Some(length) => write_decimal(output, length, &mut written)?,
+                None => write_decimal(output, -1, &mut written)?,
+            }
+        }
+        if fields.is_tombstone {
+            sep(output, &mut comma, &mut written)?;
+            write_bytes(
+                output,
+                if record.value_length.is_none() {
+                    b"\"isTombstone\":true"
+                } else {
+                    b"\"isTombstone\":false"
+                },
+                &mut written,
+            )?;
+        }
+        write_bytes(output, b"}", &mut written)
     })()
     .expect("writing metadata to a vector cannot fail");
 }
@@ -583,13 +840,47 @@ fn write_bytes_fields(
 }
 
 fn write_json_string(output: &mut impl Write, value: &str, written: &mut usize) -> io::Result<()> {
-    // The generic simd-json error conversion loses the original I/O error kind.
-    simd_json::to_writer(CountingWriter { output, written }, value).map_err(|error| {
-        match error.error() {
-            simd_json::ErrorType::Io(error) => io::Error::new(error.kind(), error.to_string()),
-            _ => io::Error::other(error),
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    write_bytes(output, b"\"", written)?;
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        let escape: &[u8] = match byte {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            0x08 => b"\\b",
+            0x0c => b"\\f",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x00..=0x1f => {
+                if start < index {
+                    write_bytes(output, &bytes[start..index], written)?;
+                }
+                let encoded = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[(byte >> 4) as usize],
+                    HEX[(byte & 0x0f) as usize],
+                ];
+                write_bytes(output, &encoded, written)?;
+                start = index + 1;
+                continue;
+            }
+            _ => continue,
+        };
+        if start < index {
+            write_bytes(output, &bytes[start..index], written)?;
         }
-    })
+        write_bytes(output, escape, written)?;
+        start = index + 1;
+    }
+    if start < bytes.len() {
+        write_bytes(output, &bytes[start..], written)?;
+    }
+    write_bytes(output, b"\"", written)
 }
 
 fn write_base64(output: &mut impl Write, input: &[u8], written: &mut usize) -> io::Result<()> {
@@ -870,5 +1161,25 @@ mod tests {
         write_base64(&mut output, &[0xff, 0xee], &mut written).unwrap();
         assert_eq!(output, b"/+4=");
         assert_eq!(written, output.len());
+
+        output.clear();
+        written = 0;
+        write_json_string(&mut output, "\u{08}\u{0c}\r\t\0\u{1f}π", &mut written).unwrap();
+        assert_eq!(output, "\"\\b\\f\\r\\t\\u0000\\u001fπ\"".as_bytes());
+        assert_eq!(written, output.len());
+
+        for (value, expected) in [
+            (i64::MIN, "-9223372036854775808"),
+            (i64::MAX, "9223372036854775807"),
+            (-1, "-1"),
+            (0, "0"),
+            (42, "42"),
+        ] {
+            output.clear();
+            written = 0;
+            write_decimal(&mut output, value, &mut written).unwrap();
+            assert_eq!(output, expected.as_bytes());
+            assert_eq!(written, expected.len());
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "jkq"
-version = "0.22.1"
+version = "0.23.0"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -9,7 +9,6 @@ publish = false
 chrono = { version = "0.4.45", default-features = false }
 clap = { version = "4.6.7", features = ["derive"] }
 crossbeam-channel = "0.5.16"
-jx = { git = "https://github.com/jo-cube/jx.git", tag = "v0.2.0" }
+jx = { git = "https://github.com/jo-cube/jx.git", tag = "v0.3.0" }
 rdkafka = { version = "0.39.0", default-features = false, features = ["libz", "ssl-vendored", "zstd"] }
 signal-hook = "0.4.6"
-simd-json = "=0.19.0"

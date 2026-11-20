@@ -37,7 +37,7 @@ fn if_predicates(sources: &[&str], category: &str) -> Vec<PredicateSource> {
         .collect()
 }
 
-fn cli_plan(arguments: &[&str]) -> TransformPlan {
+pub(super) fn cli_plan(arguments: &[&str]) -> TransformPlan {
     let mut command = vec!["jkq", "-b", "x", "-t", "events"];
     command.extend_from_slice(arguments);
     crate::cli::RawCli::try_parse_from(command)
@@ -318,14 +318,20 @@ fn action_predicates_require_boolean_results() {
 }
 
 #[test]
-fn source_tombstones_bypass_evaluation() {
+fn source_tombstones_bypass_payload_predicates_and_projection() {
     for flag in [
         "--drop-if",
         "--drop-unless",
+        "--keep-if",
         "--tombstone-if",
         "--tombstone-unless",
     ] {
-        let transform = cli_plan(&[flag, "$error('must not run')", "--project", "missing"]);
+        let transform = cli_plan(&[
+            flag,
+            "id = 1 ? $error('must not run') : false",
+            "--project",
+            "$error('must not run')",
+        ]);
         assert_eq!(run(&transform, None).unwrap(), Action::Tombstone);
     }
 }

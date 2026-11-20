@@ -42,8 +42,9 @@ tests/process.rs           Unix process and signal behavior
 ```
 
 The transform modules use jx's public compilation, shared-input preparation,
-immutable binding, and compact serialization APIs. simd-json is used only to
-serialize JSON envelope strings.
+workspace reuse, immutable binding, binding-demand inspection, and compact
+serialization APIs. JSON envelope strings and decimal integers are encoded with
+native safe Rust formatters in `src/output.rs`.
 
 ## Startup
 
@@ -153,7 +154,9 @@ compile options shares its storage across expressions; workers require no
 per-record binding setup.
 
 Before workers start, one `jx::InputPlan` borrows the compiled expressions
-in drop, tombstone, then projection order. Workers share this immutable plan.
+in drop, tombstone, then projection order. Workers share this immutable plan and
+keep one reusable `jx::execution::Workspace` per worker thread to avoid
+per-record demand-span allocations.
 Each required payload is prepared once: jx validates the complete input and
 captures query-sized input demands during that traversal. Predicates and
 projection evaluate through stable indices with independent state. General
@@ -190,10 +193,12 @@ bytes unchanged; drops and failures retain unused source storage until release.
 See [expression-language.md](expression-language.md) for native jx serialization
 and missing-value behavior.
 
-By default, existing Kafka tombstones bypass all JSONata work. They remain
-tombstones unless `--drop-tombstones` is set. Records selected by
-`--tombstone-if` or `--tombstone-unless` follow the same option before
-projection. An identity transform also bypasses parsing unless `--on-invalid-json` was supplied
+By default, `--drop-tombstones` drops source tombstones before any expression.
+Otherwise, input-independent predicates evaluate on source tombstones with
+absent input, while payload-dependent predicates and all projections are skipped
+so surviving tombstones remain tombstones. Records selected by `--tombstone-if`
+or `--tombstone-unless` follow `--drop-tombstones` before projection. An
+identity transform also bypasses parsing unless `--on-invalid-json` was supplied
 explicitly or a JSON-value envelope was requested.
 
 ### Metadata and Deferred Preparation
@@ -202,35 +207,35 @@ Worker scheduling depends on evaluation/output requirements, not on JSON
 preparation. Every worker plan retains the same ordered completion path,
 including metadata-only plans that never prepare payloads. Identity raw-byte
 plans still bypass workers. Native Kafka messages remain poller-confined;
-payload copying and bounded admission charges are unchanged. Transform metadata
-requirements are combined with formatter requirements before copying keys,
-headers, and timestamps into owned records.
+payload copying and bounded admission charges are unchanged.
 
-A conservative source-name precheck (`$meta` or `$eval`, allowing false
-positives in strings/comments) declares the runtime binding only for expressions
-that might access it. Variable names are unescaped in jx; dynamic evaluation is
-included even when its text comes from `$vars`. This keeps existing payload-only
-expressions on their original compiled and serialization paths. There is no
-metadata-field demand analysis or Kafka functionality in jx.
+A conservative source-name precheck (`$meta` or `$eval`) declares the runtime
+binding only for expressions that might access it, keeping payload-only
+expressions free of lexical scope setup. After compilation, jx's general
+`Expression::binding_demand("meta")` eliminates false positives (strings or
+comments) and reports either the exact top-level `$meta` fields accessed or
+`All` when `$meta` escapes. Transform metadata requirements combine only the
+demanded Kafka fields (`key`, `headers`, `timestamp`) with formatter
+requirements before copying source metadata into owned records.
 
-A worker lazily encodes the complete metadata object using envelope byte helpers
-and validates it once into borrowed `jx::RawJson`. The binding is supplied through
-fresh `EvaluationOptions` for each reached expression. The reusable metadata byte
-buffer is worker-local, outside source-byte admission, and discarded when its
-capacity exceeds the existing 16 KiB/source-budget recycling threshold. Large
-keys/headers therefore still cost encoding and transient memory when metadata
-is used; unused metadata after short-circuiting is never encoded.
+A worker lazily encodes only the demanded metadata fields using envelope byte
+helpers and validates the compact JSON once into borrowed `jx::RawJson`. The
+binding is supplied through fresh `EvaluationOptions` for each reached
+expression. The reusable metadata byte buffer is worker-local, outside
+source-byte admission, and discarded when its capacity exceeds the existing
+16 KiB/source-budget recycling threshold. Unused metadata after short-circuiting
+is never encoded.
 
-Default eager preparation and source tombstone bypass are unchanged. With
-`--defer-json`, jx's conservative `InputDependency::Independent` proof permits
-absent-input evaluation; the first reached dependent expression prepares a
-non-null payload through the shared `InputPlan`. Source tombstones always use
-absent input, never a fabricated JSON null. Surviving JSON-value passthrough
-prepares at serialization. A prepared projection without runtime bindings retains
-`PreparedInput::write_json`; bound or absent-input evaluations use
-`Evaluation::write_json`, which shares jx's complete-result serializer, rollback,
-and evaluation-error precedence. There is one worker action flow and no
-poller-side filtering or payload-copy omission.
+Default eager validation for non-tombstone records is unchanged, while
+input-independent predicates evaluate on source tombstones automatically. With
+`--defer-json`, jx's conservative `InputDependency::Independent` proof also
+permits absent-input evaluation before payload validation and allows source
+tombstones to run payload-dependent predicates and `--project`. Surviving
+JSON-value passthrough prepares at serialization. A prepared projection without
+runtime bindings retains `PreparedInput::write_json`; bound or absent-input
+evaluations use `Evaluation::write_json`, which shares jx's complete-result
+serializer, rollback, and evaluation-error precedence. There is one worker
+action flow and no poller-side filtering or payload-copy omission.
 
 ## Ordering and Output
 
@@ -253,9 +258,10 @@ action into one reused buffer before applying the final output format. Final
 `%s`, `%S`, and `%R` therefore operate on the exact generated payload
 independently of JSONata metadata access. Drops produce no bytes, tombstones
 bypass payload formatting, and `%L` continues to report the source payload length.
-JSON envelope strings use simd-json's streaming serializer; output accounting
+JSON envelope strings use a native safe Rust escaper; output accounting
 and I/O error kinds, including broken pipe, are preserved. Broken pipe is normal
-pipeline termination.
+pipeline termination. Under `-u`/`--unbuffered`, stdout remains wrapped in its
+buffer and flushes once per emitted record.
 Optional ISO 8601 envelope timestamps are converted only by the writer, with
 range checks before streaming the envelope; source metadata remains numeric.
 For a JSON-value envelope, the writer inserts compact JSON bytes produced by
@@ -358,9 +364,11 @@ not finished or a poller, worker, or stdout cannot progress.
 - Every successfully transformed non-tombstone input resolves to exactly one
   action.
 - One input never expands into multiple output records.
-- By default, source tombstones bypass JSON and JSONata and remain tombstones
-  unless `--drop-tombstones` is set; deferred mode permits expression evaluation
-  with absent input after that drop check.
+- By default, `--drop-tombstones` drops source tombstones first; otherwise
+  input-independent predicates evaluate on source tombstones with absent input,
+  while payload-dependent predicates and all projections skip source tombstones
+  so survivors remain tombstones. `--defer-json` permits full absent-input
+  evaluation including projection of source tombstones.
 - Pass-through preserves exact source payload bytes unless the user explicitly
   requests a JSON-value envelope or payload format.
 - Payload formatting applies only to emitted non-tombstone actions and does not

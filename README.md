@@ -6,12 +6,15 @@ Kafka metadata and tombstones, and streams record data to stdout with
 predictable per-partition ordering.
 
 Filtering and projection expressions use [JSONata](https://jsonata.org/).
-Source metadata is available as `$meta`; opt-in `--defer-json` allows metadata-only
-processing without validating payload JSON. See the [expression contract](docs/expression-language.md#source-metadata-and-deferred-json).
+Source metadata is available as `$meta`. Metadata-only predicates (such as
+`--keep-if '$meta.key = "user-42"'`) automatically apply to both normal records
+and Kafka tombstones; opt-in `--defer-json` additionally skips JSON validation
+before metadata drops and lets tombstones evaluate payload expressions or
+`--project`. See the [expression contract](docs/expression-language.md#source-metadata-and-deferred-json).
 
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \
-  --drop-unless 'environment = "production"' \
+  --keep-if 'environment = "production"' \
   --project '{"id": id, "total": $sum(items.price)}' \
   -f '%p\t%o\t%R%s\n'
 ```
@@ -24,10 +27,15 @@ A successfully processed input record produces one of four actions:
   is requested;
 - **project**: write a compact JSON result.
 
-Kafka tombstones bypass JSON parsing and expression evaluation and remain
-tombstones by default. `--drop-tombstones` drops them, as well as records
-selected by `--tombstone-if` or `--tombstone-unless`, before projection. Records
-stay in source order within each partition by default; there is no global order across partitions.
+By default, source Kafka tombstones evaluate metadata-only predicates (such as
+`--keep-if '$meta.key = "user-42"'`), bypass payload-dependent predicates and
+projections, and remain tombstones if they survive. Note that a single combined
+metadata+payload expression depends on the payload and therefore skips
+tombstones — split metadata and payload checks into separate flags to filter
+tombstones by metadata too. `--drop-tombstones` drops both source tombstones and
+records selected by `--tombstone-if` or `--tombstone-unless` before projection.
+Records stay in source order within each partition by default; there is no
+global order across partitions.
 
 Admission limits bound source work, rather than total process memory. Native
 Kafka batches, JSONata intermediates, and expanded output remain outside that
@@ -109,12 +117,19 @@ jkq -b localhost:9092 -t events -p 0 --snapshot \
   --tombstone-if 'deleted = true' -f '%K%k%R%s'
 ```
 
+Inspect all records (including tombstones) for one key on a compacted topic:
+
+```sh
+jkq -b localhost:9092 -t users --snapshot \
+  --keep-if '$meta.key = "user-42"' -J
+```
+
 Pass a strict JSON object to every expression as `$vars`:
 
 ```sh
 jkq -b localhost:9092 -t events -p 0 --snapshot \
   --vars '{"tenant":"acme","cutoff":1000}' \
-  --drop-if 'tenant != $vars.tenant' \
+  --keep-if 'tenant = $vars.tenant' \
   --project '{"id": id, "large": amount >= $vars.cutoff}'
 ```
 
